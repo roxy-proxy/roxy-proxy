@@ -448,9 +448,10 @@ async fn h2_a_guest_answering_bodiless_still_completes_its_forward() {
 }
 
 /// A guest that answered and then cuts its forward short keeps its answer:
-/// the cut fails `next` for the guest, and the client's body is not cut
-/// with it. The record keeps the core's refusal of the cut forward, the
-/// layer's fault, with the status the client got.
+/// nothing comes back for the cut forward, so `next` fails for the guest,
+/// and the client's body is not cut with it. The cut is the guest's own
+/// doing, not a fault: the record is the layer's answer, with
+/// `forward_aborted` as its reason.
 #[tokio::test]
 async fn a_guest_that_answered_keeps_its_answer_when_its_forward_is_cut() {
     let kit = stack(&["a"]).await;
@@ -471,13 +472,17 @@ async fn a_guest_that_answered_keeps_its_answer_when_its_forward_is_cut() {
         "{a:?}"
     );
     let ev = kit.request_event().await;
-    assert_eq!(ev["decision"], "deny", "{ev:#}");
-    assert_eq!(ev["reason"], "layer_error", "{ev:#}");
+    assert_eq!(ev["decision"], "answered", "{ev:#}");
+    assert_eq!(ev["reason"], "forward_aborted", "{ev:#}");
     assert_eq!(ev["terminal_rule"], "layer:a", "{ev:#}");
     assert_eq!(ev["res"]["status"], 200, "{ev:#}");
-    let errs = kit.events("layer_error", 1).await;
-    assert_eq!(errs[0]["layer"], "a", "{errs:#?}");
-    assert_eq!(errs[0]["kind"], "invalid_request", "{errs:#?}");
+    assert!(
+        kit.sink
+            .events()
+            .iter()
+            .all(|e| e["event"] != "layer_error"),
+        "nothing failed"
+    );
     assert!(kit.upstream.seen().is_empty(), "nothing complete left");
 }
 

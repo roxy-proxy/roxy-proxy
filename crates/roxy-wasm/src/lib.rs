@@ -19,11 +19,10 @@ mod streams;
 pub use async_trait::async_trait;
 pub use config::{Capabilities, Capability, LayerConfig, LayerLimits};
 pub use error::{Budget, LayerError, LoadError};
-pub use exchange::{LayerOutcome, Running};
 pub use head::MAX_FIELDS_BYTES;
 pub use host::{
-    EndpointError, EndpointPermit, FlowInfo, HostError, LayerHost, LayerRequest, LayerResponse,
-    LogLevel, Principal, TagError,
+    EndpointError, EndpointPermit, FlowInfo, GuestBody, HostError, LayerHost, LayerRequest,
+    LayerResponse, LogLevel, Principal, TagError,
 };
 pub use runtime::{CompiledLayer, Layer, WasmRuntime};
 pub use state::{MAX_BODY_BYTES, MAX_MESSAGE_BYTES};

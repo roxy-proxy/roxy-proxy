@@ -24,12 +24,7 @@ pub(super) async fn call(
     index: usize,
     call: Call,
 ) -> Result<Reply, LayerError> {
-    let host = StackHost {
-        st: st.clone(),
-        index,
-        observer: None,
-        call: Some(call.id()),
-    };
+    let host = StackHost::silent(st.clone(), index, None, Some(call.id()));
     let caps = st.snap.addons[index].capabilities;
     let require = |cap: Capability, import: &'static str| {
         if caps.contains(cap) {

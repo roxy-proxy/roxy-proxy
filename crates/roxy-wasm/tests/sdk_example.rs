@@ -8,11 +8,11 @@ use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::BodyExt;
 use roxy_http::{Body, BodyError};
-use roxy_wasm::{Layer, LayerConfig, LayerError, WasmRuntime};
+use roxy_wasm::{Layer, LayerConfig, WasmRuntime};
 use tokio::sync::oneshot;
 
 mod common;
-use common::{Mock, NextMode, collect, exchange};
+use common::{Mock, NextMode, collect, exchange, start};
 
 const REDACT: &[u8] = include_bytes!("fixtures/redact.wasm");
 
@@ -48,17 +48,13 @@ async fn redacts_both_directions_while_streaming() {
 
     // The needle straddles two chunks of the client's body.
     let (mut tx, body) = Body::channel(u64::MAX, None);
-    let handle = tokio::spawn({
-        let layer = layer.clone();
-        let host = host.clone();
-        async move { layer.handle(host, post(body)).await }
-    });
+    let mut started = start(&layer, host.clone(), post(body));
     for chunk in ["key=sk-li", "ve-1234&x=1"] {
         tx.send_data(Bytes::from(chunk)).await.unwrap();
     }
     tx.finish().await.unwrap();
 
-    let resp = handle.await.unwrap().unwrap();
+    let resp = started.response().await.unwrap();
     // The mock echoes the request body, so this is what went upstream,
     // redacted again on the way back.
     assert_eq!(collect(resp.into_body()).await.unwrap(), "key=[x]&x=1");
@@ -69,17 +65,13 @@ async fn streams_without_buffering() {
     let layer = redact().await;
     let host = Mock::echo();
     let (mut tx, body) = Body::channel(u64::MAX, None);
-    let handle = tokio::spawn({
-        let layer = layer.clone();
-        let host = host.clone();
-        async move { layer.handle(host, post(body)).await }
-    });
+    let mut started = start(&layer, host.clone(), post(body));
     // The first chunk reaches the client before the second is sent (all
     // but the held-back tail of `longest needle - 1` bytes).
     let first = "a".repeat(64);
     tx.send_data(Bytes::from(first.clone())).await.unwrap();
     tx.send_data(Bytes::from(first.clone())).await.unwrap();
-    let resp = handle.await.unwrap().unwrap();
+    let resp = started.response().await.unwrap();
     let mut body = resp.into_body();
     let frame = body.frame().await.unwrap().unwrap().into_data().unwrap();
     assert!(!frame.is_empty());
@@ -96,11 +88,7 @@ async fn request_and_response_stream_concurrently() {
     let layer = redact().await;
     let host = Mock::echo();
     let (mut tx, body) = Body::channel(u64::MAX, None);
-    let handle = tokio::spawn({
-        let layer = layer.clone();
-        let host = host.clone();
-        async move { layer.handle(host, post(body)).await }
-    });
+    let mut started = start(&layer, host.clone(), post(body));
     let unit = "0123456789abcdef-sk-live-1234-";
     let sender = tokio::spawn(async move {
         let all = unit.repeat(35_000); // ~1 MiB
@@ -109,7 +97,7 @@ async fn request_and_response_stream_concurrently() {
         }
         tx.finish().await.unwrap();
     });
-    let resp = handle.await.unwrap().unwrap();
+    let resp = started.response().await.unwrap();
     let out = collect(resp.into_body()).await.unwrap();
     sender.await.unwrap();
     assert_eq!(out, "0123456789abcdef-[x]-".repeat(35_000));
@@ -128,11 +116,7 @@ async fn untouched_bodies_stream_both_ways_at_once() {
         Response::new(up_body),
     )))));
     let (mut client_tx, client_body) = Body::channel(u64::MAX, None);
-    let handle = tokio::spawn({
-        let layer = layer.clone();
-        let host = host.clone();
-        async move { layer.handle(host, post(client_body)).await }
-    });
+    let mut started = start(&layer, host.clone(), post(client_body));
 
     let mut upstream_body = seen_rx.await.unwrap().into_body();
     client_tx.send_data(Bytes::from("first ")).await.unwrap();
@@ -140,7 +124,7 @@ async fn untouched_bodies_stream_both_ways_at_once() {
     assert_eq!(frame.into_data().unwrap(), "first ");
 
     // The response starts while the request body is still open.
-    let resp = handle.await.unwrap().unwrap();
+    let resp = started.response().await.unwrap();
     let mut client_body = resp.into_body();
     up_tx.send_data(Bytes::from("pong ")).await.unwrap();
     let frame = client_body.frame().await.unwrap().unwrap();
@@ -158,10 +142,11 @@ async fn untouched_bodies_stream_both_ways_at_once() {
 }
 
 /// A request body that fails while the layer passes it on untouched (moved
-/// host-side, with the layer still waiting on the response) fails the
-/// exchange closed: the body handed down is never finished as if complete.
+/// host-side, with the layer still waiting on the response) is cut where
+/// it failed, never finished as if complete: nothing comes back for it,
+/// and the layer, which answers nothing else, gives no response.
 #[tokio::test]
-async fn a_failing_untouched_request_body_fails_closed() {
+async fn a_failing_untouched_request_body_is_cut() {
     let layer = passthrough().await;
     let host = Mock::new(NextMode::Upload);
     let (mut client_tx, client_body) = Body::channel(u64::MAX, None);
@@ -175,11 +160,8 @@ async fn a_failing_untouched_request_body_fails_closed() {
     client_tx.abort(BodyError::Incomplete);
 
     let outcome = handle.await.unwrap();
-    assert!(
-        matches!(outcome, Err(LayerError::InvalidRequest(_))),
-        "{outcome:?}"
-    );
-    assert_eq!(host.upload_ended().await, Err(BodyError::Stopped));
+    assert!(outcome.is_err(), "{outcome:?}");
+    assert_eq!(host.upload_ended().await, Err(BodyError::Incomplete));
 }
 
 /// The same failure once the layer below has answered (without reading the
@@ -217,6 +199,6 @@ async fn a_failing_untouched_request_body_is_cut_after_the_answer() {
     assert_eq!((status.as_u16(), body.as_ref()), (200, b"ok".as_slice()));
     assert_eq!(
         collect(upstream_body).await.unwrap_err(),
-        BodyError::Stopped
+        BodyError::Incomplete
     );
 }

@@ -6,7 +6,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use http::uri::{Authority, Scheme};
 use roxy_http::Body;
-use tokio::sync::oneshot;
 use wasmtime::component::{Resource, ResourceTable};
 use wasmtime_wasi::p2::{DynInputStream, DynOutputStream, DynPollable};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
@@ -16,7 +15,7 @@ use crate::config::{Capability, LayerConfig};
 use crate::error::{Budget, LayerError};
 use crate::exchange::{ExchangeShared, FromGuest};
 use crate::head::{self, HeadError};
-use crate::host::{EndpointError, LayerHost, LogLevel, TagError};
+use crate::host::{EndpointError, GuestBody, LayerHost, LogLevel, TagError};
 use crate::streams::{Answer, PendingResponse, Produced, Streams};
 
 /// Most resources (streams, pollables, pending responses) a guest may hold
@@ -47,8 +46,8 @@ pub(crate) struct ExchangeCtx {
     /// guest passes to `next` without them.
     pub(crate) scheme: Scheme,
     pub(crate) authority: Authority,
-    /// Takes the guest's answer (`respond`); `None` once it has answered.
-    pub(crate) answer: Option<oneshot::Sender<http::Response<Body>>>,
+    /// The guest has answered (`respond`).
+    pub(crate) answered: bool,
     /// The streams handed to the guest so far.
     pub(crate) streams: Streams,
 }
@@ -422,6 +421,7 @@ impl chain::Host for StoreState {
         };
         let (method, uri, headers) =
             parsed.map_err(|e| self.fail(head_error(e, Produced::Next)))?;
+        let produced_here = matches!(body, types::Body::Bytes(_) | types::Body::Stream);
         let (body, out) = self
             .body_from_guest(body, Produced::Next)
             .map_err(|e| self.fail(e))?;
@@ -429,6 +429,9 @@ impl chain::Host for StoreState {
         *request.method_mut() = method;
         *request.uri_mut() = uri;
         *request.headers_mut() = headers;
+        if produced_here {
+            request.extensions_mut().insert(GuestBody);
+        }
 
         // Entered here, not in the task: the guest may cut the body it just
         // passed before the task has run, and the cut must find `next`
@@ -437,11 +440,12 @@ impl chain::Host for StoreState {
         let fut = wasmtime_wasi::runtime::spawn(async move {
             let resp = host.next(request).await;
             drop(below);
-            if shared.check_next().is_err() {
-                return Err(internal("next failed"));
-            }
             match resp {
-                Ok(resp) => Ok(resp),
+                Ok(Some(resp)) => Ok(resp),
+                // Nothing came back for the forward (it was cut, or
+                // nothing upstream answered): the guest's `next` fails,
+                // and nothing has failed.
+                Ok(None) => Err(internal("no response")),
                 Err(e) => {
                     shared.fail(LayerError::Host(e));
                     Err(internal("next failed"))
@@ -452,7 +456,7 @@ impl chain::Host for StoreState {
             table, exchange, ..
         } = self;
         let ex = exchange.as_mut().expect("in an exchange");
-        let pending = ex.streams.pending(table, fut, true)?;
+        let pending = ex.streams.pending(table, fut)?;
         Ok(Ok((pending, out)))
     }
 
@@ -461,12 +465,12 @@ impl chain::Host for StoreState {
         head: types::ResponseHead,
         body: types::Body,
     ) -> wasmtime::Result<Option<Resource<DynOutputStream>>> {
-        let answer = self.exchange_mut("chain.respond")?.answer.take();
-        let Some(answer) = answer else {
+        if self.exchange("chain.respond")?.answered {
             return Err(self.fail(LayerError::InvalidResponse(
                 "respond called twice".to_owned(),
             )));
-        };
+        }
+        self.exchange_mut("chain.respond")?.answered = true;
         let (status, headers) = head::response_from_guest(head, self.layer.config.max_headers)
             .map_err(|e| self.fail(head_error(e, Produced::Response)))?;
         let produced_here = matches!(body, types::Body::Bytes(_) | types::Body::Stream);
@@ -477,6 +481,8 @@ impl chain::Host for StoreState {
         // returns, so it cannot promise a length: framed by length, a whole
         // body would reach the client complete before a trap after it could
         // cut it. A body passed through keeps the length its origin gave.
+        let shared = self.exchange("chain.respond")?.shared.clone();
+        let body = FromGuest::response(body, shared);
         let body = if produced_here {
             Body::wrap_native(body, u64::MAX, None)
         } else {
@@ -485,12 +491,12 @@ impl chain::Host for StoreState {
         let mut resp = http::Response::new(body);
         *resp.status_mut() = status;
         *resp.headers_mut() = headers;
+        if produced_here {
+            resp.extensions_mut().insert(GuestBody);
+        }
         let ex = self.exchange("chain.respond")?;
         ex.shared.answered();
-        ex.host.answered();
-        // The receiver is gone only once the exchange has failed or been
-        // cancelled; an answer to a failed exchange is discarded.
-        let _ = answer.send(resp);
+        ex.host.respond(resp);
         Ok(out)
     }
 }
@@ -549,7 +555,7 @@ impl endpoints::Host for StoreState {
             table, exchange, ..
         } = self;
         let ex = exchange.as_mut().expect("in an exchange");
-        let pending = ex.streams.pending(table, fut, false)?;
+        let pending = ex.streams.pending(table, fut)?;
         Ok(Ok((pending, out)))
     }
 }

@@ -65,9 +65,11 @@ boundary in one call. Bodies are plain `wasi:io/streams` (vendored at
 - A layer answers with `chain.respond(response-head, body)`, once, before
   `handle` returns; `chain.next(request-head, body)` passes a request down,
   once. Neither waits on the other: a layer may answer and then forward,
-  forward and answer before the response from below arrives, or answer
+  forward and answer before the response from upstream arrives, or answer
   without forwarding; its answer reaches the client as soon as it is made,
-  and a forward it made runs to its end. Both take a `body`: `empty`, `bytes` (one piece, no stream),
+  and a forward it made runs on for as long as it waits for the response
+  (read at least the response head for the forward to be delivered). Both
+  take a `body`: `empty`, `bytes` (one piece, no stream),
   `passthrough` (a stream the host handed this layer, moved host-side
   without entering the guest) or `stream`, for which the call returns the
   `output-stream` to write. A streamed body must be ended with

@@ -418,13 +418,14 @@ pub(crate) async fn observe(
             return forward(st, index, &addon, real_req, tx).await;
         }
     };
-    let host = Arc::new(super::host::StackHost {
-        st: st.clone(),
+    let host = Arc::new(super::host::StackHost::silent(
+        st.clone(),
         index,
-        observer: Some(next),
-        call: None,
-    });
+        Some(next),
+        None,
+    ));
     tokio::spawn(async move {
+        // Whatever the observer answers is discarded by its host.
         let result = match layer.handle(host, copy_req).await {
             // The copy went with the request: its queued frames are back in
             // the budget, and the real exchange never waited.
@@ -432,17 +433,7 @@ pub(crate) async fn observe(
                 request_lag.report(NO_INSTANCE);
                 return;
             }
-            Ok(resp) => {
-                // Whatever it answers is discarded, but read to the end so
-                // the layer's own failures surface.
-                let outcome = resp.extensions().get::<roxy_wasm::LayerOutcome>().cloned();
-                discard(resp.into_body()).await;
-                match outcome {
-                    Some(o) => o.wait().await,
-                    None => Ok(()),
-                }
-            }
-            Err(e) => Err(e),
+            other => other,
         };
         if let Err(e) = result {
             // The exchange failing (below the observer, at admission or in
@@ -466,7 +457,7 @@ pub(crate) async fn observe(
 }
 
 /// Reads `body` to its end or first error, holding one frame at a time.
-async fn discard(mut body: Body) {
+pub(super) async fn discard(mut body: Body) {
     while body.frame().await.is_some_and(|f| f.is_ok()) {}
 }
 
@@ -479,7 +470,7 @@ async fn forward(
     real_req: LayerRequest,
     tx: oneshot::Sender<Result<LayerResponse, HostError>>,
 ) -> Result<LayerResponse, Headless> {
-    match super::layer::below_lanes(&st, index, Ok(real_req)).await {
+    match super::layer::below_lanes(&st, index, Ok(real_req), false).await {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
             let (real_body, copy_body, _lag, cut) = copy_for(&st, addon, Dir::Response, body);

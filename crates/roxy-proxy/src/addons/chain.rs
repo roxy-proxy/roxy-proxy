@@ -423,6 +423,7 @@ impl Chain {
         tx: oneshot::Sender<(Head, Body)>,
         head: Head,
         body: Body,
+        own: bool,
     ) {
         let producer = id.producer();
         let complete = body.is_end_stream();
@@ -441,7 +442,7 @@ impl Chain {
         let body = if complete {
             body
         } else {
-            Body::wrap_native(Reading::new(self, id, body), u64::MAX, known)
+            Body::wrap_native(Reading::new(self, id, body, own), u64::MAX, known)
         };
         // The consumer may have let go already: the body then drops here,
         // which is a stop on a lane that is stopped.
@@ -688,7 +689,7 @@ impl LaneTx {
     pub(crate) fn head(mut self, head: Head, known_length: Option<u64>, cap: u64) -> LaneBody {
         let tx = self.tx.take().expect("used once");
         let (sender, body) = Body::channel_with_depth(LANE_DEPTH, cap, known_length);
-        self.chain.head(self.lane, tx, head, body);
+        self.chain.head(self.lane, tx, head, body, false);
         LaneBody {
             chain: self.chain.clone(),
             lane: self.lane,
@@ -698,10 +699,22 @@ impl LaneTx {
 
     /// Puts `head` on the lane with a body made elsewhere (an upstream's,
     /// a refusal's, the body of the lane this one is bound to): the lane
-    /// ends or cuts as its consumer reads the body to its end.
+    /// ends or cuts as its consumer reads the body to its end. An error
+    /// read from the body is a cut by whoever made the body, not by this
+    /// producer.
     pub(crate) fn whole(mut self, head: Head, body: Body) {
         let tx = self.tx.take().expect("used once");
-        self.chain.head(self.lane, tx, head, body);
+        self.chain.head(self.lane, tx, head, body, false);
+    }
+
+    /// Puts `head` on the lane with a body the producer makes itself (a
+    /// guest's stream): an error read from it is the producer's own cut.
+    /// [`BodyError::Stopped`] is the exception: that is how a failed
+    /// producer's body is cut for it, and the failure is recorded where it
+    /// happened.
+    pub(crate) fn produced(mut self, head: Head, body: Body) {
+        let tx = self.tx.take().expect("used once");
+        self.chain.head(self.lane, tx, head, body, true);
     }
 
     /// Nothing goes on the lane.
@@ -870,7 +883,8 @@ impl LaneRx {
                 self.rx = rx;
                 match seeded {
                     Some((parts, body)) => {
-                        self.chain.head(self.lane, tx, Head::Response(parts), body);
+                        self.chain
+                            .head(self.lane, tx, Head::Response(parts), body, false);
                     }
                     None => self.chain.cut(self.lane, FAILED.to_owned(), false),
                 }
@@ -940,6 +954,8 @@ struct Reading {
     inner: Body,
     chain: Arc<Chain>,
     lane: LaneId,
+    /// The producer made the body itself: an error in it is its own cut.
+    own: bool,
     done: AtomicBool,
     /// One future for the lane's end, so its waker stays registered across
     /// polls that found the inner body pending.
@@ -947,11 +963,12 @@ struct Reading {
 }
 
 impl Reading {
-    fn new(chain: &Arc<Chain>, lane: LaneId, inner: Body) -> Self {
+    fn new(chain: &Arc<Chain>, lane: LaneId, inner: Body, own: bool) -> Self {
         Self {
             inner,
             chain: chain.clone(),
             lane,
+            own,
             done: AtomicBool::new(false),
             terminal: Box::pin(chain.lane(lane).terminal.clone().cancelled_owned()),
         }
@@ -963,11 +980,13 @@ impl Reading {
         }
     }
 
-    /// The body's error reached the reader: the lane is cut, by whoever
-    /// cut the body (its producer's own abort is recorded where it cut).
-    fn cut(&self, why: String) {
+    /// The body's error reached the reader: the lane is cut. It is the
+    /// producer's own abort when the producer made the body and the error
+    /// is not the fail-closed cut of a producer that failed.
+    fn cut(&self, e: &BodyError) {
         if !self.done.swap(true, Ordering::AcqRel) {
-            self.chain.cut(self.lane, why, false);
+            let abort = self.own && *e != BodyError::Stopped;
+            self.chain.cut(self.lane, e.to_string(), abort);
         }
     }
 }
@@ -987,7 +1006,7 @@ impl HttpBody for Reading {
         match Pin::new(&mut this.inner).poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => Poll::Ready(Some(Ok(frame))),
             Poll::Ready(Some(Err(e))) => {
-                this.cut(e.to_string());
+                this.cut(&e);
                 Poll::Ready(Some(Err(e)))
             }
             Poll::Ready(None) => {

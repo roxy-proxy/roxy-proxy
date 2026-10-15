@@ -8,12 +8,11 @@
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-use roxy_wasm::{HostError, LayerError, LayerRequest, LayerResponse};
+use roxy_wasm::{LayerError, LayerRequest, LayerResponse};
 
 use super::chain::{Head, Headless, LaneRx, LaneTx, LayerIo, StageHandle};
 use super::{
-    AddonImpl, AddonMode, BoxFuture, StackError, StackFlow, decode, lock, select, service,
-    subscribe, tee,
+    AddonImpl, AddonMode, StackError, StackFlow, decode, lock, select, service, subscribe, tee,
 };
 
 /// A layer's ends of the hop upstream of it: where its forward goes, and
@@ -25,14 +24,9 @@ pub(super) struct Forward {
 
 /// How running the layer ended.
 enum Entered {
-    /// The layer answered: `res` is still to go on its lane, or it went
-    /// there as the layer answered. `done` resolves when the layer has
-    /// finished with the exchange, with its failure if it failed after
-    /// answering.
-    Answered {
-        res: Option<LayerResponse>,
-        done: BoxFuture<Result<(), StackError>>,
-    },
+    /// The layer ran to the end of its handler; whatever it answered went
+    /// on its lane as it answered.
+    Done,
     /// The layer did not run: what came back from upstream, passed on.
     Through(Result<LayerResponse, Headless>),
     /// A service layer: it runs its own stage on the lanes, torn down by
@@ -51,8 +45,9 @@ pub(super) async fn run(st: Arc<StackFlow>, index: usize, io: LayerIo) {
         stage,
     } = io;
     *lock(&st.layers[index].forward) = Some(Forward { req_out, res_in });
-    // A service's answer goes on the lane where its head is parsed; the
-    // stage keeps the lane until then, or for an answer of its own.
+    // The layer's answer goes on the lane where the layer gives it (a
+    // guest's `respond`, a service's `response` message); the stage keeps
+    // the lane until then.
     let res_out = Arc::new(Mutex::new(Some(res_out)));
     let torn_down = stage.torn_down();
     let arrived = tokio::select! {
@@ -67,19 +62,20 @@ pub(super) async fn run(st: Arc<StackFlow>, index: usize, io: LayerIo) {
             tokio::select! {
                 biased;
                 () = torn_down.cancelled() => None,
-                entered = enter(&st, index, &stage, req) => Some(entered),
+                entered = enter(&st, index, &stage, req, &res_out) => Some(entered),
             }
         }
         Some(Ok((Head::Response(_), _))) => unreachable!("a request lane carries requests"),
         // Nothing reached the layer: nothing leaves it, and what comes
         // back from upstream for that nothing is passed on.
         Some(Err(headless)) => Some(Entered::Through(
-            below_lanes(&st, index, Err(headless)).await,
+            below_lanes(&st, index, Err(headless), false).await,
         )),
     };
     match entered {
-        // Torn down: the chain has cut the layer's lanes.
-        None => {}
+        // Torn down (the chain has cut the layer's lanes), or the layer ran
+        // to the end of its handler with its answer on its lane.
+        None | Some(Entered::Done) => {}
         Some(Entered::Service(svc, req)) => {
             let forward = lock(&st.layers[index].forward).take();
             let answer = lock(&res_out).take();
@@ -92,20 +88,6 @@ pub(super) async fn run(st: Arc<StackFlow>, index: usize, io: LayerIo) {
                 answer,
             };
             service::run(&st, index, &svc, req, ends, &stage).await;
-        }
-        Some(Entered::Answered { res, done }) => {
-            if let (Some(res), Some(res_out)) = (res, lock(&res_out).take()) {
-                let (parts, body) = res.into_parts();
-                res_out.whole(Head::Response(parts), body);
-            }
-            let finished = tokio::select! {
-                biased;
-                () = torn_down.cancelled() => Ok(()),
-                r = done => r,
-            };
-            if let Err(e) = finished {
-                stage.fail(e);
-            }
         }
         Some(Entered::Through(through)) => {
             if let Some(res_out) = lock(&res_out).take() {
@@ -121,9 +103,8 @@ pub(super) async fn run(st: Arc<StackFlow>, index: usize, io: LayerIo) {
         }
         Some(Entered::Fault(e)) => stage.fail(e),
     }
-    // Done: nothing of the layer's takes a body parked for it, a forward
-    // it never made is no forward, and an answer it never gave is none.
-    subscribe::release(&st, index);
+    // Done: a forward the layer never made is no forward, and an answer it
+    // never gave is none.
     let forward = lock(&st.layers[index].forward).take();
     drop(forward);
     let answer = lock(&res_out).take();
@@ -136,12 +117,13 @@ async fn enter(
     index: usize,
     stage: &StageHandle,
     req: LayerRequest,
+    answer: &Arc<Mutex<Option<LaneTx>>>,
 ) -> Entered {
     let addon = st.snap.addons[index].clone();
     let req = match select::selects(st, index, &addon, req) {
         Ok((true, req)) => req,
         // Skipped: as if the layer passed both directions on unchanged.
-        Ok((false, req)) => return Entered::Through(below_lanes(st, index, Ok(req)).await),
+        Ok((false, req)) => return Entered::Through(below_lanes(st, index, Ok(req), false).await),
         Err(e) => return Entered::Fault(e),
     };
     st.layers[index].ran.store(true, Ordering::SeqCst);
@@ -158,43 +140,37 @@ async fn enter(
         return Entered::Through(tee::observe(st.clone(), index, req).await);
     }
     stage.enforcing();
-    let (res, done): (Option<LayerResponse>, BoxFuture<Result<(), StackError>>) = match &addon.kind
-    {
+    match &addon.kind {
         AddonImpl::Wasm(layer) => {
-            let req = subscribe::detach_request(st, index, req);
-            let h = Arc::new(super::host::StackHost {
+            let mut req = req;
+            let host = super::host::StackHost {
                 st: st.clone(),
                 index,
                 observer: None,
                 call: None,
-            });
-            match layer.handle(h, req).await {
-                Ok(mut res) => {
-                    // The guest runs on after answering, and may still
-                    // forward, until its handler returns: kept running
-                    // whether or not the front writes its body, and
-                    // cancelled with the stage.
-                    let running = res.extensions_mut().remove::<roxy_wasm::Running>();
-                    let outcome = res.extensions().get::<roxy_wasm::LayerOutcome>().cloned();
-                    let done = Box::pin(async move {
-                        let r = match outcome {
-                            Some(outcome) => outcome.wait().await.map_err(StackError::from),
-                            None => Ok(()),
-                        };
-                        drop(running);
-                        r
-                    });
-                    (Some(subscribe::reattach_response(st, index, res)), done)
-                }
+                answer: answer.clone(),
+                held_request: Mutex::new(None),
+                held_response: Mutex::new(None),
+            };
+            // A head-only layer gets the head with an empty body; the body
+            // stays here, to go on with the head the layer passes on.
+            if addon.subscribe.request == subscribe::Part::Head {
+                let body = std::mem::take(req.body_mut());
+                subscribe::head_only(req.headers_mut());
+                *lock(&host.held_request) = Some(body);
+            }
+            // The answer goes on its lane as the guest gives it; this
+            // returns once the handler has returned.
+            match layer.handle(Arc::new(host), req).await {
+                Ok(()) => Entered::Done,
                 // Recorded as it happened, through the host; an error
                 // from before the exchange had a host (no instance,
                 // say) is not.
-                Err(e) => return Entered::Fault(e.into()),
+                Err(e) => Entered::Fault(e.into()),
             }
         }
-        AddonImpl::Service(svc) => return Entered::Service(svc.clone(), req),
-    };
-    Entered::Answered { res, done }
+        AddonImpl::Service(svc) => Entered::Service(svc.clone(), req),
+    }
 }
 
 /// What layer `index`'s `next` reaches, on its lanes: the request goes
@@ -202,25 +178,16 @@ async fn enter(
 /// upstream's, the rules' refusal, or the refusal a failure upstream
 /// earns, put on the lane for the layers downstream to see as they would
 /// any response. A lane that ends without a head is the one case nothing
-/// answers: the client's own failure, or a stage torn down.
-pub(crate) fn below(
-    st: Arc<StackFlow>,
-    index: usize,
-    req: LayerRequest,
-) -> BoxFuture<Result<LayerResponse, HostError>> {
-    Box::pin(async move {
-        below_lanes(&st, index, Ok(req))
-            .await
-            .map_err(|e| HostError::new(e.to_string()))
-    })
-}
-
-/// [`below`], with the lane's own account of a response that never came.
-/// `Err` forwards nothing: the lane upstream is ended as it was found.
+/// answers: the forward was cut, the client's own request failed, or a
+/// stage was torn down. `Err` forwards nothing: the lane upstream is ended
+/// as it was found. `own` says the request's body is the layer's own
+/// making (a guest's stream), so an error in it is the layer's cut rather
+/// than one it passed through.
 pub(super) async fn below_lanes(
     st: &Arc<StackFlow>,
     index: usize,
     req: Result<LayerRequest, Headless>,
+    own: bool,
 ) -> Result<LayerResponse, Headless> {
     let Some(Forward {
         req_out,
@@ -231,8 +198,11 @@ pub(super) async fn below_lanes(
         return Err(Headless::Cut("next called twice".to_owned()));
     };
     match req {
+        Ok(req) if own => {
+            let (parts, body) = req.into_parts();
+            req_out.produced(Head::Request(parts), body);
+        }
         Ok(req) => {
-            let req = subscribe::reattach_request(st, index, req);
             let (parts, body) = req.into_parts();
             req_out.whole(Head::Request(parts), body);
         }
@@ -243,12 +213,5 @@ pub(super) async fn below_lanes(
     let Head::Response(parts) = head else {
         unreachable!("a response lane carries responses")
     };
-    let res = http::Response::from_parts(parts, body);
-    // A skipped layer, or an observer, passes the response on whole; an
-    // enforce layer subscribed to the head gets only that.
-    Ok(if st.enforced(index) {
-        subscribe::detach_response(st, index, res)
-    } else {
-        res
-    })
+    Ok(http::Response::from_parts(parts, body))
 }

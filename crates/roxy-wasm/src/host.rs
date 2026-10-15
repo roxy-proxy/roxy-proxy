@@ -28,6 +28,13 @@ pub type LayerResponse = http::Response<Body>;
 /// is answered.
 pub type EndpointPermit = tokio::sync::OwnedSemaphorePermit;
 
+/// In the extensions of a request passed to [`LayerHost::next`] or a
+/// response given to [`LayerHost::respond`] whose body the guest produced
+/// itself (`bytes` or `stream`) rather than passed through: an error in
+/// such a body is the guest's own cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GuestBody;
+
 /// The client as roxy established it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Principal {
@@ -128,16 +135,27 @@ pub enum EndpointError {
 /// of their own here: time below the layer is not the layer's.
 #[async_trait::async_trait]
 pub trait LayerHost: Send + Sync + 'static {
-    /// Pass the request to the layers below this one. Called at most once
-    /// per exchange.
+    /// Pass the request to the layers upstream of this one. Called at most
+    /// once per exchange.
     ///
     /// The host validates the request through the canonical model and
-    /// runs it down the rest of the stack. Bodies stream in both
+    /// runs it up the rest of the stack. Bodies stream in both
     /// directions: the request body is still being produced by the guest
     /// when this is called, and the response body is read by the guest as
-    /// it arrives. A denial is a response, not an error. `Err` fails the
-    /// exchange closed (for example, the request does not validate).
-    async fn next(&self, req: LayerRequest) -> Result<LayerResponse, HostError>;
+    /// it arrives. A denial is a response, not an error. `Ok(None)` means
+    /// nothing came back (the forward was cut, or nothing upstream
+    /// answered): the guest's `next` fails and nothing has failed. `Err`
+    /// fails the exchange closed (for example, the request does not
+    /// validate). Dropping the returned future (the guest dropped its
+    /// `pending-response`) tells the host the layer reads no more of the
+    /// response.
+    async fn next(&self, req: LayerRequest) -> Result<Option<LayerResponse>, HostError>;
+
+    /// The guest answered (`respond`): `res` is the client's response from
+    /// this layer, its body streaming from the guest. Called at most once
+    /// per exchange, before [`crate::Layer::handle`] returns. Must not call
+    /// back into the layer.
+    fn respond(&self, res: LayerResponse);
 
     /// A slot for one endpoint call, taken before the call's body leaves
     /// the guest: `endpoints.call` waits here while the exchange has as
@@ -197,14 +215,8 @@ pub trait LayerHost: Send + Sync + 'static {
 
     /// The exchange failed with `err`. Called once, before the failure can
     /// be seen anywhere else: before [`crate::Layer::handle`] returns it,
-    /// before a body the layer produced ends on it, before the
-    /// [`crate::LayerOutcome`] reports it. So a host that attributes
-    /// failures has this one recorded by the time anything downstream fails
-    /// on it. Must not call back into the layer.
+    /// before a body the layer produced ends on it. So a host that
+    /// attributes failures has this one recorded by the time anything
+    /// downstream fails on it. Must not call back into the layer.
     fn failed(&self, err: &LayerError);
-
-    /// The guest answered (`respond`): the response head is the layer's,
-    /// whatever its `next` returns before or after. Must not call back
-    /// into the layer.
-    fn answered(&self) {}
 }

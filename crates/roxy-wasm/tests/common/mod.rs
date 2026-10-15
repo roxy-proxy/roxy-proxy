@@ -11,10 +11,10 @@ use http_body_util::BodyExt;
 use roxy_http::{Body, BodyError};
 use roxy_wasm::{
     EndpointError, EndpointPermit, FlowInfo, HostError, Layer, LayerConfig, LayerError, LayerHost,
-    LayerOutcome, LayerRequest, LayerResponse, LogLevel, Principal, TagError, WasmRuntime,
-    async_trait,
+    LayerRequest, LayerResponse, LogLevel, Principal, TagError, WasmRuntime, async_trait,
 };
 use tokio::sync::{Semaphore, oneshot, watch};
+use tokio::task::JoinHandle;
 
 pub const TEST_LAYER: &[u8] = include_bytes!("../fixtures/test_layer.wasm");
 
@@ -63,6 +63,9 @@ pub struct Mock {
     /// Set to let calls to the `park` endpoint answer; until then they
     /// wait, holding their permits.
     pub unpark: watch::Sender<bool>,
+    /// Where the layer's answer goes (`respond`), for the exchange in
+    /// progress.
+    pub answer: Mutex<Option<oneshot::Sender<LayerResponse>>>,
 }
 
 /// How many tags the mock host lets a flow hold.
@@ -85,7 +88,15 @@ impl Mock {
             tags: Mutex::new(Vec::new()),
             endpoint_calls: Arc::new(Semaphore::new(MOCK_ENDPOINT_CALLS)),
             unpark: watch::Sender::new(false),
+            answer: Mutex::new(None),
         })
+    }
+
+    /// Arms the host for one exchange's answer.
+    pub fn expect_answer(&self) -> oneshot::Receiver<LayerResponse> {
+        let (tx, rx) = oneshot::channel();
+        *self.answer.lock().unwrap() = Some(tx);
+        rx
     }
 
     pub fn echo() -> Arc<Self> {
@@ -110,12 +121,12 @@ impl Mock {
 
 #[async_trait]
 impl LayerHost for Mock {
-    async fn next(&self, req: LayerRequest) -> Result<LayerResponse, HostError> {
+    async fn next(&self, req: LayerRequest) -> Result<Option<LayerResponse>, HostError> {
         self.next_calls.fetch_add(1, Ordering::SeqCst);
         self.entered.notify_one();
         let (parts, body) = req.into_parts();
         *self.seen.lock().unwrap() = Some(parts.clone());
-        match &self.mode {
+        let resp = match &self.mode {
             NextMode::Echo => Ok(Response::builder()
                 .status(200)
                 .header("x-upstream", "yes")
@@ -153,9 +164,17 @@ impl LayerHost for Mock {
                 });
                 match done.await {
                     Ok(true) => Ok(Response::new(Body::from_bytes("from upstream"))),
-                    _ => Err(HostError::new("upload cut")),
+                    // A forward the guest cut gets no response.
+                    _ => return Ok(None),
                 }
             }
+        };
+        resp.map(Some)
+    }
+
+    fn respond(&self, res: LayerResponse) {
+        if let Some(tx) = self.answer.lock().unwrap().take() {
+            let _ = tx.send(res);
         }
     }
 
@@ -279,22 +298,78 @@ pub async fn collect(body: Body) -> Result<Bytes, BodyError> {
         .map(http_body_util::Collected::to_bytes)
 }
 
+/// An exchange in progress: the layer runs on a task of its own, and its
+/// answer arrives through the host.
+pub struct Started {
+    answer: Option<oneshot::Receiver<LayerResponse>>,
+    task: JoinHandle<Result<(), LayerError>>,
+}
+
+impl Started {
+    /// The layer's answer, as soon as it gives one; the failure if the
+    /// layer fails first.
+    pub async fn response(&mut self) -> Result<LayerResponse, LayerError> {
+        let Some(answer) = self.answer.as_mut() else {
+            panic!("the answer was taken");
+        };
+        let answered = tokio::select! {
+            biased;
+            res = answer => res.ok(),
+            outcome = &mut self.task => {
+                self.answer = None;
+                let outcome = outcome.expect("the layer task does not panic");
+                return Err(outcome.err().unwrap_or(LayerError::NoResponse));
+            }
+        };
+        self.answer = None;
+        if let Some(res) = answered {
+            return Ok(res);
+        }
+        // The host went with the task: it failed before answering.
+        let outcome = (&mut self.task)
+            .await
+            .expect("the layer task does not panic");
+        Err(outcome.err().unwrap_or(LayerError::NoResponse))
+    }
+
+    /// How the exchange ended, once the handler has returned.
+    pub async fn outcome(self) -> Result<(), LayerError> {
+        self.task.await.expect("the layer task does not panic")
+    }
+
+    /// Drops the exchange where it is: the layer's task is aborted.
+    pub fn abort(&self) {
+        self.task.abort();
+    }
+}
+
+/// Starts an exchange on a task of its own.
+pub fn start(layer: &Layer, host: Arc<Mock>, req: LayerRequest) -> Started {
+    let answer = host.expect_answer();
+    let layer = layer.clone();
+    let task = tokio::spawn(async move { layer.handle(host, req).await });
+    Started {
+        answer: Some(answer),
+        task,
+    }
+}
+
 /// Runs a whole exchange, collecting the response body.
 pub async fn exchange(
     layer: &Layer,
     host: Arc<Mock>,
     req: LayerRequest,
 ) -> Result<(StatusCode, Bytes), LayerError> {
-    let resp = layer.handle(host, req).await?;
+    let mut started = start(layer, host, req);
+    let resp = started.response().await?;
     let status = resp.status();
-    let outcome = resp.extensions().get::<LayerOutcome>().cloned().unwrap();
     match collect(resp.into_body()).await {
         Ok(b) => {
-            outcome.wait().await?;
+            started.outcome().await?;
             Ok((status, b))
         }
-        Err(_) => Err(outcome
-            .wait()
+        Err(_) => Err(started
+            .outcome()
             .await
             .expect_err("body failed, so must the outcome")),
     }

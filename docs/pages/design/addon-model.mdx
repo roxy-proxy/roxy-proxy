@@ -34,7 +34,8 @@ chunk by chunk, at any time. roxy infers nothing across the lanes: a
 layer's answer on the response lane says nothing about the request lane,
 which runs on upstream as the layer drives it. A layer that answers and
 wants nothing forwarded forwards nothing; one that answers and forwards
-has a forward that runs to its end. It is each layer's job to keep each
+has a forward that runs on for as long as it waits for the response to it.
+It is each layer's job to keep each
 lane coherent for the next layer along it, and the stack's as a whole to
 keep what leaves the proxy valid: one request upstream, one response
 downstream, each well formed where it reaches a socket.
@@ -59,6 +60,60 @@ The stack is a pipeline: every layer runs at once, as its own task, each
 seeing what the layer above passed on, so on a long stream each works on a
 different chunk at the same time. Observe layers get copies and run beside
 the stream rather than in it.
+
+## Lanes, and the rules that move them
+
+Between two neighbouring stages (the client edge, each layer, the core
+edge) run two lanes: a request lane, produced by the downstream stage and
+consumed by the upstream one, and a response lane the other way. Each lane
+is shaped like an HTTP/2 stream. Its producer may put on it at most one
+head, then bytes, then trailers once, then either an end (complete) or a
+cut (incomplete, with a reason); its consumer may stop it (read no more).
+A lane that is ended or cut before any head carries nothing: a headless
+request lane is no forward, a headless response lane from a layer is no
+answer. A lane that has ended, been cut or been stopped is terminal and
+never moves again; what a producer puts on a terminal lane is discarded.
+
+The rules, which decide every lifecycle question:
+
+- **A stage is done** when both lanes it produces are terminal and it holds
+  neither lane it consumes; letting go of a lane it still holds then is a
+  stop.
+- **A stop on a request lane** tells its producer and nothing else: the
+  upstream stopped reading the forward, and the layer keeps its other
+  lanes.
+- **A stop on a response lane tears its producer down**: the stage is
+  cancelled, every lane it produces that is not terminal is cut, and every
+  lane it holds is let go of. Letting go of its own upstream response lane
+  is a stop on that lane, so the teardown runs upstream hop by hop. This
+  one rule is the client going away (the client edge stops the first
+  response lane and cuts the first request lane), a layer giving up on the
+  layer upstream of it, and a done stage releasing its inputs. A
+  consequence: a forward is carried upstream only while something
+  downstream waits for its response, so a layer that forwards and wants
+  the request delivered reads at least the response head.
+- **A layer that lets go of its response lane without a head** has not
+  answered: that is its `no_response` fault.
+- **A layer that faults** (a trap, a budget, a missed deadline, a lane out
+  of grammar, a reset, an invalid head found at an edge and put down to it,
+  no answer) has its fault recorded first, is torn down, and the refusal
+  the fault earns is put on its response lane if that lane has no head
+  yet, for the layers downstream to see as they would any response.
+- **A layer answered** if the response lane it consumes had no head when
+  it put its own head on the lane it produces, decided then and never
+  re-derived. The first fault recorded stands, and a layer's is logged
+  once.
+- **A layer cutting a lane it produces is an abort, not a fault**: the
+  record says `forward_aborted` or `answer_aborted`, and what is downstream
+  of the cut lane sees it cut.
+- **The exchange is over** when every lane is terminal; the record is
+  final then.
+
+Observers are not stages: an observe layer gets copies of both lanes of a
+hop, nothing it produces moves a lane, and the exchange does not wait for
+it. A head-only layer puts its head on a lane and the body of the lane it
+consumes in the same direction goes on with it (for a response, only when
+the status is the same; otherwise the answer is the layer's own, whole).
 
 ## The response lane starts where the request lane ends
 
@@ -207,13 +262,17 @@ rules.
 `next` and the layer's answer are the two lanes, and neither waits on the
 other. A layer may answer first and forward after, forward and answer
 before the response from upstream arrives, or answer and never forward.
-Its answer reaches the client as soon as it is made. A forward it made
-runs on to its end upstream, and the response still arrives for it to read
-or ignore; a layer that abandons its forward (drops the pending response)
-has it cut, never completed. A layer that fails has any forward of its
-given up with it. Once the client's response is complete and no layer
-forwarded the request, the rest of the client's upload is dropped rather
-than held for a reader that will never come.
+Its answer reaches the client as soon as it is made. A forward is carried
+upstream only while something downstream waits for its response: a layer
+that wants its forward delivered reads at least the response head. A layer
+that stops reading the response (drops the pending response, or returns
+without reading it) has the upstream request cancelled; the forward's body
+is still the layer's to finish or cut. A layer that cuts a lane of its own
+(drops a body unfinished) has aborted it: nothing comes back for a cut
+forward, and the record says `forward_aborted` or `answer_aborted`; that
+is not a failure. A layer that fails is torn down, and everything upstream
+of it with it. Once a layer is done with the client's upload, the rest of
+it is dropped rather than held for a reader that will never come.
 
 ## A layer takes what it subscribes to
 

@@ -998,13 +998,7 @@ pub(crate) async fn open(
 /// and `flow.config`, so the service can key its state on (flow, layer).
 pub(super) fn open_message(st: &Arc<StackFlow>, index: usize, mode: AddonMode) -> Out {
     let addon = &st.snap.addons[index];
-    let info = StackHost {
-        st: st.clone(),
-        index,
-        observer: None,
-        call: None,
-    }
-    .flow_info();
+    let info = StackHost::silent(st.clone(), index, None, None).flow_info();
     Out::Open {
         flow: info.flow_id,
         conn: info.conn_id,

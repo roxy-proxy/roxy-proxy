@@ -32,7 +32,6 @@ mod tee;
 mod ws;
 
 pub(crate) use client_edge::run;
-pub(crate) use layer::below;
 pub(crate) use reclaim::Reclaim;
 pub use service::{ServiceError, ServiceSpec};
 pub use subscribe::{Part, Subscription};
@@ -193,8 +192,6 @@ const MAX_TAG_BYTES: usize = 4096;
 struct LayerSlot {
     /// The layer ran on this exchange: its `when` and `sample` let it.
     ran: AtomicBool,
-    /// Bodies bypassing the layer (enforce mode, head-only subscription).
-    bypass: Mutex<subscribe::Bypass>,
     /// The layer's ends of the hop upstream of it, until it forwards.
     forward: Mutex<Option<layer::Forward>>,
 }
@@ -501,14 +498,6 @@ impl StackFlow {
         }
     }
 
-    /// Layer `index` is answering: whether its answer is its own is read
-    /// now, and a response from upstream arriving from here on has no head
-    /// of the layer's to be spliced onto.
-    pub(crate) fn layer_answered(&self, index: usize) {
-        self.chain().layer_answering(index);
-        subscribe::answered(self, index);
-    }
-
     /// The front refused the upgrade the stack relayed: the exchange is
     /// over, and the socket the layers were to carry is dropped unspliced.
     pub(crate) fn abandon_upgrade(&self) {
@@ -754,9 +743,9 @@ mod tests {
         assert!(st.torn_down().is_cancelled());
     }
 
-    /// Which layer answered is read as it answers: a forward that resolves
-    /// between the answer and the front taking it does not turn the answer
-    /// into the response from below.
+    /// Which layer answered is read as its head lands on its lane: a
+    /// response from upstream landing after that does not turn the answer
+    /// into a response passed on.
     #[tokio::test]
     async fn the_answering_layer_is_read_when_it_answers() {
         let kit = Kit::builder()
@@ -774,11 +763,10 @@ mod tests {
         let (st, _cx, mut ends) = test_flow(&kit);
         let a = ends.layers.pop().unwrap();
         a.stage.enforcing();
-        st.layer_answered(0);
+        a.res_out.whole(Head::Response(answer(403)), Body::empty());
         ends.core
             .res_out
             .whole(Head::Response(answer(200)), Body::empty());
-        a.res_out.whole(Head::Response(answer(403)), Body::empty());
         assert_eq!(st.answered_by(), Some(0));
 
         let (st, _cx, mut ends) = test_flow(&kit);
@@ -787,9 +775,12 @@ mod tests {
         ends.core
             .res_out
             .whole(Head::Response(answer(200)), Body::empty());
-        st.layer_answered(0);
         a.res_out.whole(Head::Response(answer(200)), Body::empty());
-        assert_eq!(st.answered_by(), None, "the response from below, passed on");
+        assert_eq!(
+            st.answered_by(),
+            None,
+            "the response from upstream, passed on"
+        );
     }
 
     /// A metric source's detail can quote the series key, which a rule may

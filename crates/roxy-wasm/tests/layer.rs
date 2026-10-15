@@ -11,8 +11,8 @@ use http::{Method, Response, StatusCode};
 use http_body_util::BodyExt;
 use roxy_http::{Body, BodyError, BodySender};
 use roxy_wasm::{
-    Budget, Capabilities, Capability, HostError, Layer, LayerError, LayerOutcome, LoadError,
-    MAX_FIELDS_BYTES, MAX_MESSAGE_BYTES,
+    Budget, Capabilities, Capability, HostError, Layer, LayerError, LoadError, MAX_FIELDS_BYTES,
+    MAX_MESSAGE_BYTES,
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -26,12 +26,14 @@ async fn passes_through_and_transforms() {
     let host = Mock::echo();
     let mut req = request("pass", Body::from_bytes("hello layer"));
     req.headers_mut().insert("x-upper", "1".parse().unwrap());
-    let resp = layer.handle(host.clone(), req).await.unwrap();
+    let mut started = start(&layer, host.clone(), req);
+    let resp = started.response().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.headers()["x-upstream"], "yes");
     let body = collect(resp.into_body()).await.unwrap();
     // Upper-cased on the way down, and again (no-op) on the way up.
     assert_eq!(body, "HELLO LAYER");
+    started.outcome().await.unwrap();
 
     let seen = host.seen.lock().unwrap().clone().unwrap();
     assert_eq!(seen.method, Method::POST);
@@ -61,11 +63,7 @@ async fn streams_both_directions() {
     let (mut client_tx, client_body) = Body::channel(u64::MAX, None);
     let mut req = request("pass", client_body);
     req.headers_mut().insert("x-upper", "1".parse().unwrap());
-    let handle = tokio::spawn({
-        let layer = layer.clone();
-        let host = host.clone();
-        async move { layer.handle(host, req).await }
-    });
+    let mut started = start(&layer, host.clone(), req);
 
     // Request direction: the host sees each chunk while the client is
     // still sending.
@@ -85,7 +83,7 @@ async fn streams_both_directions() {
     // Response direction: the head comes back once the guest has it, and
     // each chunk reaches the client before the upstream sends the next.
     up_tx.send_data(Bytes::from("alpha ")).await.unwrap();
-    let resp = handle.await.unwrap().unwrap();
+    let resp = started.response().await.unwrap();
     let mut body = resp.into_body();
     for chunk in ["alpha ", "beta ", "gamma"] {
         if chunk != "alpha " {
@@ -324,16 +322,16 @@ async fn failures_after_the_head_cut_the_body() {
         ("leak", "leak"),
     ] {
         let host = Mock::echo();
-        let resp = layer
-            .handle(host.clone(), request(test, Body::empty()))
+        let mut started = start(&layer, host.clone(), request(test, Body::empty()));
+        let resp = started
+            .response()
             .await
             .unwrap_or_else(|e| panic!("{test}: head should be out: {e}"));
-        let outcome = resp.extensions().get::<LayerOutcome>().cloned().unwrap();
         let err = collect(resp.into_body()).await.unwrap_err();
         assert_eq!(err, BodyError::Stopped, "{test}");
         // The body ended on a failure the host already had.
         let told = host.failed.lock().unwrap().clone();
-        let failure = outcome.wait().await.unwrap_err();
+        let failure = started.outcome().await.unwrap_err();
         assert_eq!(told.as_slice(), std::slice::from_ref(&failure), "{test}");
         match check {
             "trap" => assert!(
@@ -359,18 +357,19 @@ async fn looping_on_add_tag_after_the_head_fails_at_the_cap() {
     let rt = runtime();
     let layer = load(&rt, config()).await;
     let host = Mock::echo();
-    let resp = layer
-        .handle(host.clone(), request("tags-after-head", Body::empty()))
-        .await
-        .unwrap();
+    let mut started = start(
+        &layer,
+        host.clone(),
+        request("tags-after-head", Body::empty()),
+    );
+    let resp = started.response().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
-    let outcome = resp.extensions().get::<LayerOutcome>().cloned().unwrap();
     assert_eq!(
         collect(resp.into_body()).await.unwrap_err(),
         BodyError::Stopped
     );
     assert_eq!(
-        outcome.wait().await.unwrap_err(),
+        started.outcome().await.unwrap_err(),
         LayerError::BudgetExceeded(Budget::Tags)
     );
     // The refused tag is the first one past the cap.
@@ -525,29 +524,31 @@ async fn invalid_next_request_fails_closed() {
 }
 
 /// A request body passed to `next` and left unfinished while the guest is
-/// still waiting on the response fails the exchange, whatever the guest
-/// answers next.
+/// still waiting on the response is the guest's own cut of its forward,
+/// not a failure: nothing comes back for it, so `next` fails for the
+/// guest, which answers as it likes.
 #[tokio::test]
-async fn unfinished_next_body_while_awaiting_fails_closed() {
+async fn unfinished_next_body_while_awaiting_cuts_the_forward() {
     let rt = runtime();
     let layer = load(&rt, config()).await;
     let host = Mock::new(NextMode::Upload);
-    let err = exchange(
+    let (status, body) = exchange(
         &layer,
         host.clone(),
         request("cut-then-await", Body::from_bytes("partial")),
     )
     .await
-    .unwrap_err();
-    assert!(matches!(err, LayerError::InvalidRequest(_)), "{err:?}");
+    .unwrap();
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "answered after next failed");
     assert_eq!(host.next_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(host.upload_ended().await, Err(BodyError::Stopped));
+    assert_eq!(host.upload_ended().await, Err(BodyError::Incomplete));
+    assert!(host.failed.lock().unwrap().is_empty());
 }
 
 /// A guest that has answered and then leaves its `next` body unfinished
-/// while waiting on the response has cut its forward, not failed the
-/// exchange: `next` fails for the guest, the host is told of the fault,
-/// and the answer stands.
+/// while waiting on the response has cut its forward: `next` fails for
+/// the guest, nothing has failed, and the answer stands.
 #[tokio::test]
 async fn unfinished_next_body_after_answering_cuts_the_forward_only() {
     let rt = runtime();
@@ -562,12 +563,8 @@ async fn unfinished_next_body_after_answering_cuts_the_forward_only() {
     .unwrap();
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "answered and kept");
-    assert_eq!(host.upload_ended().await, Err(BodyError::Stopped));
-    let failed = host.failed.lock().unwrap().clone();
-    assert!(
-        matches!(failed.as_slice(), [LayerError::InvalidRequest(_)]),
-        "{failed:?}"
-    );
+    assert_eq!(host.upload_ended().await, Err(BodyError::Incomplete));
+    assert!(host.failed.lock().unwrap().is_empty());
 }
 
 /// An endpoint call's future the guest holds is not a wait on `next`: a
@@ -593,7 +590,7 @@ async fn a_held_endpoint_call_does_not_make_an_abandoned_next_a_cut() {
     let (status, body) = handle.await.unwrap().unwrap();
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "abandoned with a call held");
-    assert_eq!(host.upload_ended().await, Err(BodyError::Stopped));
+    assert_eq!(host.upload_ended().await, Err(BodyError::Incomplete));
     let failed = host.failed.lock().unwrap().clone();
     assert!(failed.is_empty(), "{failed:?}");
 }
@@ -623,7 +620,7 @@ async fn unfinished_next_body_after_dropping_the_future_is_not_a_failure() {
         let (status, body) = handle.await.unwrap().unwrap();
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body, "answered by  after forwarding 7 bytes");
-        assert_eq!(host.upload_ended().await, Err(BodyError::Stopped));
+        assert_eq!(host.upload_ended().await, Err(BodyError::Incomplete));
     }
 }
 
@@ -1010,6 +1007,7 @@ async fn dropping_the_exchange_cancels_it() {
         let layer = layer.clone();
         async move {
             let _done = done_tx;
+            let _answer = host.expect_answer();
             layer.handle(host, request("pass", client_body)).await
         }
     });
@@ -1125,7 +1123,8 @@ async fn both_bodies_stream_at_once() {
     let (mut client_tx, client_body) = Body::channel(u64::MAX, None);
     let mut req = request("pass", client_body);
     req.headers_mut().insert("x-upper", "1".parse().unwrap());
-    let resp = layer.handle(Mock::echo(), req).await.unwrap();
+    let mut started = start(&layer, Mock::echo(), req);
+    let resp = started.response().await.unwrap();
     let mut body = resp.into_body();
     for msg in ["ping", "pong", "done"] {
         client_tx.send_data(Bytes::from(msg)).await.unwrap();
