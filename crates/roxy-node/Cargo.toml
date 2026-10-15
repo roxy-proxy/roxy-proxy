@@ -39,7 +39,7 @@ http-body-util = { version = "0.1.5", default-features = false, optional = true 
 hyper = { version = "1.11.1", features = ["server", "http1"], optional = true }
 hyper-util = { version = "0.1.21", features = ["server", "tokio", "http1"], optional = true }
 rcgen = { workspace = true, optional = true }
-rustls = { version = "0.23.45", default-features = false, features = ["ring", "tls12", "std"], optional = true }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "tls12", "std"], optional = true }
 tokio-rustls = { version = "0.26.6", default-features = false, features = ["ring", "tls12"], optional = true }
 
 [dev-dependencies]

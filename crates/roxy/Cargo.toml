@@ -49,7 +49,7 @@ hyper = { version = "1.11.1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1.21", features = ["server", "server-auto", "tokio", "http1", "http2"] }
 rcgen.workspace = true
 reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "stream", "http2"] }
-rustls = { version = "0.23.45", default-features = false, features = ["ring", "tls12", "std"] }
+rustls = { version = "0.23.46", default-features = false, features = ["ring", "tls12", "std"] }
 serde_json.workspace = true
 tempfile.workspace = true
 tokio-rustls = { version = "0.26.6", default-features = false }
