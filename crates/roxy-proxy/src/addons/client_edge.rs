@@ -126,10 +126,12 @@ pub(super) fn stack_outcome(
         unreachable!("a response lane carries responses")
     };
     let mut resp = http::Response::from_parts(parts, body);
-    // A layer's answer is a final response; the one `1xx` with a meaning
-    // here is the `101` of a relayed upgrade, judged below.
-    if resp.status().is_informational() && resp.status() != StatusCode::SWITCHING_PROTOCOLS {
-        let err = LayerError::InvalidResponse(format!("{} is not a final response", resp.status()));
+    // A layer's answer is a final response a client can be given; the
+    // one `1xx` with a meaning here is the `101` of a relayed upgrade,
+    // judged below.
+    let status = resp.status().as_u16();
+    if status != 101 && !(200..=599).contains(&status) {
+        let err = LayerError::InvalidResponse(format!("{status} is not a final response"));
         st.fail(&st.blamed(), err);
         return refuse(st);
     }

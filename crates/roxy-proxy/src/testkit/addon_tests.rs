@@ -2197,11 +2197,12 @@ mod service {
     }
 
     /// A service that ends its forwarded request with an error has cut its
-    /// own forward: the cut is its fault, the refusal that earns comes back
-    /// on its response lane, and the client gets it unless the service
-    /// reshapes it.
+    /// own forward: an abort, not a fault. Nothing answers it (its
+    /// response lane comes back cut, headless), and a service that passes
+    /// that on rather than answering has given no answer: the client gets
+    /// the `503` that earns, logged as `no_response`.
     #[tokio::test]
-    async fn a_service_cutting_its_forward_is_refused_as_its_own_failure() {
+    async fn a_service_cutting_its_forward_gets_no_answer_for_it() {
         let kit = kit(
             RULES,
             vec![addon("s", "cut-forward", AddonMode::Enforce, |_| {})],
@@ -2214,7 +2215,7 @@ mod service {
         assert_eq!(ev["decision"], "deny", "{ev:#}");
         assert_eq!(ev["terminal_rule"], "layer:s");
         let errs = kit.events("layer_error", 1).await;
-        assert_eq!(errs[0]["kind"], "service:cut", "{errs:#?}");
+        assert_eq!(errs[0]["kind"], "no_response", "{errs:#?}");
         assert!(kit.upstream.seen().is_empty(), "nothing complete left");
     }
 

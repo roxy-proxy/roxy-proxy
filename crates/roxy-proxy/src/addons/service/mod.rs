@@ -1,12 +1,13 @@
 //! Service layers: an external service in the network path.
 //!
 //! Each exchange is a stream on one of a few pooled WebSocket connections
-//! to the layer's named endpoint ([`mux`]). The
-//! stream carries the exchange's two lanes, each a head, bytes and an
-//! end, each way: roxy streams the request into it as it arrives, and the
-//! response from below once there is one; the service streams back the
-//! request it forwards, if it forwards one, and the response the client
-//! gets, which it owes:
+//! to the layer's named endpoint ([`mux`]). The stream carries the two
+//! lanes each way, each shaped like an HTTP/2 stream: a head, body bytes,
+//! trailers, an end, or a cut (an end with `error`); the reader of a lane
+//! may `stop` it. Roxy streams the request into the service as it arrives,
+//! and the response from upstream once there is one; the service streams
+//! back the request it forwards, if it forwards one, and the response the
+//! client gets, which it owes:
 //!
 //! ```text
 //! roxy → service   open, {"type":"request", method, url, headers}  bytes…  request_end
@@ -17,16 +18,19 @@
 //!
 //! Nothing orders one lane against the other: the service may answer
 //! before it forwards, while it forwards or without forwarding, and roxy
-//! takes each head as it comes. A body that fails on its way to the
-//! service ends its lane with the error (`"error"` on the end), and the
-//! service's own lanes go on. A WebSocket is the same exchange,
+//! takes each head as it comes. A lane's end may come before its head and
+//! then carries nothing: a headless `request_end` from the service is no
+//! forward, a headless `response_end` is no answer. The stream ends when
+//! the service has ended both its lanes, or roxy has stopped them. A body
+//! that fails on its way to the service ends its lane with the error, and
+//! the service's own lanes go on. A WebSocket is the same exchange,
 //! long-lived: after the `101` the request body is the client's bytes and
 //! the response body the upstream's, until each side closes.
 //!
 //! What the service forwards is held to the same checks as a WASM layer's
 //! `next` (re-validated as strictly as a client request, then judged by
 //! the rules). Fail closed (enforce mode): a failed connection or
-//! handshake, a protocol violation, a missed deadline, a reset or a lost
+//! handshake, a lane out of grammar, a missed deadline, a reset or a lost
 //! connection deny the exchange before the response head and cut the body
 //! after it. The connection goes through the connector (address floor,
 //! deny lists) and never through other layers or the rules.
@@ -39,16 +43,15 @@ use std::time::Duration;
 
 use http::{HeaderMap, HeaderName, HeaderValue};
 use roxy_http::Body;
-use roxy_wasm::{LayerError, LayerRequest, LayerResponse, LogLevel};
+use roxy_wasm::{LayerError, LayerRequest, LogLevel};
 use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot::error::TryRecvError;
-use tokio::sync::{oneshot, watch};
-use tokio::task::JoinHandle;
+use tokio::sync::watch;
 use tokio::time::Instant as TokioInstant;
+use tokio_util::sync::CancellationToken;
 
-use super::chain::{Head, LaneTx};
+use super::chain::{Head, Headless, LaneRx, LaneTx, StageHandle};
 use super::tee::CopyCut;
-use super::{AddonMode, StackFlow, Subscription, lock, subscribe};
+use super::{AddonMode, Part, StackError, StackFlow, Subscription, lock};
 use crate::in_flight::Dir;
 
 pub(crate) use mux::Pools;
@@ -92,10 +95,6 @@ pub enum ServiceError {
     /// only.
     #[error("service sent bytes of the {0} body it is not subscribed to")]
     Unsubscribed(&'static str),
-    /// The service ended a lane it was sending short of complete, on
-    /// purpose: the body is cut where it stopped.
-    #[error("service cut the {dir} body: {why}")]
-    Cut { dir: &'static str, why: String },
     /// Host-service call `call` failed, or called a service the layer was
     /// not granted: the same failures a WASM layer's host calls have, with
     /// the same flow-log kinds.
@@ -107,24 +106,6 @@ pub enum ServiceError {
     },
 }
 
-/// Why the service's answer will not come.
-#[derive(Debug, Clone, thiserror::Error)]
-pub(super) enum Unanswered {
-    /// The service failed the stream.
-    #[error(transparent)]
-    Service(ServiceError),
-    /// roxy gave up on the stream (the client went away, say), recorded by
-    /// whoever gave it up: the service is not at fault.
-    #[error("service stream lost: {0}")]
-    Abandoned(String),
-}
-
-impl From<ServiceError> for Unanswered {
-    fn from(e: ServiceError) -> Self {
-        Unanswered::Service(e)
-    }
-}
-
 impl ServiceError {
     /// A stable code for the flow log (`layer_error.kind`).
     pub fn kind(&self) -> String {
@@ -134,7 +115,6 @@ impl ServiceError {
             ServiceError::Protocol(_) => "service:protocol".into(),
             ServiceError::Closed(_) => "service:closed".into(),
             ServiceError::Unsubscribed(dir) => format!("unsubscribed:{dir}"),
-            ServiceError::Cut { .. } => "service:cut".into(),
             ServiceError::Layer { err, .. } => super::layer_error_kind(err),
         }
     }
@@ -201,6 +181,15 @@ enum Out {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// Trailers of the `dir` body: after its bytes, before its end.
+    Trailers {
+        dir: Dir,
+        headers: Vec<(String, String)>,
+    },
+    /// Roxy reads no more of the `dir` body the service sends.
+    Stop {
+        dir: Dir,
+    },
     Credit {
         dir: Dir,
         bytes: u64,
@@ -234,6 +223,15 @@ enum In {
     ResponseEnd {
         #[serde(default)]
         error: Option<String>,
+    },
+    Trailers {
+        dir: Dir,
+        #[serde(default)]
+        headers: Vec<(String, String)>,
+    },
+    /// The service reads no more of the `dir` body roxy sends.
+    Stop {
+        dir: Dir,
     },
     Credit {
         dir: Dir,
@@ -417,17 +415,6 @@ fn declared_length(h: &HeaderMap) -> Result<Option<u64>, ServiceError> {
     }
 }
 
-/// Runs enforce-mode service layer `index` on `req`.
-pub(super) async fn handle(
-    st: &Arc<StackFlow>,
-    index: usize,
-    svc: &ServiceSpec,
-    req: LayerRequest,
-    res_out: Arc<Mutex<Option<LaneTx>>>,
-) -> Result<JoinHandle<()>, Unanswered> {
-    run(st, index, svc, req, res_out).await
-}
-
 /// The head's fields, plus `content-length` when the body's length is
 /// known (and not zero), so a service that passes the head on keeps it.
 /// roxy checks it against the body the service sends back.
@@ -457,139 +444,152 @@ fn response_head(parts: &http::response::Parts, body: &Body) -> Out {
     }
 }
 
-/// Runs the service until it has answered on `res_out`; the task
-/// returned attends its stream to the end.
-async fn run(
+/// A service layer's ends of its lanes besides the request it was given:
+/// the response lane it consumes, and the two lanes it produces.
+pub(super) struct Ends {
+    pub(super) res_in: LaneRx,
+    pub(super) forward: LaneTx,
+    pub(super) answer: LaneTx,
+}
+
+/// Runs enforce-mode service layer `index` on its lanes: `req` is what
+/// reached it (its head read), and the service's own lanes go to the
+/// stream, where its heads are put on them as they are parsed. Returns
+/// once the stream has ended.
+pub(super) async fn run(
     st: &Arc<StackFlow>,
     index: usize,
     svc: &ServiceSpec,
     req: LayerRequest,
-    res_out: Arc<Mutex<Option<LaneTx>>>,
-) -> Result<JoinHandle<()>, Unanswered> {
-    let answer_to: mux::AnswerSink = {
-        let st = st.clone();
-        Box::new(move |res: LayerResponse| {
-            if let Some(res_out) = lock(&res_out).take() {
-                let res = subscribe::reattach_response(&st, index, res);
-                let (parts, body) = res.into_parts();
-                res_out.whole(Head::Response(parts), body);
-            }
-        })
+    ends: Ends,
+    stage: &StageHandle,
+) {
+    let Ends {
+        res_in,
+        forward,
+        answer,
+    } = ends;
+    let torn_down = stage.torn_down();
+    let held_request = Arc::new(Mutex::new(None));
+    let held_response = Arc::new(Mutex::new(None));
+    // The lanes stay here until the stream takes them: a stream that
+    // never opens leaves them to the fault recorded for it.
+    let mut lanes = Some(mux::Lanes {
+        req: forward,
+        res: answer,
+        held_request: held_request.clone(),
+        held_response: held_response.clone(),
+    });
+    let opened = tokio::select! {
+        biased;
+        () = torn_down.cancelled() => return,
+        opened = tokio::time::timeout(
+            svc.first_byte_timeout,
+            mux::open(st, index, svc, AddonMode::Enforce, &mut lanes),
+        ) => opened,
     };
-    let (stream, answers) = tokio::time::timeout(
-        svc.first_byte_timeout,
-        mux::open(st, index, svc, AddonMode::Enforce, Some(answer_to)),
-    )
-    .await
-    .map_err(|_| ServiceError::Timeout("first_byte_timeout"))??;
-    let Some(answers) = answers else {
-        return Err(ServiceError::Closed("no answers on an enforce stream".into()).into());
+    let stream = match opened {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => return stage.fail(StackError::Service(e)),
+        Err(_) => {
+            return stage.fail(StackError::Service(ServiceError::Timeout(
+                "first_byte_timeout",
+            )));
+        }
     };
-    // Until the service has answered, an exchange that ends here (the
-    // client went away, a missed head) resets the stream.
-    let guard = Guard(Some(stream.clone()));
-
     // The service's clock starts with the request head, however long
     // getting the stream took.
     let clock = Clock::new(svc.first_byte_timeout);
-    let (parts, body) = req.into_parts();
-    let s = stream.clone();
-    let head = request_head(&parts, &body);
-    tokio::spawn(async move { s.pump(Dir::Request, head, body).await });
-    let attended = tokio::spawn(attend(
-        st.clone(),
-        index,
+    let subscribe = st.snap.addons[index].subscribe;
+    let request = tokio::spawn(pump_request(
         stream.clone(),
-        answers.forward,
+        req,
+        subscribe.request == Part::Head,
+        held_request,
+    ));
+    let response = tokio::spawn(pump_response(
+        stream.clone(),
+        res_in,
+        subscribe.response == Part::Head,
+        held_response,
         clock.clone(),
     ));
-
-    match clock
-        .answer_by(answers.answer, || st.forward_requested(index))
-        .await
-    {
-        Ok(answer) => answer?,
-        // The service's own deadline: it is told which, as for any fault
-        // of its own.
-        Err(e) => {
-            stream.fail(e.clone(), mux::Reset::Send);
-            guard.disarm();
-            return Err(e.into());
-        }
-    }
-    guard.disarm();
-    Ok(attended)
-}
-
-/// Attends the stream for the life of the exchange: runs the request lane
-/// below the service, then stays until the stream has ended (the service
-/// may hold a body open long after its forward is through). The layer
-/// being torn down before that resets the stream, whatever the lane is
-/// doing: nothing more happens on it.
-async fn attend(
-    st: Arc<StackFlow>,
-    index: usize,
-    stream: Arc<mux::Stream>,
-    forward: oneshot::Receiver<LayerRequest>,
-    clock: Clock,
-) {
-    let torn_down = st.layer_torn_down(index);
-    let lane = async {
-        forward_lane(&st, index, &stream, forward, &clock).await;
-        stream.until_ended().await;
-    };
+    let answered = stream.answered();
     tokio::select! {
         biased;
         () = torn_down.cancelled() => stream.abandon(),
-        () = lane => {}
+        () = stream.until_ended() => {}
+        // The service's own deadline: it is told which, as for any fault
+        // of its own.
+        () = clock.expired(answered, || st.forward_requested(index)) => {
+            stream.fail(ServiceError::Timeout("first_byte_timeout"), mux::Reset::Send);
+        }
     }
+    // The stream has ended: what roxy still pumped of its lanes is let go
+    // of, which the layer downstream and the core learn of as a stop.
+    request.abort();
+    response.abort();
 }
 
-/// The request lane below the service: the request it forwards, if it
-/// forwards one, run through the layers below and the core, and the
-/// response that comes back streamed into the service. Independent of the
-/// service's answer: the forward runs to its end whether the service
-/// answers before, during or after it. The service's own stream ending
-/// does not end it, the response from below then has nowhere to go and is
-/// dropped as it arrives.
-async fn forward_lane(
-    st: &Arc<StackFlow>,
-    index: usize,
-    stream: &mux::Stream,
-    forward: oneshot::Receiver<LayerRequest>,
-    clock: &Clock,
+/// Streams `req` to the service on its request lane. For a head-only
+/// subscription the body stays with roxy, to go on with the head the
+/// service forwards.
+async fn pump_request(
+    stream: Arc<mux::Stream>,
+    req: LayerRequest,
+    head_only: bool,
+    kept: Arc<Mutex<Option<Body>>>,
 ) {
-    // `Err`: the stream ended without a forward.
-    let Ok(req) = forward.await else {
-        return;
-    };
-    // A stream reset as the forward arrived (a missed deadline, the client
-    // gone) has told the service nothing more happens on it. One that
-    // ended on the service's last message has not: the forward runs.
-    if stream.is_broken() {
+    let (parts, body) = req.into_parts();
+    let head = request_head(&parts, &body);
+    if head_only {
+        *lock(&kept) = Some(body);
+        if stream.send(&head).await {
+            stream.send(&Out::RequestEnd { error: None }).await;
+        }
         return;
     }
-    clock.stop();
-    // Only the client's own failure comes back as an error, and nothing
-    // upstream answers it.
-    let Ok(res) = super::below(st.clone(), index, req).await else {
-        stream.abandon();
-        return;
-    };
-    // The response head goes at once, however far the client's upload
-    // has got. A `101` goes the same way: its body is the upstream's side
-    // of the WebSocket, and the request body still streaming is the
-    // client's.
-    clock.restart();
-    let (parts, body) = res.into_parts();
-    let head = response_head(&parts, &body);
-    stream.pump(Dir::Response, head, body).await;
+    stream.pump(Dir::Request, head, body).await;
+}
+
+/// Streams the response from upstream to the service on its response
+/// lane, as soon as it arrives, however far the client's upload has got;
+/// the service's clock restarts with it. A lane that ends without a head
+/// is passed on as such: nothing came back for what the service forwarded.
+async fn pump_response(
+    stream: Arc<mux::Stream>,
+    mut res_in: LaneRx,
+    head_only: bool,
+    kept: Arc<Mutex<Option<(http::StatusCode, Body)>>>,
+    clock: Clock,
+) {
+    match res_in.head().await {
+        Ok((Head::Response(parts), body)) => {
+            clock.restart();
+            let head = response_head(&parts, &body);
+            if head_only {
+                *lock(&kept) = Some((parts.status, body));
+                if stream.send(&head).await {
+                    stream.send(&Out::ResponseEnd { error: None }).await;
+                }
+                return;
+            }
+            stream.pump(Dir::Response, head, body).await;
+        }
+        Ok((Head::Request(_), _)) => unreachable!("a response lane carries responses"),
+        Err(Headless::Ended) => {
+            stream.send(&Out::ResponseEnd { error: None }).await;
+        }
+        Err(Headless::Cut(why)) => {
+            stream.send(&Out::ResponseEnd { error: Some(why) }).await;
+        }
+    }
 }
 
 /// The service's answer clock: `first_byte_timeout` from roxy's request
-/// head, stopped while the service's forward is below, and
-/// `first_byte_timeout` again from the response head from below. The
-/// service's own time, never the time below it.
+/// head, stopped while the service's forward is upstream unanswered, and
+/// `first_byte_timeout` again from the response head from upstream. The
+/// service's own time, never the time upstream of it.
 #[derive(Clone)]
 struct Clock {
     limit: Duration,
@@ -602,11 +602,6 @@ impl Clock {
             limit,
             deadline: watch::Sender::new(Some(TokioInstant::now() + limit)),
         }
-    }
-
-    /// The service forwarded: no clock runs while the request is upstream.
-    fn stop(&self) {
-        self.deadline.send_replace(None);
     }
 
     /// Stops the clock if `at` is still its deadline: an expiry seen
@@ -630,16 +625,12 @@ impl Clock {
             .send_replace(Some(TokioInstant::now() + self.limit));
     }
 
-    /// The service's answer, within the clock. An answer that lands as the
-    /// deadline passes is still an answer, and so is a forward accepted by
-    /// then (`forwarded`) that the task carrying it has yet to pick up:
-    /// the timeout polls the channel and the stream's state before the
-    /// clock, so it reports elapsed with a value already queued.
-    async fn answer_by<T>(
-        &self,
-        mut answer: oneshot::Receiver<T>,
-        forwarded: impl Fn() -> bool,
-    ) -> Result<T, ServiceError> {
+    /// Resolves when the deadline passes without an answer. An answer
+    /// that lands as the deadline passes is still an answer, and a forward
+    /// outstanding by then (`forwarded`) stops the clock instead: both are
+    /// read before the clock is believed. Pending for ever once the
+    /// service has answered.
+    async fn expired(&self, answered: CancellationToken, forwarded: impl Fn() -> bool) {
         let mut deadline = self.deadline.subscribe();
         loop {
             let at = *deadline.borrow_and_update();
@@ -651,21 +642,17 @@ impl Clock {
             };
             tokio::select! {
                 biased;
-                r = &mut answer => {
-                    return r.map_err(|_| ServiceError::Closed("the stream ended".into()));
-                }
+                () = answered.cancelled() => std::future::pending::<()>().await,
                 // Cannot fail: this clock holds the sender.
                 _ = deadline.changed() => {}
                 () = expiry => {
-                    match answer.try_recv() {
-                        Ok(v) => return Ok(v),
-                        Err(TryRecvError::Closed) => {
-                            return Err(ServiceError::Closed("the stream ended".into()));
-                        }
-                        Err(TryRecvError::Empty) if forwarded() => self.stop_if(at),
-                        Err(TryRecvError::Empty) => {
-                            return Err(ServiceError::Timeout("first_byte_timeout"));
-                        }
+                    if answered.is_cancelled() {
+                        std::future::pending::<()>().await;
+                    }
+                    if forwarded() {
+                        self.stop_if(at);
+                    } else {
+                        return;
                     }
                 }
             }
@@ -673,27 +660,10 @@ impl Clock {
     }
 }
 
-/// Resets a stream whose exchange ended before the service's answer.
-struct Guard(Option<Arc<mux::Stream>>);
-
-impl Guard {
-    fn disarm(mut self) {
-        self.0 = None;
-    }
-}
-
-impl Drop for Guard {
-    fn drop(&mut self) {
-        if let Some(s) = self.0.take() {
-            s.abandon();
-        }
-    }
-}
-
 /// Runs observe-mode service layer `index`: the copies go to the service
-/// on a stream of their own. What it sends back goes nowhere, but its
-/// last message ends the stream as it does an enforce one, so it may read
-/// the copies and then call the host services before ending it.
+/// on a stream of their own. What it sends back goes nowhere, but it ends
+/// the stream as it does an enforce one, by ending both its lanes, so it
+/// may read the copies and then call the host services before ending it.
 pub(super) async fn observe(
     st: &Arc<StackFlow>,
     index: usize,
@@ -704,12 +674,12 @@ pub(super) async fn observe(
     let start = TokioInstant::now();
     let opened = tokio::time::timeout_at(
         start + svc.first_byte_timeout,
-        mux::open(st, index, svc, AddonMode::Observe, None),
+        mux::open(st, index, svc, AddonMode::Observe, &mut None),
     )
     .await
     .unwrap_or(Err(ServiceError::Timeout("first_byte_timeout")));
     let stream = match opened {
-        Ok((s, _)) => s,
+        Ok(s) => s,
         Err(e) => {
             // Read the copies so the tee does not count them as lagging.
             drain(req.into_body()).await;

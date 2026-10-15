@@ -12,7 +12,7 @@ use roxy_wasm::{HostError, LayerError, LayerRequest, LayerResponse};
 
 use super::chain::{Head, Headless, LaneRx, LaneTx, LayerIo, StageHandle};
 use super::{
-    AddonImpl, AddonMode, BoxFuture, ENDED, StackError, StackFlow, decode, lock, select, service,
+    AddonImpl, AddonMode, BoxFuture, StackError, StackFlow, decode, lock, select, service,
     subscribe, tee,
 };
 
@@ -35,10 +35,10 @@ enum Entered {
     },
     /// The layer did not run: what came back from upstream, passed on.
     Through(Result<LayerResponse, Headless>),
+    /// A service layer: it runs its own stage on the lanes, torn down by
+    /// the chain rather than by this task.
+    Service(service::ServiceSpec, LayerRequest),
     Fault(StackError),
-    /// Roxy gave the layer up before it answered: nothing of the layer's
-    /// failed.
-    Abandoned,
 }
 
 /// Runs layer `index` on its lanes.
@@ -67,7 +67,7 @@ pub(super) async fn run(st: Arc<StackFlow>, index: usize, io: LayerIo) {
             tokio::select! {
                 biased;
                 () = torn_down.cancelled() => None,
-                entered = enter(&st, index, &stage, req, &res_out) => Some(entered),
+                entered = enter(&st, index, &stage, req) => Some(entered),
             }
         }
         Some(Ok((Head::Response(_), _))) => unreachable!("a request lane carries requests"),
@@ -80,6 +80,19 @@ pub(super) async fn run(st: Arc<StackFlow>, index: usize, io: LayerIo) {
     match entered {
         // Torn down: the chain has cut the layer's lanes.
         None => {}
+        Some(Entered::Service(svc, req)) => {
+            let forward = lock(&st.layers[index].forward).take();
+            let answer = lock(&res_out).take();
+            let (Some(Forward { req_out, res_in }), Some(answer)) = (forward, answer) else {
+                unreachable!("a layer's lanes are taken once")
+            };
+            let ends = service::Ends {
+                res_in,
+                forward: req_out,
+                answer,
+            };
+            service::run(&st, index, &svc, req, ends, &stage).await;
+        }
         Some(Entered::Answered { res, done }) => {
             if let (Some(res), Some(res_out)) = (res, lock(&res_out).take()) {
                 let (parts, body) = res.into_parts();
@@ -107,7 +120,6 @@ pub(super) async fn run(st: Arc<StackFlow>, index: usize, io: LayerIo) {
             }
         }
         Some(Entered::Fault(e)) => stage.fail(e),
-        Some(Entered::Abandoned) => stage.gone(ENDED),
     }
     // Done: nothing of the layer's takes a body parked for it, a forward
     // it never made is no forward, and an answer it never gave is none.
@@ -124,7 +136,6 @@ async fn enter(
     index: usize,
     stage: &StageHandle,
     req: LayerRequest,
-    res_out: &Arc<Mutex<Option<LaneTx>>>,
 ) -> Entered {
     let addon = st.snap.addons[index].clone();
     let req = match select::selects(st, index, &addon, req) {
@@ -147,10 +158,10 @@ async fn enter(
         return Entered::Through(tee::observe(st.clone(), index, req).await);
     }
     stage.enforcing();
-    let req = subscribe::detach_request(st, index, req);
     let (res, done): (Option<LayerResponse>, BoxFuture<Result<(), StackError>>) = match &addon.kind
     {
         AddonImpl::Wasm(layer) => {
+            let req = subscribe::detach_request(st, index, req);
             let h = Arc::new(super::host::StackHost {
                 st: st.clone(),
                 index,
@@ -181,21 +192,7 @@ async fn enter(
                 Err(e) => return Entered::Fault(e.into()),
             }
         }
-        AddonImpl::Service(svc) => {
-            match service::handle(st, index, svc, req, res_out.clone()).await {
-                Ok(attended) => (
-                    None,
-                    Box::pin(async move {
-                        let _ = attended.await;
-                        Ok(())
-                    }),
-                ),
-                Err(service::Unanswered::Service(e)) => {
-                    return Entered::Fault(StackError::Service(e));
-                }
-                Err(service::Unanswered::Abandoned(_)) => return Entered::Abandoned,
-            }
-        }
+        AddonImpl::Service(svc) => return Entered::Service(svc.clone(), req),
     };
     Entered::Answered { res, done }
 }

@@ -6,19 +6,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use roxy_http::{Body, BodyError};
-use roxy_wasm::LayerResponse;
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use super::link::{Link, LinkShared, LinkState, Queued, binary, binary_frame};
 use super::lock;
 use super::pool::{Pool, Reservation};
-use super::stream::{
-    Answers, MAX_BODY_FRAME, MAX_HOST_CALLS_WAITING, Phase, Stream, StreamState, open,
-};
+use super::stream::{Lanes, MAX_BODY_FRAME, MAX_HOST_CALLS_WAITING, Stream, StreamState, open};
+use crate::addons::attribution::Fault;
+use crate::addons::chain::{Head, Headless, LaneRx};
 use crate::addons::service::testing;
-use crate::addons::service::{Call, In, Unanswered};
-use crate::addons::{AddonImpl, AddonMode, AddonSpec};
+use crate::addons::service::{Call, In, ServiceError};
+use crate::addons::{AddonImpl, AddonMode, AddonSpec, Ends, StackError};
 use crate::in_flight::Dir;
 use crate::testkit::ALLOW_UP;
 
@@ -39,15 +38,18 @@ fn failed_link() -> Arc<Link> {
     })
 }
 
-/// An enforce stream on a link with nothing behind it, with the
-/// answers an exchange would wait on. What the stream sends goes
-/// nowhere.
-async fn lone_stream() -> (
-    Arc<Stream>,
-    Answers,
-    oneshot::Receiver<LayerResponse>,
-    crate::testkit::Kit,
-) {
+/// The lanes around a lone stream's layer: where its forward arrives
+/// (the core edge's end) and where its answer arrives (the client edge's
+/// end).
+struct Around {
+    forward: LaneRx,
+    answer: LaneRx,
+    _ends: Ends,
+}
+
+/// An enforce stream on a link with nothing behind it, on the lanes of a
+/// one-layer flow. What the stream sends goes nowhere.
+async fn lone_stream() -> (Arc<Stream>, Around, crate::testkit::Kit) {
     lone_stream_of(
         testing::addon("s", "pass", AddonMode::Enforce, |_| {}),
         None,
@@ -55,38 +57,25 @@ async fn lone_stream() -> (
     .await
 }
 
-/// [`lone_stream`] for the layer `addon`, in its mode (an observe
-/// stream's answers go unused), holding `slot` in a pool if given.
+/// [`lone_stream`] for the layer `addon`, in its mode (an observe stream
+/// has no lanes), holding `slot` in a pool if given.
 async fn lone_stream_of(
     addon: Arc<AddonSpec>,
     slot: Option<Reservation>,
-) -> (
-    Arc<Stream>,
-    Answers,
-    oneshot::Receiver<LayerResponse>,
-    crate::testkit::Kit,
-) {
+) -> (Arc<Stream>, Around, crate::testkit::Kit) {
     let mode = addon.mode;
     let kit = testing::kit(ALLOW_UP, vec![addon]).await;
-    let (st, _cx, _ends) = crate::addons::test_flow(&kit);
-    let (forward_tx, forward) = oneshot::channel();
-    let (answer_tx, answer) = oneshot::channel();
-    let (response_tx, response) = oneshot::channel();
-    let phase = match mode {
-        AddonMode::Enforce => Phase::Enforce {
-            forward: Some(forward_tx),
-            answer: Some((
-                Box::new(move |res| {
-                    let _ = response_tx.send(res);
-                }),
-                answer_tx,
-            )),
-        },
-        AddonMode::Observe => Phase::Observing {
-            forwarding: false,
-            responded: false,
-        },
-    };
+    let (st, _cx, mut ends) = crate::addons::test_flow(&kit);
+    let layer = ends.layers.pop().unwrap();
+    if mode == AddonMode::Enforce {
+        layer.stage.enforcing();
+    }
+    let lanes = (mode == AddonMode::Enforce).then(|| Lanes {
+        req: layer.req_out,
+        res: layer.res_out,
+        held_request: Arc::default(),
+        held_response: Arc::default(),
+    });
     let link = failed_link();
     let stream = Arc::new(Stream {
         id: 1,
@@ -94,16 +83,38 @@ async fn lone_stream_of(
         st,
         index: 0,
         mode,
-        state: Mutex::new(StreamState::new(phase, slot)),
+        state: Mutex::new(StreamState::new(lanes, slot)),
         more_credit: Notify::new(),
         ended: CancellationToken::new(),
+        answered: CancellationToken::new(),
+        stop_in: [CancellationToken::new(), CancellationToken::new()],
+        held_request: Arc::default(),
+        held_response: Arc::default(),
         wire: Arc::default(),
         calls: Mutex::new(None),
         broken: AtomicBool::new(false),
         draining: Mutex::new(None),
     });
     lock(&link.shared.streams).open.insert(1, stream.clone());
-    (stream, Answers { forward, answer }, response, kit)
+    let forward = std::mem::replace(&mut ends.core.req_in, layer.req_in);
+    let answer = std::mem::replace(&mut ends.edge.res_in, layer.res_in);
+    let around = Around {
+        forward,
+        answer,
+        _ends: ends,
+    };
+    (stream, around, kit)
+}
+
+/// The service's fault its stream's failure put on the flow.
+fn service_fault(stream: &Stream) -> ServiceError {
+    match stream.st.attribution.fault() {
+        Some(Fault::Layer {
+            err: StackError::Service(e),
+            ..
+        }) => e,
+        other => panic!("a service fault, not {other:?}"),
+    }
 }
 
 fn request_head() -> In {
@@ -116,76 +127,146 @@ fn request_head() -> In {
 
 /// The service's response head is taken while the request body it is
 /// forwarding is still streaming; each body's bytes reach their own
-/// consumer, and the stream ends once both have.
+/// consumer, and the stream ends once both lanes have.
 #[tokio::test]
 async fn a_response_head_arrives_while_the_request_body_streams() {
-    let (stream, answers, response, _kit) = lone_stream().await;
+    let (stream, mut around, _kit) = lone_stream().await;
     stream.control(request_head());
-    let req = answers.forward.await.expect("the request is forwarded");
+    let (_, req) = around
+        .forward
+        .head()
+        .await
+        .expect("the request is forwarded");
     stream.bytes(Dir::Request, b"up");
     stream.control(In::Response {
         status: 200,
         headers: Vec::new(),
     });
-    tokio::time::timeout(Duration::from_millis(100), answers.answer)
+    let (head, res) = tokio::time::timeout(Duration::from_millis(100), around.answer.head())
         .await
         .expect("the response head is not held behind the request body")
-        .unwrap()
         .unwrap();
-    let res = response.await.unwrap();
-    assert_eq!(res.status(), 200);
+    assert!(matches!(head, Head::Response(p) if p.status == 200));
     stream.bytes(Dir::Response, b"down");
     stream.control(In::ResponseEnd { error: None });
     assert_eq!(
-        res.into_body().collect_up_to(u64::MAX).await.unwrap().data,
+        res.collect_up_to(u64::MAX).await.unwrap().data,
         &b"down"[..]
     );
     assert!(
         !lock(&stream.state).ended(),
-        "the request body is still owed"
+        "the request lane is still owed"
     );
     stream.bytes(Dir::Request, b"load");
     stream.control(In::RequestEnd { error: None });
     assert_eq!(
-        req.into_body().collect_up_to(u64::MAX).await.unwrap().data,
+        req.collect_up_to(u64::MAX).await.unwrap().data,
         &b"upload"[..]
     );
     assert!(lock(&stream.state).ended());
 }
 
-/// A `101` from the service answers an upgrade only: on an ordinary
-/// exchange it is a protocol violation, like any status below 200.
+/// A lane the service ends before its head carries nothing: a headless
+/// `request_end` is no forward, and the stream still owes the answer.
 #[tokio::test]
-async fn a_101_on_an_exchange_that_is_not_an_upgrade_fails_the_stream() {
-    let (stream, answers, _response, _kit) = lone_stream().await;
-    stream.control(request_head());
-    let _req = answers.forward.await.expect("the request is forwarded");
+async fn a_headless_request_end_is_no_forward() {
+    let (stream, mut around, _kit) = lone_stream().await;
+    stream.control(In::RequestEnd { error: None });
+    assert_eq!(around.forward.head().await.unwrap_err(), Headless::Ended);
+    assert!(!lock(&stream.state).ended(), "the answer is owed");
     stream.control(In::Response {
-        status: 101,
+        status: 204,
         headers: Vec::new(),
     });
+    stream.control(In::ResponseEnd { error: None });
     assert!(lock(&stream.state).ended());
-    let e = answers.answer.await.unwrap().unwrap_err();
-    assert!(e.to_string().contains("status 101"), "{e}");
+    assert!(around.answer.head().await.is_ok());
 }
 
-/// A request head that does not parse is the service's protocol error,
-/// and the answer it owes is where the exchange learns it: nothing was
+/// An end the service sends with an error cuts the lane where it is: an
+/// abort of its own, not its fault, and the stream goes on to its end.
+#[tokio::test]
+async fn a_lane_the_service_cuts_is_its_abort_not_its_fault() {
+    let (stream, mut around, _kit) = lone_stream().await;
+    stream.control(request_head());
+    let (_, req) = around
+        .forward
+        .head()
+        .await
+        .expect("the request is forwarded");
+    stream.bytes(Dir::Request, b"part");
+    stream.control(In::RequestEnd {
+        error: Some("changed my mind".to_owned()),
+    });
+    assert!(req.collect_up_to(u64::MAX).await.is_err());
+    assert!(!lock(&stream.state).ended(), "the answer is still owed");
+    assert!(stream.st.attribution.fault().is_none(), "no fault");
+    assert_eq!(stream.st.chain().abort_reason(), Some("forward_aborted"));
+}
+
+/// Trailers come once, after the body's bytes and before its end, and
+/// reach the lane as the body's last frame; before a head they are a
+/// protocol error.
+#[tokio::test]
+async fn trailers_follow_the_bytes_and_precede_the_end() {
+    use http_body_util::BodyExt as _;
+    let (stream, mut around, _kit) = lone_stream().await;
+    stream.control(request_head());
+    let (_, req) = around
+        .forward
+        .head()
+        .await
+        .expect("the request is forwarded");
+    stream.bytes(Dir::Request, b"body");
+    stream.control(In::Trailers {
+        dir: Dir::Request,
+        headers: vec![("x-sum".to_owned(), "1".to_owned())],
+    });
+    stream.control(In::RequestEnd { error: None });
+    let collected = req.collect().await.unwrap();
+    assert_eq!(collected.trailers().unwrap()["x-sum"], "1");
+    assert_eq!(collected.to_bytes(), &b"body"[..]);
+    assert!(!lock(&stream.state).ended());
+    stream.control(In::Trailers {
+        dir: Dir::Response,
+        headers: Vec::new(),
+    });
+    assert!(lock(&stream.state).ended(), "trailers before a head");
+    assert_eq!(service_fault(&stream).kind(), "service:protocol");
+}
+
+/// The service's `stop` ends roxy's pump of that body where it is.
+#[tokio::test]
+async fn a_stop_from_the_service_ends_the_pump() {
+    let (stream, _around, _kit) = lone_stream().await;
+    let (_tx, body) = Body::channel(u64::MAX, None);
+    stream.control(In::Stop { dir: Dir::Request });
+    let pumped = tokio::time::timeout(
+        Duration::from_millis(100),
+        stream.pump_body(Dir::Request, body),
+    )
+    .await
+    .expect("the pump ends on the stop");
+    assert!(matches!(pumped, Err(super::stream::Lost::Stream)));
+}
+
+/// A request head that does not parse is the service's protocol error:
+/// the stream ends, the layer is torn down with it, and nothing was
 /// forwarded.
 #[tokio::test]
-async fn an_invalid_request_head_fails_the_answer() {
-    let (stream, answers, _response, _kit) = lone_stream().await;
+async fn an_invalid_request_head_fails_the_stream() {
+    let (stream, mut around, _kit) = lone_stream().await;
     stream.control(In::Request {
         method: "GET".to_owned(),
         url: "http://up.test/".to_owned(),
         headers: vec![("bad header".to_owned(), "x".to_owned())],
     });
     assert!(lock(&stream.state).ended());
-    assert!(answers.forward.await.is_err(), "nothing is forwarded");
-    let Err(Unanswered::Service(e)) = answers.answer.await.expect("the answer is told") else {
-        panic!("no answer comes");
-    };
-    assert_eq!(e.kind(), "service:protocol", "{e}");
+    assert!(
+        matches!(around.forward.head().await, Err(Headless::Cut(_))),
+        "nothing is forwarded"
+    );
+    assert_eq!(service_fault(&stream).kind(), "service:protocol");
 }
 
 fn fields(n: usize) -> Vec<(String, String)> {
@@ -197,31 +278,33 @@ fn fields(n: usize) -> Vec<(String, String)> {
 /// head, and the stream ends rather than the connection's reader.
 #[tokio::test]
 async fn a_head_with_more_than_max_headers_fields_fails_the_stream() {
-    let (stream, answers, _response, _kit) = lone_stream().await;
+    let (stream, _around, _kit) = lone_stream().await;
     stream.control(In::Request {
         method: "GET".to_owned(),
         url: "http://up.test/".to_owned(),
         headers: fields(101),
     });
     assert!(lock(&stream.state).ended());
-    let Err(Unanswered::Service(e)) = answers.answer.await.expect("the answer is told") else {
-        panic!("no answer comes");
-    };
+    let e = service_fault(&stream);
     assert_eq!(e.kind(), "service:protocol", "{e}");
     assert_eq!(
         e.to_string(),
         "service protocol violation: 101 header fields, more than max_headers (100)"
     );
 
-    let (stream, answers, _response, _kit) = lone_stream().await;
+    let (stream, mut around, _kit) = lone_stream().await;
     stream.control(request_head());
-    let _req = answers.forward.await.expect("the request is forwarded");
+    around
+        .forward
+        .head()
+        .await
+        .expect("the request is forwarded");
     stream.control(In::Response {
         status: 200,
         headers: fields(101),
     });
     assert!(lock(&stream.state).ended());
-    let e = answers.answer.await.unwrap().unwrap_err();
+    let e = service_fault(&stream);
     assert!(e.to_string().contains("max_headers (100)"), "{e}");
 }
 
@@ -229,13 +312,17 @@ async fn a_head_with_more_than_max_headers_fields_fails_the_stream() {
 /// while only the request body is being fed fail the stream.
 #[tokio::test]
 async fn bytes_of_a_body_without_a_head_fail_the_stream() {
-    let (stream, answers, _response, _kit) = lone_stream().await;
+    let (stream, mut around, _kit) = lone_stream().await;
     stream.control(request_head());
-    let req = answers.forward.await.expect("the request is forwarded");
+    let (_, req) = around
+        .forward
+        .head()
+        .await
+        .expect("the request is forwarded");
     stream.bytes(Dir::Response, b"early");
     assert!(lock(&stream.state).ended());
-    assert!(req.into_body().collect_up_to(u64::MAX).await.is_err());
-    let e = answers.answer.await.unwrap().unwrap_err();
+    assert!(req.collect_up_to(u64::MAX).await.is_err());
+    let e = service_fault(&stream);
     assert!(
         e.to_string()
             .contains("bytes of a response body that is not open"),
@@ -249,8 +336,8 @@ async fn bytes_of_a_body_without_a_head_fail_the_stream() {
 /// recorded as the pump read the failure.
 #[tokio::test]
 async fn a_body_failing_on_its_way_to_the_service_ends_its_lane_only() {
-    use crate::addons::attribution::{Fault, Side, attributed};
-    let (stream, mut answers, _response, _kit) = lone_stream().await;
+    use crate::addons::attribution::{Side, attributed};
+    let (stream, _around, _kit) = lone_stream().await;
     let (tx, body) = Body::channel(u64::MAX, None);
     tx.abort(BodyError::Incomplete);
     let body = attributed(&stream.st, Side::Client, body);
@@ -263,10 +350,6 @@ async fn a_body_failing_on_its_way_to_the_service_ends_its_lane_only() {
         "the client is at fault, not the service"
     );
     assert!(!lock(&stream.state).ended(), "the stream goes on");
-    assert!(
-        answers.answer.try_recv().is_err(),
-        "the answer is still owed"
-    );
 }
 
 /// A call the service sent before the stream ended still runs once it
@@ -279,7 +362,7 @@ async fn a_call_queued_before_the_end_still_runs() {
         testing::addon("s", "pass", AddonMode::Enforce, |_| {}),
         &[roxy_wasm::Capability::Record],
     );
-    let (stream, _answers, _response, kit) = lone_stream_of(addon, None).await;
+    let (stream, _around, kit) = lone_stream_of(addon, None).await;
     stream.control(In::Call(Call::Record {
         id: 7,
         kind: "late".to_owned(),
@@ -311,7 +394,7 @@ async fn an_ended_stream_keeps_its_place_until_its_calls_have_run() {
         testing::addon("s", "pass", AddonMode::Observe, |_| {}),
         &[roxy_wasm::Capability::Record],
     );
-    let (stream, _answers, _response, kit) = lone_stream_of(addon, Some(slot)).await;
+    let (stream, _around, kit) = lone_stream_of(addon, Some(slot)).await;
     stream.control(In::Call(Call::Record {
         id: 1,
         kind: "late".to_owned(),
@@ -337,7 +420,7 @@ async fn a_call_after_the_end_is_dropped() {
         testing::addon("s", "pass", AddonMode::Observe, |_| {}),
         &[roxy_wasm::Capability::Record],
     );
-    let (stream, _answers, _response, kit) = lone_stream_of(addon, None).await;
+    let (stream, _around, kit) = lone_stream_of(addon, None).await;
     stream.reset("the exchange ended");
     stream.control(In::Call(Call::Record {
         id: 1,
@@ -369,7 +452,7 @@ async fn a_call_failing_after_the_end_is_logged() {
         testing::addon("s", "pass", AddonMode::Observe, |_| {}),
         &[roxy_wasm::Capability::Record],
     );
-    let (stream, _answers, _response, kit) = lone_stream_of(addon, None).await;
+    let (stream, _around, kit) = lone_stream_of(addon, None).await;
     stream.control(In::Call(Call::StateGet {
         id: 9,
         key: "k".to_owned(),
@@ -402,7 +485,7 @@ async fn a_call_failing_after_the_end_is_logged() {
 /// more is the service's protocol error, and fails the stream.
 #[tokio::test]
 async fn more_calls_waiting_than_the_cap_fail_the_stream() {
-    let (stream, answers, _response, _kit) = lone_stream().await;
+    let (stream, _around, _kit) = lone_stream().await;
     let get = |id| {
         In::Call(Call::StateGet {
             id,
@@ -416,9 +499,7 @@ async fn more_calls_waiting_than_the_cap_fail_the_stream() {
     assert!(!lock(&stream.state).ended(), "{cap} calls may wait");
     stream.control(get(cap + 1));
     assert!(lock(&stream.state).ended());
-    let Err(Unanswered::Service(e)) = answers.answer.await.expect("the answer is told") else {
-        panic!("no answer comes");
-    };
+    let e = service_fault(&stream);
     assert_eq!(e.kind(), "service:protocol", "{e}");
     assert_eq!(
         e.to_string(),
@@ -531,18 +612,18 @@ async fn a_reset_never_overtakes_its_open() {
         panic!("a service layer");
     };
 
-    let (first, _) = open(&st, 0, svc, AddonMode::Enforce, Some(Box::new(drop)))
+    let first = open(&st, 0, svc, AddonMode::Observe, &mut None)
         .await
         .unwrap();
     // The service reads nothing until its pause is over.
     fill(&first).await;
     // Queued at the back once the writer moves again.
-    let (second, _) = open(&st, 0, svc, AddonMode::Enforce, Some(Box::new(drop)))
+    let second = open(&st, 0, svc, AddonMode::Observe, &mut None)
         .await
         .unwrap();
     second.reset("the exchange ended");
     // Everything before this is on the wire once its `open` is.
-    let (third, _) = open(&st, 0, svc, AddonMode::Enforce, Some(Box::new(drop)))
+    let third = open(&st, 0, svc, AddonMode::Observe, &mut None)
         .await
         .unwrap();
 
@@ -583,14 +664,14 @@ async fn an_open_given_up_mid_send_releases_its_place() {
         panic!("a service layer");
     };
 
-    let (first, _) = open(&st, 0, svc, AddonMode::Enforce, Some(Box::new(drop)))
+    let first = open(&st, 0, svc, AddonMode::Observe, &mut None)
         .await
         .unwrap();
     // The service never reads.
     fill(&first).await;
     let given_up = tokio::time::timeout(
         Duration::from_millis(100),
-        open(&st, 0, svc, AddonMode::Enforce, Some(Box::new(drop))),
+        open(&st, 0, svc, AddonMode::Observe, &mut None),
     )
     .await;
     assert!(given_up.is_err(), "the open message cannot go");

@@ -47,6 +47,7 @@ produces a `request` event:
 | an upstream failure | the `upstream_error` reason ([upstream](/reference/upstream#errors)) |
 | roxy could not finish the exchange (its connection ended, or the server stopped, mid-flight) | `aborted` |
 | an addon layer dropped the exchange after the rules had forwarded it | `upstream_aborted` |
+| an addon layer cut a lane of its own: the request it was forwarding, or the response it was giving | `forward_aborted`, `answer_aborted` (unless another reason stands) |
 | the client went away | `client_gone` |
 | an HTTP/2 client stopped taking the response | `client_stalled` |
 | the response body was cut after its head went out | why it was cut, when roxy knows: `buffer_budget_exhausted` (a decoder window the [buffer budget](/reference/limits#limits) could not cover), `upstream_body_failed` (the upstream's body failed into an addon layer), `layer_error` (a layer failed; the `layer_error` event names it), or the client's `parse_error` reason when its request body was rejected while the response was being written; otherwise `response_write_failed` |

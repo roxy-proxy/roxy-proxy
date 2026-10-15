@@ -29,7 +29,7 @@ use std::sync::{Mutex, PoisonError};
 
 pub use link::SUBPROTOCOL;
 pub(crate) use pool::Pools;
-pub(super) use stream::{AnswerSink, Reset, Stream, open};
+pub(super) use stream::{Lanes, Reset, Stream, open};
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)

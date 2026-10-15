@@ -348,6 +348,11 @@ impl Chain {
         self.stages[layer + 1].torn.clone()
     }
 
+    /// Layer `layer` is torn down, or being torn down.
+    pub(crate) fn layer_torn(&self, layer: usize) -> bool {
+        self.stages[layer + 1].torn_why.get().is_some()
+    }
+
     /// Why layer `layer` was torn down, once it has been.
     pub(crate) fn layer_torn_down_why(&self, layer: usize) -> &'static str {
         self.stages[layer + 1]
@@ -678,10 +683,11 @@ impl LaneTx {
     }
 
     /// Puts `head` on the lane; the body follows through the writer
-    /// returned, `known_length` bytes of it when declared.
-    pub(crate) fn head(mut self, head: Head, known_length: Option<u64>) -> LaneBody {
+    /// returned, `known_length` bytes of it when declared and at most
+    /// `cap`.
+    pub(crate) fn head(mut self, head: Head, known_length: Option<u64>, cap: u64) -> LaneBody {
         let tx = self.tx.take().expect("used once");
-        let (sender, body) = Body::channel_with_depth(LANE_DEPTH, u64::MAX, known_length);
+        let (sender, body) = Body::channel_with_depth(LANE_DEPTH, cap, known_length);
         self.chain.head(self.lane, tx, head, body);
         LaneBody {
             chain: self.chain.clone(),
@@ -738,16 +744,28 @@ impl LaneBody {
         self.sender.as_mut().ok_or(BodyError::Closed)
     }
 
+    /// The body channel closed: its reader dropped it. When the reader is
+    /// the client edge, wait until the lane is terminal before reporting
+    /// that. The h1 and h2 handlers drop the body first and tear the chain
+    /// down (with the reason) a moment later; reporting the drop early
+    /// would let a producer act on it before the reason is known.
+    async fn consumer_gone(&self) -> BodyError {
+        if self.lane.consumer() == 0 {
+            self.chain.lane(self.lane).terminal.cancelled().await;
+        }
+        BodyError::Closed
+    }
+
     /// Resolves once the consumer stopped the lane, or the lane is
     /// terminal for any other reason.
     pub(crate) async fn closed(&self) {
         let terminal = self.chain.lane(self.lane).terminal.clone();
         match &self.sender {
-            Some(s) => tokio::select! {
+            Some(s) if self.lane.consumer() != 0 => tokio::select! {
                 () = s.closed() => {}
                 () = terminal.cancelled() => {}
             },
-            None => terminal.cancelled().await,
+            _ => terminal.cancelled().await,
         }
     }
 
@@ -755,9 +773,13 @@ impl LaneBody {
     pub(crate) async fn ready(&mut self) -> Result<(), BodyError> {
         let terminal = self.chain.lane(self.lane).terminal.clone();
         let sender = self.sender()?;
-        tokio::select! {
+        let ready = tokio::select! {
             r = sender.ready() => r,
             () = terminal.cancelled() => Err(BodyError::Closed),
+        };
+        match ready {
+            Err(BodyError::Closed) => Err(self.consumer_gone().await),
+            other => other,
         }
     }
 
@@ -768,12 +790,18 @@ impl LaneBody {
 
     pub(crate) async fn send_data(&mut self, data: Bytes) -> Result<(), BodyError> {
         self.ready().await?;
-        self.try_push(data)
+        match self.try_push(data) {
+            Err(BodyError::Closed) => Err(self.consumer_gone().await),
+            other => other,
+        }
     }
 
     pub(crate) async fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), BodyError> {
         self.ready().await?;
-        self.sender()?.try_push_trailers(trailers)
+        match self.sender()?.try_push_trailers(trailers) {
+            Err(BodyError::Closed) => Err(self.consumer_gone().await),
+            other => other,
+        }
     }
 
     /// Ends the lane. A body short of its declared length cuts it instead.
@@ -784,6 +812,7 @@ impl LaneBody {
                 self.chain.end(self.lane);
                 Ok(())
             }
+            Err(BodyError::Closed) => Err(self.consumer_gone().await),
             Err(e) => {
                 self.chain.cut(self.lane, e.to_string(), true);
                 Err(e)
@@ -893,9 +922,10 @@ impl LaneRx {
 
 impl Drop for LaneRx {
     fn drop(&mut self) {
-        // The client edge is no task of the chain's: it stops its lane
-        // itself, with the reason the front found (the client gone, a
-        // write failed, an answer refused), never by letting go.
+        // Dropping a lane the client edge consumes does not stop it. The
+        // edge stops its lane explicitly, through `Chain::tear_down` or
+        // `Chain::release`, so the reason (client gone, write failed,
+        // answer refused) is known when the stop happens.
         if !self.spent && self.lane.consumer() != 0 {
             let why = self.chain.gave_up(self.lane.consumer());
             self.chain.stop(self.lane, why);
@@ -933,9 +963,11 @@ impl Reading {
         }
     }
 
+    /// The body's error reached the reader: the lane is cut, by whoever
+    /// cut the body (its producer's own abort is recorded where it cut).
     fn cut(&self, why: String) {
         if !self.done.swap(true, Ordering::AcqRel) {
-            self.chain.cut(self.lane, why, true);
+            self.chain.cut(self.lane, why, false);
         }
     }
 }
@@ -992,7 +1024,8 @@ impl HttpBody for Reading {
 
 impl Drop for Reading {
     fn drop(&mut self) {
-        // As for `LaneRx`: the client edge stops its own lane.
+        // Same rule as `LaneRx::drop`: the client edge stops its lane
+        // explicitly, not by dropping the body.
         if !self.done.swap(true, Ordering::AcqRel) && self.lane.consumer() != 0 {
             let why = self.chain.gave_up(self.lane.consumer());
             self.chain.stop(self.lane, why);
@@ -1083,7 +1116,7 @@ mod tests {
         // changes nothing.
         drop(core.req_in);
         assert_eq!(c.state(req(0)), LaneState::Stopped);
-        let body = edge.req_out.head(request(), None);
+        let body = edge.req_out.head(request(), None, u64::MAX);
         assert_eq!(c.state(req(0)), LaneState::Stopped);
         assert_eq!(body.finish().await, Err(BodyError::Closed));
         assert_eq!(c.state(req(0)), LaneState::Stopped);
@@ -1101,7 +1134,9 @@ mod tests {
     #[tokio::test]
     async fn an_ended_lane_let_go_of_unread_is_not_stopped() {
         let (c, mut edge, _layers, core, _) = chain(0);
-        let mut body = core.res_out.head(Head::Response(response(200)), None);
+        let mut body = core
+            .res_out
+            .head(Head::Response(response(200)), None, u64::MAX);
         body.send_data(Bytes::from_static(b"x")).await.unwrap();
         body.finish().await.unwrap();
         assert_eq!(c.state(res(0)), LaneState::Ended);
@@ -1116,7 +1151,7 @@ mod tests {
     #[tokio::test]
     async fn the_producer_learns_of_a_stop_at_its_next_frame() {
         let (c, edge, _layers, mut core, _) = chain(0);
-        let mut body = edge.req_out.head(request(), None);
+        let mut body = edge.req_out.head(request(), None, u64::MAX);
         let (_, reader) = core.req_in.head().await.unwrap();
         body.send_data(Bytes::from_static(b"a")).await.unwrap();
         drop(reader);
@@ -1136,13 +1171,15 @@ mod tests {
         let (c, edge, mut layers, mut core, record) = chain(2);
         let mut l2 = layers.pop().unwrap();
         let mut l1 = layers.pop().unwrap();
-        let upload = edge.req_out.head(request(), None);
+        let upload = edge.req_out.head(request(), None, u64::MAX);
         let (_, b0) = l1.req_in.head().await.unwrap();
         l1.req_out.whole(request(), b0);
         let (_, b1) = l2.req_in.head().await.unwrap();
         l2.req_out.whole(request(), b1);
         let (_, _b2) = core.req_in.head().await.unwrap();
-        let mut answer = core.res_out.head(Head::Response(response(200)), None);
+        let mut answer = core
+            .res_out
+            .head(Head::Response(response(200)), None, u64::MAX);
         answer.send_data(Bytes::from_static(b"a")).await.unwrap();
 
         edge.res_in.release(CLIENT_GONE);
@@ -1176,7 +1213,7 @@ mod tests {
             let c = c.clone();
             async move { c.until_over().await }
         });
-        let f0 = edge.req_out.head(request(), None);
+        let f0 = edge.req_out.head(request(), None, u64::MAX);
         let (_, b0) = l1.req_in.head().await.unwrap();
         l1.req_out.whole(request(), b0);
         let (_, b1) = core.req_in.head().await.unwrap();
@@ -1212,7 +1249,7 @@ mod tests {
     async fn a_fault_is_recorded_torn_down_and_seeded_in_that_order() {
         let (c, mut edge, mut layers, mut core, record) = chain(1);
         let mut l1 = layers.pop().unwrap();
-        let _f0 = edge.req_out.head(request(), None);
+        let _f0 = edge.req_out.head(request(), None, u64::MAX);
         let (_, b0) = l1.req_in.head().await.unwrap();
         l1.req_out.whole(request(), b0);
         let (_, _b1) = core.req_in.head().await.unwrap();
@@ -1242,7 +1279,9 @@ mod tests {
     async fn a_fault_after_the_answer_cuts_it() {
         let (c, mut edge, mut layers, _core, _) = chain(1);
         let l1 = layers.pop().unwrap();
-        let mut answer = l1.res_out.head(Head::Response(response(200)), None);
+        let mut answer = l1
+            .res_out
+            .head(Head::Response(response(200)), None, u64::MAX);
         answer.send_data(Bytes::from_static(b"part")).await.unwrap();
         let (_, body) = edge.res_in.head().await.unwrap();
         l1.stage.fail(LayerError::Trap("boom".into()));
@@ -1307,7 +1346,9 @@ mod tests {
         l1.stage.answering();
         core.res_out
             .whole(Head::Response(response(200)), Body::empty());
-        let _a1 = l1.res_out.head(Head::Response(response(403)), None);
+        let _a1 = l1
+            .res_out
+            .head(Head::Response(response(403)), None, u64::MAX);
         assert_eq!(l1.stage.answered(), Some(true));
         assert_eq!(c.answered_by(), Some(0));
 
@@ -1316,7 +1357,9 @@ mod tests {
         core.res_out
             .whole(Head::Response(response(200)), Body::empty());
         l1.stage.answering();
-        let _a1 = l1.res_out.head(Head::Response(response(200)), None);
+        let _a1 = l1
+            .res_out
+            .head(Head::Response(response(200)), None, u64::MAX);
         assert_eq!(
             c.answered_by(),
             None,
@@ -1330,11 +1373,15 @@ mod tests {
         let l2 = layers.pop().unwrap();
         let l1 = layers.pop().unwrap();
         // L2 answers before anything is on res[2]: its own.
-        let _a2 = l2.res_out.head(Head::Response(response(403)), None);
+        let _a2 = l2
+            .res_out
+            .head(Head::Response(response(403)), None, u64::MAX);
         assert_eq!(l2.stage.answered(), Some(true));
         // L1 passes a head on while L2's is on res[1]: not its own, even
         // unread.
-        let _a1 = l1.res_out.head(Head::Response(response(403)), None);
+        let _a1 = l1
+            .res_out
+            .head(Head::Response(response(403)), None, u64::MAX);
         assert_eq!(l1.stage.answered(), Some(false));
         assert_eq!(c.answered_by(), Some(1));
         drop(core);
@@ -1345,8 +1392,12 @@ mod tests {
         let (c, _edge, mut layers, _core, _) = chain(2);
         let l2 = layers.pop().unwrap();
         let l1 = layers.pop().unwrap();
-        let _a1 = l1.res_out.head(Head::Response(response(200)), None);
-        let _a2 = l2.res_out.head(Head::Response(response(200)), None);
+        let _a1 = l1
+            .res_out
+            .head(Head::Response(response(200)), None, u64::MAX);
+        let _a2 = l2
+            .res_out
+            .head(Head::Response(response(200)), None, u64::MAX);
         assert_eq!(l1.stage.answered(), Some(true));
         assert_eq!(l2.stage.answered(), Some(true));
         assert_eq!(c.answered_by(), Some(0));
@@ -1356,7 +1407,7 @@ mod tests {
     async fn a_layer_cutting_its_own_lane_is_an_abort_not_a_fault() {
         let (c, _edge, mut layers, mut core, record) = chain(1);
         let l1 = layers.pop().unwrap();
-        let forward = l1.req_out.head(request(), None);
+        let forward = l1.req_out.head(request(), None, u64::MAX);
         let (_, body) = core.req_in.head().await.unwrap();
         forward.abort("changed my mind");
         assert_eq!(
@@ -1368,7 +1419,9 @@ mod tests {
         assert!(lock(&record.faults).is_empty());
         assert!(!l1.stage.torn_down().is_cancelled());
         // The first abort stands.
-        let answer = l1.res_out.head(Head::Response(response(200)), None);
+        let answer = l1
+            .res_out
+            .head(Head::Response(response(200)), None, u64::MAX);
         drop(answer);
         assert_eq!(c.abort_reason(), Some("forward_aborted"));
 
@@ -1384,7 +1437,7 @@ mod tests {
         // the body of the lane it produces.
         let (c, edge, mut layers, mut core, _) = chain(1);
         let mut l1 = layers.pop().unwrap();
-        let mut f0 = edge.req_out.head(request(), None);
+        let mut f0 = edge.req_out.head(request(), None, u64::MAX);
         let (_, b0) = l1.req_in.head().await.unwrap();
         l1.req_out.whole(request(), b0);
         let (_, mut b1) = core.req_in.head().await.unwrap();
@@ -1402,7 +1455,7 @@ mod tests {
         // And an end read through the binding ends both.
         let (c, edge, mut layers, mut core, _) = chain(1);
         let mut l1 = layers.pop().unwrap();
-        let f0 = edge.req_out.head(request(), None);
+        let f0 = edge.req_out.head(request(), None, u64::MAX);
         let (_, b0) = l1.req_in.head().await.unwrap();
         l1.req_out.whole(request(), b0);
         let (_, b1) = core.req_in.head().await.unwrap();
@@ -1416,7 +1469,9 @@ mod tests {
     async fn a_bound_response_stopped_downstream_tears_the_core_down() {
         let (c, mut edge, mut layers, core, _) = chain(1);
         let mut l1 = layers.pop().unwrap();
-        let mut upstream = core.res_out.head(Head::Response(response(200)), None);
+        let mut upstream = core
+            .res_out
+            .head(Head::Response(response(200)), None, u64::MAX);
         let (_, r1) = l1.res_in.head().await.unwrap();
         l1.res_out.whole(Head::Response(response(200)), r1);
         let (_, r0) = edge.res_in.head().await.unwrap();
@@ -1434,8 +1489,8 @@ mod tests {
     async fn a_lane_cut_from_outside_ends_a_read_its_producer_left_hanging() {
         let (c, mut edge, mut layers, mut core, _) = chain(1);
         let l1 = layers.pop().unwrap();
-        let _f0 = edge.req_out.head(request(), None);
-        let forward = l1.req_out.head(request(), None);
+        let _f0 = edge.req_out.head(request(), None, u64::MAX);
+        let forward = l1.req_out.head(request(), None, u64::MAX);
         let (_, mut b1) = core.req_in.head().await.unwrap();
         // The core reads while L1's producer end stays open and quiet.
         let read = tokio::spawn(async move { b1.frame().await });

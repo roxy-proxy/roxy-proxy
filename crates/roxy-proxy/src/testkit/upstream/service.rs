@@ -253,6 +253,8 @@ struct Lane {
     queue: VecDeque<Queued>,
     /// Nothing is sent from the queue while set.
     held: bool,
+    /// roxy reads no more of this lane: nothing more is sent on it.
+    stopped: bool,
 }
 
 impl Lane {
@@ -261,6 +263,7 @@ impl Lane {
             credit: WINDOW,
             queue: VecDeque::new(),
             held: false,
+            stopped: false,
         }
     }
 }
@@ -282,10 +285,11 @@ impl Sess {
 }
 
 /// The direction a control message belongs to, for a pass-through.
-fn lane_of(kind: &str) -> Option<u8> {
+fn lane_of(kind: &str, v: &Value) -> Option<u8> {
     match kind {
         "request" | "request_end" => Some(REQUEST),
         "response" | "response_end" => Some(RESPONSE),
+        "trailers" => v["dir"].as_str().and_then(dir_of),
         _ => None,
     }
 }
@@ -308,9 +312,9 @@ enum Mode {
     Abort,
     Patient,
     /// Answers the client (`200`, body `early`) as soon as roxy's request
-    /// head arrives, then forwards the request as it comes and reads the
-    /// response from below without passing it on: an answer that leaves
-    /// the forward to run to its end.
+    /// head arrives, then forwards the request as it comes and ends its
+    /// answer once the response head from upstream has arrived, without
+    /// passing it on: an answer that leaves the forward to run to its end.
     Early,
     /// Answers each request head with a `204` and nothing else: no body,
     /// no forward.
@@ -474,35 +478,27 @@ impl Conn {
                 self.flush(id, dir);
             }
             "result" => self.answered(id),
+            "stop" => self.stopped(id, &v),
             "request" if self.mode == Mode::Overlong => self.forward_declared(id, &v, 3, b"12345"),
             "request" if self.mode == Mode::Short => self.forward_declared(id, &v, 5, b"123"),
-            "request" if self.mode == Mode::Refuse => {
-                self.send(text(
-                    id,
-                    json!({"type": "response", "status": 403, "headers": []}),
-                ));
-                self.send(text(id, json!({"type": "response_end"})));
-            }
-            "request" if self.mode == Mode::NoContent => {
-                self.send(text(
-                    id,
-                    json!({"type": "response", "status": 204, "headers": []}),
-                ));
-                self.send(text(id, json!({"type": "response_end"})));
-            }
+            "request" if self.mode == Mode::Refuse => self.answer_alone(id, 403),
+            "request" if self.mode == Mode::NoContent => self.answer_alone(id, 204),
             "request" if self.mode == Mode::Abort => {
                 self.streams.remove(&id);
                 self.send(text(id, json!({"type": "reset", "message": "aborted"})));
             }
             "request" if self.mode == Mode::Early => {
-                // The forward goes first: a stream ends on the service's
-                // last message, and an answer with nothing forwarded is it.
                 self.pass_control(id, &kind, v);
                 self.send(text(
                     id,
                     json!({"type": "response", "status": 200, "headers": [["content-type", "text/plain"]]}),
                 ));
                 self.send(binary(id, RESPONSE, b"early"));
+            }
+            // The answer's end waits for the response head from upstream:
+            // a forward is carried only while something waits for its
+            // response.
+            "response" if self.mode == Mode::Early => {
                 self.send(text(id, json!({"type": "response_end"})));
             }
             "request" if self.mode == Mode::EarlyNoContent => {
@@ -556,10 +552,33 @@ impl Conn {
         }
     }
 
+    /// roxy reads no more of the `dir` lane: nothing more goes on it.
+    fn stopped(&mut self, id: u32, v: &Value) {
+        let Some(dir) = v["dir"].as_str().and_then(dir_of) else {
+            return;
+        };
+        if let Some(s) = self.streams.get_mut(&id) {
+            let lane = &mut s.lanes[usize::from(dir)];
+            lane.stopped = true;
+            lane.queue.clear();
+        }
+    }
+
+    /// Answers `status` with no body and forwards nothing: the request
+    /// lane ends headless.
+    fn answer_alone(&self, id: u32, status: u16) {
+        self.send(text(
+            id,
+            json!({"type": "response", "status": status, "headers": []}),
+        ));
+        self.send(text(id, json!({"type": "response_end"})));
+        self.send(text(id, json!({"type": "request_end"})));
+    }
+
     /// Passes a head or end straight back in its own direction, when the
     /// behaviour passes that direction.
     fn pass_control(&mut self, id: u32, kind: &str, mut v: Value) {
-        let Some(dir) = lane_of(kind).filter(|d| self.passes_head(*d)) else {
+        let Some(dir) = lane_of(kind, &v).filter(|d| self.passes_head(*d)) else {
             return;
         };
         v.as_object_mut().map(|o| o.remove("stream"));
@@ -705,7 +724,7 @@ impl Conn {
             return;
         };
         let lane = &mut s.lanes[usize::from(dir)];
-        if lane.held {
+        if lane.held || lane.stopped {
             return;
         }
         let mut out = Vec::new();

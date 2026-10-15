@@ -15,7 +15,7 @@ use roxy_http::{Body, CanonicalRequest};
 use roxy_wasm::{LayerError, LayerRequest};
 
 use super::attribution::{Side, attributed};
-use super::chain::{CoreIo, Head, Headless, LaneTx};
+use super::chain::{CoreIo, Head, Headless, LaneState, LaneTx};
 use super::client_edge::refusal_for_fault;
 use super::{StackFlow, decode, ws};
 use crate::body::{Collected, collect_prefix};
@@ -30,6 +30,7 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
         stage,
     } = io;
     let torn_down = stage.torn_down();
+    let forward = req_in.id();
     let arrived = tokio::select! {
         biased;
         () = torn_down.cancelled() => return,
@@ -84,12 +85,20 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
             drop(lease);
             refuse(&st, res_out, &refusal, res);
         }
-        // The request body failed on its way in, recorded where it entered
-        // the stack (the client's) or by the layer that produced it; the
-        // refusal that earns, if one does, is the answer.
+        // The request body failed on its way in. If a fault was recorded
+        // for it (the client's broken upload, a layer's failure, the
+        // budget), the refusal that fault earns is the answer. If none was,
+        // the lane was cut by a layer of its own accord: nothing answers
+        // that, and the response lane is cut as the request lane was.
         Outcome::Close(_) => {
             drop(lease);
-            refused(&st, res_out).await;
+            if let LaneState::Cut(why) = st.chain().state(forward)
+                && st.attribution.fault().is_none()
+            {
+                res_out.cut_headless(why);
+            } else {
+                refused(&st, res_out).await;
+            }
         }
         Outcome::Upgrade {
             mut res,

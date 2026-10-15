@@ -193,9 +193,6 @@ const MAX_TAG_BYTES: usize = 4096;
 struct LayerSlot {
     /// The layer ran on this exchange: its `when` and `sample` let it.
     ran: AtomicBool,
-    /// The layer's forward was accepted, whether or not the call that
-    /// carries it has run: a service's answer clock stops on it.
-    forwarded: AtomicBool,
     /// Bodies bypassing the layer (enforce mode, head-only subscription).
     bypass: Mutex<subscribe::Bypass>,
     /// The layer's ends of the hop upstream of it, until it forwards.
@@ -314,11 +311,9 @@ impl StackFlow {
         self.chain().torn_down()
     }
 
-    /// Cancelled when layer `index` is torn down: with the exchange, by a
-    /// failure of its own, or by the layer downstream letting go of its
-    /// answer.
-    pub(crate) fn layer_torn_down(&self, index: usize) -> CancellationToken {
-        self.chain().layer_torn_down(index)
+    /// Layer `index` is torn down, or being torn down.
+    pub(crate) fn layer_torn(&self, index: usize) -> bool {
+        self.chain().layer_torn(index)
     }
 
     /// Why layer `index` was torn down, once it has been.
@@ -359,22 +354,13 @@ impl StackFlow {
         cx
     }
 
-    /// Layer `index`'s forward is outstanding: accepted (whether or not
-    /// the call that carries it has run) and not yet answered on the lane
-    /// upstream of the layer.
+    /// Layer `index`'s forward is outstanding: its head is on the request
+    /// lane upstream of the layer, and nothing has answered it there yet.
     pub(crate) fn forward_requested(&self, index: usize) -> bool {
-        let answered = LaneId {
-            hop: index + 1,
-            dir: Dir::Res,
-        };
-        self.layers[index].forwarded.load(Ordering::SeqCst) && !self.chain().has_head(answered)
-    }
-
-    /// Layer `index` is forwarding: its request is on its way to the next
-    /// layer. Marked before the call that carries it runs, so the answer
-    /// clock stops as the service forwards.
-    pub(crate) fn forwarding(&self, index: usize) {
-        self.layers[index].forwarded.store(true, Ordering::SeqCst);
+        let chain = self.chain();
+        let hop = index + 1;
+        chain.has_head(LaneId { hop, dir: Dir::Req })
+            && !chain.has_head(LaneId { hop, dir: Dir::Res })
     }
 
     /// The facts `metric-get` reads.
@@ -566,6 +552,11 @@ impl StackFlow {
     /// the rules refused the request it forwarded meanwhile. A refusal is
     /// the verdict whatever the client was given.
     fn fold_answer(&self, cx: &mut FlowCx) {
+        // A lane a layer cut of its own accord: the reason, unless one
+        // stands.
+        if let Some(abort) = self.chain().abort_reason() {
+            cx.record.reason.get_or_insert_with(|| abort.to_owned());
+        }
         if cx.record.decision == Some(DecisionKind::Deny) {
             return;
         }
