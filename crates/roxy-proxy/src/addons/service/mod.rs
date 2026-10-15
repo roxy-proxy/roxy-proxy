@@ -530,7 +530,7 @@ pub(super) async fn run(
         () = stream.until_ended() => {}
         // The service's own deadline: it is told which, as for any fault
         // of its own.
-        () = clock.expired(answered, || st.forward_requested(index)) => {
+        () = clock.expired(answered, || st.has_forwarded(index)) => {
             stream.fail(ServiceError::Timeout("first_byte_timeout"), mux::Reset::Send);
         }
     }
@@ -592,24 +592,31 @@ async fn pump_response(
 #[derive(Clone)]
 struct Clock {
     limit: Duration,
-    deadline: watch::Sender<Option<TokioInstant>>,
+    deadline: watch::Sender<Deadline>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Deadline {
+    Request(TokioInstant),
+    Upstream,
+    Response(TokioInstant),
 }
 
 impl Clock {
     fn new(limit: Duration) -> Self {
         Self {
             limit,
-            deadline: watch::Sender::new(Some(TokioInstant::now() + limit)),
+            deadline: watch::Sender::new(Deadline::Request(TokioInstant::now() + limit)),
         }
     }
 
     /// Stops the clock if `at` is still its deadline: an expiry seen
     /// against a deadline that `restart` has since replaced (the response
     /// from upstream came back meanwhile) leaves the new one to run.
-    fn stop_if(&self, at: Option<TokioInstant>) {
+    fn stop_if(&self, at: Deadline) {
         self.deadline.send_if_modified(|d| {
             if *d == at {
-                *d = None;
+                *d = Deadline::Upstream;
                 true
             } else {
                 false
@@ -621,22 +628,25 @@ impl Clock {
     /// whole budget again to answer.
     fn restart(&self) {
         self.deadline
-            .send_replace(Some(TokioInstant::now() + self.limit));
+            .send_replace(Deadline::Response(TokioInstant::now() + self.limit));
     }
 
     /// Resolves when the deadline passes without an answer. An answer
-    /// that lands as the deadline passes is still an answer, and a forward
-    /// outstanding by then (`forwarded`) stops the clock instead: both are
-    /// read before the clock is believed. Pending for ever once the
-    /// service has answered.
+    /// that lands as the deadline passes is still an answer. A forward
+    /// (`forwarded`) stops only the request deadline, even if its response
+    /// is already published: the response pump grants the next budget
+    /// when it takes that outcome. Pending for ever once the service has
+    /// answered.
     async fn expired(&self, answered: CancellationToken, forwarded: impl Fn() -> bool) {
         let mut deadline = self.deadline.subscribe();
         loop {
             let at = *deadline.borrow_and_update();
             let expiry = async {
                 match at {
-                    Some(at) => tokio::time::sleep_until(at).await,
-                    None => std::future::pending().await,
+                    Deadline::Request(at) | Deadline::Response(at) => {
+                        tokio::time::sleep_until(at).await;
+                    }
+                    Deadline::Upstream => std::future::pending().await,
                 }
             };
             tokio::select! {
@@ -648,9 +658,11 @@ impl Clock {
                     if answered.is_cancelled() {
                         std::future::pending::<()>().await;
                     }
-                    if forwarded() {
+                    if matches!(at, Deadline::Request(_)) && forwarded() {
                         self.stop_if(at);
-                    } else {
+                    } else if *deadline.borrow() == at {
+                        // The response pump may have restarted the clock
+                        // since changed() was polled, or during forwarded().
                         return;
                     }
                 }
@@ -731,28 +743,71 @@ async fn drain(body: Body) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Call, Clock, In, header_map, pairs};
+    use super::{Call, Clock, Deadline, In, header_map, pairs};
     use http::{HeaderMap, HeaderValue};
     use serde_json::json;
     use std::time::Duration;
 
+    #[tokio::test(start_paused = true)]
+    async fn a_returned_forward_invalidates_an_already_polled_expiry() {
+        let clock = Clock::new(Duration::from_secs(1));
+        let answered = tokio_util::sync::CancellationToken::new();
+        // Simulate pump_response returning between the changed() poll and
+        // the forward recheck on another runtime worker. A stopped input
+        // can restart the clock even without a forward.
+        let expired = clock.expired(answered, || {
+            clock.restart();
+            false
+        });
+        tokio::pin!(expired);
+        assert!(futures_util::poll!(expired.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(
+            futures_util::poll!(expired.as_mut()).is_pending(),
+            "the newly returned upstream head grants a fresh answer deadline"
+        );
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(futures_util::poll!(expired.as_mut()).is_ready());
+    }
+
+    /// Publishing the upstream outcome does not reactivate the old
+    /// deadline while the response pump has yet to take it.
+    #[tokio::test(start_paused = true)]
+    async fn a_forward_waits_for_the_response_pump_to_restart_its_clock() {
+        let clock = Clock::new(Duration::from_secs(1));
+        let expired = clock.expired(tokio_util::sync::CancellationToken::new(), || true);
+        tokio::pin!(expired);
+        assert!(futures_util::poll!(expired.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_secs(2)).await;
+        assert!(futures_util::poll!(expired.as_mut()).is_pending());
+        clock.restart();
+        assert!(futures_util::poll!(expired.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(999)).await;
+        assert!(futures_util::poll!(expired.as_mut()).is_pending());
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(
+            futures_util::poll!(expired.as_mut()).is_ready(),
+            "having forwarded cannot suspend the renewed answer deadline"
+        );
+    }
+
     /// An expiry resolved against a deadline the forward's return has
     /// since replaced does not stop the fresh one: the service still has
     /// its clock to answer.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn an_expiry_seen_late_does_not_stop_a_restarted_clock() {
         let clock = Clock::new(Duration::from_secs(1));
         let expired = *clock.deadline.borrow();
         clock.restart();
         clock.stop_if(expired);
         assert!(
-            clock.deadline.borrow().is_some(),
+            matches!(*clock.deadline.borrow(), Deadline::Response(_)),
             "the restarted deadline runs"
         );
         let current = *clock.deadline.borrow();
         clock.stop_if(current);
         assert!(
-            clock.deadline.borrow().is_none(),
+            *clock.deadline.borrow() == Deadline::Upstream,
             "the deadline that expired is stopped"
         );
     }

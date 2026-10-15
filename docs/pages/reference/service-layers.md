@@ -222,6 +222,8 @@ identity for future incompatible changes.
   forward awaits an upstream outcome. A response head or a headless
   `response_end` restores the whole budget, unless the service has already
   answered; receiving a head does not wait for the response body to end.
+  An expiry of the original request budget cannot consume or suspend this
+  renewed answer budget.
   An observer gets that budget from roxy's last message to end its stream. A
   stream has no overall deadline. Head-only output lanes still require
   their explicit end: bypassed bytes can flow before it, but completion

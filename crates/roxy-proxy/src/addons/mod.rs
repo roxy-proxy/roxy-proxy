@@ -310,16 +310,13 @@ impl StackFlow {
         cx
     }
 
-    /// Layer `index`'s forward is outstanding: its head is on the request
-    /// lane upstream of the layer, and nothing has answered it there yet.
-    pub(crate) fn forward_requested(&self, index: usize) -> bool {
-        let chain = self.chain();
-        let hop = index + 1;
-        chain.has_head(LaneId { hop, dir: Dir::Req })
-            && matches!(
-                chain.state(LaneId { hop, dir: Dir::Res }),
-                chain::LaneState::Idle
-            )
+    /// Layer `index` has forwarded: its head is on the request lane
+    /// upstream of the layer, whether or not a response has arrived.
+    pub(crate) fn has_forwarded(&self, index: usize) -> bool {
+        self.chain().has_head(LaneId {
+            hop: index + 1,
+            dir: Dir::Req,
+        })
     }
 
     /// The facts `metric-get` reads.
