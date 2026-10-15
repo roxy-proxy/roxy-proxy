@@ -1,0 +1,5 @@
+# For builds whose context is this directory (human-approval/Dockerfile).
+**/.venv
+**/__pycache__
+**/ca
+**/target

@@ -3,6 +3,7 @@
 # (approval.py), which holds it until someone clicks Approve or Deny at
 # http://127.0.0.1:8585. Run from the repository root:
 #   roxy run --config examples/human-approval/roxy.yaml
+# roxy.compose.yaml is the same policy with the addresses compose.yaml needs.
 version: 1
 
 listeners:
