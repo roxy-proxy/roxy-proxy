@@ -352,6 +352,7 @@ pub async fn collect(body: Body) -> Result<Bytes, BodyError> {
 pub struct Started {
     answer: Option<oneshot::Receiver<LayerResponse>>,
     task: JoinHandle<Result<(), LayerError>>,
+    completed: Option<Result<(), LayerError>>,
 }
 
 impl Started {
@@ -365,9 +366,8 @@ impl Started {
             biased;
             res = answer => res.ok(),
             outcome = &mut self.task => {
-                self.answer = None;
                 let outcome = outcome.expect("the layer task does not panic");
-                return Err(outcome.err().unwrap_or(LayerError::NoResponse));
+                self.task_finished(outcome)
             }
         };
         self.answer = None;
@@ -375,15 +375,37 @@ impl Started {
             return Ok(res);
         }
         // The host went with the task: it failed before answering.
-        let outcome = (&mut self.task)
-            .await
-            .expect("the layer task does not panic");
-        Err(outcome.err().unwrap_or(LayerError::NoResponse))
+        if self.completed.is_none() {
+            self.completed = Some(
+                (&mut self.task)
+                    .await
+                    .expect("the layer task does not panic"),
+            );
+        }
+        Err(self
+            .completed
+            .as_ref()
+            .unwrap()
+            .clone()
+            .err()
+            .unwrap_or(LayerError::NoResponse))
+    }
+
+    fn task_finished(&mut self, outcome: Result<(), LayerError>) -> Option<LayerResponse> {
+        self.completed = Some(outcome);
+        // The guest can publish and finish between the receiver's pending
+        // poll and the task's ready poll, even in a biased select.
+        self.answer
+            .as_mut()
+            .and_then(|answer| answer.try_recv().ok())
     }
 
     /// How the exchange ended, once the handler has returned.
     pub async fn outcome(self) -> Result<(), LayerError> {
-        self.task.await.expect("the layer task does not panic")
+        match self.completed {
+            Some(outcome) => outcome,
+            None => self.task.await.expect("the layer task does not panic"),
+        }
     }
 
     /// Drops the exchange where it is: the layer's task is aborted.
@@ -400,7 +422,75 @@ pub fn start(layer: &Layer, host: Arc<Mock>, req: LayerRequest) -> Started {
     Started {
         answer: Some(answer),
         task,
+        completed: None,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn started_preserves_an_answer_published_before_task_completion() {
+    for attempt in 0..100_000 {
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            tx.send(Response::new(Body::empty())).unwrap();
+            Ok(())
+        });
+        let mut started = Started {
+            answer: Some(rx),
+            task,
+            completed: None,
+        };
+        let response = started.response().await;
+        assert!(response.is_ok(), "attempt {attempt}: {response:?}");
+        started.outcome().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn started_outcome_can_be_read_after_response_reports_a_failure() {
+    let (tx, rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        drop(tx);
+        Err(LayerError::NoResponse)
+    });
+    let mut started = Started {
+        answer: Some(rx),
+        task,
+        completed: None,
+    };
+    assert!(matches!(
+        started.response().await,
+        Err(LayerError::NoResponse)
+    ));
+    assert!(matches!(
+        started.outcome().await,
+        Err(LayerError::NoResponse)
+    ));
+}
+
+#[tokio::test]
+async fn a_task_finishing_between_polls_preserves_its_queued_answer_and_outcome() {
+    let (tx, mut rx) = oneshot::channel();
+    let task = tokio::spawn(async move {
+        tx.send(Response::new(Body::empty())).unwrap();
+        Err(LayerError::NoResponse)
+    });
+    // Poll the receiver before letting the task publish and complete.
+    assert!(matches!(
+        rx.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
+    let mut started = Started {
+        answer: Some(rx),
+        task,
+        completed: None,
+    };
+    let outcome = (&mut started.task).await.unwrap();
+    // The task branch must keep both the answer and the handler's failure.
+    assert!(started.task_finished(outcome).is_some());
+    assert!(matches!(
+        started.outcome().await,
+        Err(LayerError::NoResponse)
+    ));
 }
 
 /// Runs a whole exchange, collecting the response body.
