@@ -42,8 +42,16 @@ If `deploy` fails on a tag, the `publish` job has already updated
 
    Also bump the internal crates' `version = "…"` entries under
    `[workspace.dependencies]` to match. Then run `cargo check` so `Cargo.lock`
-   picks up the new version. Commit both files and merge the PR to `main`
-   with CI green.
+   picks up the new version.
+
+   In the same PR, move the `Unreleased` entries in `docs/pages/changelog.md`
+   under a new version heading with the date, linked to the release page:
+
+   ```md
+   ## [0.2.0 (2026-10-14)](https://github.com/roxy-proxy/roxy-proxy/releases/tag/v0.2.0)
+   ```
+
+   Commit the files and merge the PR to `main` with CI green.
 
 2. Optional: do a dry run. Run the **Release** workflow by hand
    (`workflow_dispatch`) on `main`. It builds, checks and uploads every
