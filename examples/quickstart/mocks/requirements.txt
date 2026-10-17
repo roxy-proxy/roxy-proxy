@@ -1,2 +1,2 @@
 # The chat client's SDK; the mock servers use the standard library only.
-anthropic==1.11.0
+anthropic==1.13.0
