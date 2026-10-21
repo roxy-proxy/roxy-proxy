@@ -441,28 +441,40 @@ fn report() {
     eprintln!("{line}");
 }
 
+/// hyper's `Parse::Uri`: the only refusal a raw backtick in the path can
+/// earn, since every other target byte hyper refuses roxy refuses too.
+fn refused_uri(e: &hyper::Error) -> bool {
+    e.is_parse() && e.to_string() == "invalid URI"
+}
+
 fn compare(roxy: &Side<RoxyEnd>, hyper: &Side<HyperEnd>, wire: &[u8]) {
-    let shown = String::from_utf8_lossy(wire);
+    let shown = || String::from_utf8_lossy(wire);
     for (i, r) in roxy.msgs.iter().enumerate() {
         let Some(h) = hyper.msgs.get(i) else {
             match &hyper.end {
                 HyperEnd::Rejected(e) | HyperEnd::BodyRejected(e) => {
                     let path = r.target.split('?').next().unwrap_or_default();
-                    if e.is_parse() && path.contains("%60") {
+                    if refused_uri(e) && path.contains("%60") {
                         count(RAW_BACKTICK);
                         return;
                     }
-                    panic!("roxy accepted request #{i}, hyper rejected it ({e}):\n{r:#?}\n{shown}");
+                    panic!(
+                        "roxy accepted request #{i}, hyper rejected it ({e}):\n{r:#?}\n{}",
+                        shown()
+                    );
                 }
                 HyperEnd::Done => panic!(
-                    "hyper stopped reading after request #{} and roxy read on:\n{r:#?}\n{shown}",
-                    i.saturating_sub(1)
+                    "hyper stopped reading after request #{} and roxy read on:\n{r:#?}\n{}",
+                    i.saturating_sub(1),
+                    shown()
                 ),
             }
         };
         assert_eq!(
-            r, h,
-            "request #{i} differs (roxy left, hyper right):\n{shown}"
+            r,
+            h,
+            "request #{i} differs (roxy left, hyper right):\n{}",
+            shown()
         );
     }
     if hyper.msgs.len() > roxy.msgs.len() {
@@ -470,8 +482,9 @@ fn compare(roxy: &Side<RoxyEnd>, hyper: &Side<HyperEnd>, wire: &[u8]) {
             RoxyEnd::Rejected(reason) => count(slot(reason)),
             RoxyEnd::Closed => count(CLOSED),
             RoxyEnd::Eof | RoxyEnd::Connect => panic!(
-                "roxy ended the connection where hyper parsed request #{}:\n{shown}",
-                roxy.msgs.len()
+                "roxy ended the connection where hyper parsed request #{}:\n{}",
+                roxy.msgs.len(),
+                shown()
             ),
         }
     }
