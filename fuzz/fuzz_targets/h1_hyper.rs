@@ -35,6 +35,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use http::header::{CONNECTION, HOST};
+use http::request::Parts;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use http_body_util::{BodyExt, Collected, Empty};
 use hyper::rt::ReadBufCursor;
@@ -230,22 +231,52 @@ fn url(scheme: Scheme, authority: &Authority, path: &Path, query: Option<&Query>
     }
 }
 
+/// The one `Host` field, normalised with `default_port`, or why there is no
+/// such thing.
+fn host(parts: &Parts, default_port: u16) -> Result<Option<Authority>, String> {
+    let hosts: Vec<&HeaderValue> = parts.headers.get_all(HOST).iter().collect();
+    match hosts[..] {
+        [] => Ok(None),
+        [h] => parse_authority(trim_ows(h.as_bytes()), default_port)
+            .map(Some)
+            .map_err(|e| format!("<host: {}>", e.reason)),
+        _ => Err(format!("<{} host fields>", hosts.len())),
+    }
+}
+
+/// `authority` once `Host`, if sent, is seen to name it. roxy requires that
+/// of an absolute-form or CONNECT target, so a mismatch here means roxy let
+/// one through.
+fn named_by_host(
+    parts: &Parts,
+    authority: Authority,
+    default_port: u16,
+) -> Result<Authority, String> {
+    match host(parts, default_port)? {
+        Some(h) if h != authority => Err(format!("<host {h} does not name {authority}>")),
+        _ => Ok(authority),
+    }
+}
+
 /// hyper's raw request target through roxy's URL normalisation, printed as
 /// `CanonicalRequest::url` prints roxy's. For origin-form the authority is
 /// the one `Host` names, with the role's scheme, as roxy's is. A target
 /// roxy's normaliser refuses prints as its reason code: roxy did not accept
 /// that request either, so it is never compared.
-fn hyper_target(parts: &http::request::Parts, role: &Role) -> String {
+fn hyper_target(parts: &Parts, role: &Role) -> String {
     let uri = &parts.uri;
     if parts.method == http::Method::CONNECT {
         let raw = uri.authority().map_or("", |a| a.as_str());
         return parse_authority_opt(raw.as_bytes(), None)
-            .map_or_else(|e| format!("<{}>", e.reason), |a| a.to_string());
+            .map_err(|e| format!("<{}>", e.reason))
+            .and_then(|a| named_by_host(parts, a.clone(), a.port))
+            .map_or_else(|e| e, |a| a.to_string());
     }
     let pq = uri.path_and_query().map_or("", |p| p.as_str());
     if let (Some(scheme), Some(authority)) = (uri.scheme_str(), uri.authority()) {
         return match parse_absolute_form(format!("{scheme}://{authority}{pq}").as_bytes()) {
-            Ok((s, a, p, q)) => url(s, &a, &p, q.as_ref()),
+            Ok((s, a, p, q)) => named_by_host(parts, a, s.default_port())
+                .map_or_else(|e| e, |a| url(s, &a, &p, q.as_ref())),
             Err(e) => format!("<{}>", e.reason),
         };
     }
@@ -253,14 +284,14 @@ fn hyper_target(parts: &http::request::Parts, role: &Role) -> String {
         Role::Tunnel { scheme, .. } => *scheme,
         Role::ProxyPort | Role::Origin => Scheme::Http,
     };
-    let hosts: Vec<&HeaderValue> = parts.headers.get_all(HOST).iter().collect();
-    let [host] = hosts[..] else {
-        return format!("<{} host fields>", hosts.len());
+    let authority = match host(parts, scheme.default_port()) {
+        Ok(Some(a)) => a,
+        Ok(None) => return "<no host field>".to_owned(),
+        Err(e) => return e,
     };
-    let authority = parse_authority(trim_ows(host.as_bytes()), scheme.default_port());
-    match (authority, parse_origin_form(pq.as_bytes())) {
-        (Ok(a), Ok((p, q))) => url(scheme, &a, &p, q.as_ref()),
-        (Err(e), _) | (_, Err(e)) => format!("<{}>", e.reason),
+    match parse_origin_form(pq.as_bytes()) {
+        Ok((p, q)) => url(scheme, &authority, &p, q.as_ref()),
+        Err(e) => format!("<{}>", e.reason),
     }
 }
 
@@ -277,7 +308,7 @@ fn roxy_msg(req: &CanonicalRequest, body: Buffered) -> Msg {
     }
 }
 
-fn hyper_msg(parts: &http::request::Parts, body: Collected<Bytes>, role: &Role) -> Msg {
+fn hyper_msg(parts: &Parts, body: Collected<Bytes>, role: &Role) -> Msg {
     Msg {
         method: parts.method.as_str().to_owned(),
         target: hyper_target(parts, role),
