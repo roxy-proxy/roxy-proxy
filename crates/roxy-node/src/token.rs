@@ -2,11 +2,10 @@
 //! id and expiry the server stated with the token, since nothing else on
 //! the node knows them after a restart.
 
+use crate::json::JsonFault;
+use crate::protocol::EnrolResponse;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::error::Category;
-
-use crate::protocol::EnrolResponse;
 
 /// The longest token a server may issue.
 pub const MAX_TOKEN_BYTES: usize = 512;
@@ -19,38 +18,6 @@ pub enum TokenError {
         "the node token is not 1 to {MAX_TOKEN_BYTES} bytes of bearer token text (A-Z a-z 0-9 - . _ ~ + / and trailing =)"
     )]
     Shape,
-}
-
-/// Where a JSON document stopped deserialising, without any of its text.
-/// serde's own message quotes the value it rejected, and in a token record
-/// or an enrolment or renewal response that value may be the token.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct JsonFault {
-    pub category: Category,
-    pub line: usize,
-    pub column: usize,
-}
-
-impl From<serde_json::Error> for JsonFault {
-    fn from(e: serde_json::Error) -> Self {
-        Self {
-            category: e.classify(),
-            line: e.line(),
-            column: e.column(),
-        }
-    }
-}
-
-impl std::fmt::Display for JsonFault {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let what = match self.category {
-            Category::Io => "read error",
-            Category::Syntax => "syntax error",
-            Category::Data => "missing or unexpected value",
-            Category::Eof => "unexpected end of input",
-        };
-        write!(f, "{what} at line {} column {}", self.line, self.column)
-    }
 }
 
 /// The stored record: the token and what the server said about it.
@@ -114,6 +81,8 @@ fn check_shape(token: &str) -> Result<(), TokenError> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::error::Category;
+
     use super::*;
 
     fn response(token: &str) -> EnrolResponse {

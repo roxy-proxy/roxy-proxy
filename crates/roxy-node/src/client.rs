@@ -10,10 +10,11 @@ use chrono::{DateTime, Utc};
 use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use reqwest::{StatusCode, Url};
 
+use crate::json::JsonFault;
 use crate::protocol::{
     EnrolRequest, EnrolResponse, ErrorBody, FlowAck, Lease, NodeState, PREFIX, PROTOCOL_VERSION,
 };
-use crate::token::{JsonFault, NodeToken};
+use crate::token::NodeToken;
 
 /// Per-request timeout. Lease and token calls are small; a flow batch is
 /// at most `batch_max_bytes`.
@@ -323,7 +324,9 @@ impl ControlPlane {
         match status {
             StatusCode::OK => match serde_json::from_slice::<Lease>(&body) {
                 Ok(lease) => LeaseFetch::Lease(Box::new(lease)),
-                Err(e) => LeaseFetch::Failed(Transient(format!("lease body: {e}"))),
+                Err(e) => {
+                    LeaseFetch::Failed(Transient(format!("lease body: {}", JsonFault::from(e))))
+                }
             },
             StatusCode::GONE => LeaseFetch::Revoked,
             StatusCode::UPGRADE_REQUIRED => LeaseFetch::Unsupported(error_body(&body, &secrets)),
@@ -356,7 +359,9 @@ impl ControlPlane {
         match status {
             StatusCode::OK => match serde_json::from_slice::<FlowAck>(&body) {
                 Ok(ack) => ShipOutcome::Acked(ack),
-                Err(e) => ShipOutcome::Failed(Transient(format!("flow ack body: {e}"))),
+                Err(e) => {
+                    ShipOutcome::Failed(Transient(format!("flow ack body: {}", JsonFault::from(e))))
+                }
             },
             StatusCode::INSUFFICIENT_STORAGE => ShipOutcome::QuotaExhausted,
             StatusCode::GONE => ShipOutcome::Revoked,
@@ -764,6 +769,49 @@ pub(crate) mod tests {
             panic!("400 is a rejection");
         };
         assert!(!e.to_string().contains(token), "{e}");
+    }
+
+    /// A lease body carries the lease secrets and a flow ack is read on
+    /// every upload, so neither parse failure may quote the document.
+    #[tokio::test]
+    async fn malformed_lease_and_flow_ack_bodies_are_not_echoed() {
+        let mock = MockServer::start().await;
+        let (cp, _) = enrolled(&mock).await;
+        let lease = r#"{"lease_id":"L1","valid_for_seconds":"SHOULD-NOT-LEAK","refresh_after_seconds":1,"config":"","secrets":{"k":"SHOULD-NOT-LEAK"},"state_epoch":"e","flow":{}}"#;
+        mock.push(
+            "/roxy/v1/lease",
+            Reply::Status {
+                status: 200,
+                headers: vec![],
+                body: lease.as_bytes().to_vec(),
+            },
+        );
+        let LeaseFetch::Failed(e) = cp.fetch_lease(&state()).await else {
+            panic!("a lease that does not parse is a transient failure");
+        };
+        assert!(!e.to_string().contains("SHOULD-NOT-LEAK"), "{e}");
+        assert_eq!(
+            e.to_string(),
+            "lease body: missing or unexpected value at line 1 column 54"
+        );
+
+        mock.push(
+            "/roxy/v1/flows",
+            Reply::Status {
+                status: 200,
+                headers: vec![],
+                body: br#"{"acked_through":"SHOULD-NOT-LEAK"}"#.to_vec(),
+            },
+        );
+        let batch = crate::protocol::encode_flow_batch("node-1", "L1", 1, [r#"{"seq":1}"#]);
+        let ShipOutcome::Failed(e) = cp.ship_flows(&batch).await else {
+            panic!("an ack that does not parse is a transient failure");
+        };
+        assert!(!e.to_string().contains("SHOULD-NOT-LEAK"), "{e}");
+        assert_eq!(
+            e.to_string(),
+            "flow ack body: missing or unexpected value at line 1 column 34"
+        );
     }
 
     #[tokio::test]
