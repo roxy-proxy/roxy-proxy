@@ -4,6 +4,7 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::error::Category;
 
 use crate::protocol::EnrolResponse;
 
@@ -13,11 +14,47 @@ pub const MAX_TOKEN_BYTES: usize = 512;
 #[derive(Debug, thiserror::Error)]
 pub enum TokenError {
     #[error("the node token record does not parse: {0}")]
-    Invalid(#[from] serde_json::Error),
+    Invalid(JsonFault),
     #[error(
         "the node token is not 1 to {MAX_TOKEN_BYTES} bytes of bearer token text (A-Z a-z 0-9 - . _ ~ + / and trailing =)"
     )]
     Shape,
+}
+
+/// Where a JSON document stopped deserialising, without any of its text.
+/// serde's own message quotes the value it rejected, and in a token record
+/// or an enrol response that value may be the token.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JsonFault {
+    pub category: Category,
+    pub line: usize,
+    pub column: usize,
+}
+
+impl From<&serde_json::Error> for JsonFault {
+    fn from(e: &serde_json::Error) -> Self {
+        Self {
+            category: e.classify(),
+            line: e.line(),
+            column: e.column(),
+        }
+    }
+}
+
+impl std::fmt::Display for JsonFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let category = match self.category {
+            Category::Io => "io",
+            Category::Syntax => "syntax",
+            Category::Data => "data",
+            Category::Eof => "eof",
+        };
+        write!(
+            f,
+            "{category} error at line {} column {}",
+            self.line, self.column
+        )
+    }
 }
 
 /// The stored record: the token and what the server said about it.
@@ -51,7 +88,8 @@ impl NodeToken {
 
     /// Parses a record written by [`NodeToken::record`].
     pub fn parse(record: &str) -> Result<Self, TokenError> {
-        let parsed: Self = serde_json::from_str(record)?;
+        let parsed: Self =
+            serde_json::from_str(record).map_err(|e| TokenError::Invalid(JsonFault::from(&e)))?;
         check_shape(&parsed.token)?;
         Ok(parsed)
     }
@@ -103,6 +141,43 @@ mod tests {
         let text = format!("{back:?}");
         assert!(!text.contains("tok-secret"), "{text}");
         assert!(text.contains("n1"));
+    }
+
+    /// serde's message quotes the value it choked on, which in a token
+    /// record may be the token itself.
+    #[test]
+    fn a_record_that_does_not_parse_is_not_echoed() {
+        for (record, category) in [
+            (
+                r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK","not_after":918273}"#,
+                Category::Data,
+            ),
+            (
+                r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK","not_after":"SHOULD-NOT-LEAK"}"#,
+                Category::Data,
+            ),
+            (
+                r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK","not_after":"#,
+                Category::Eof,
+            ),
+            (
+                r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK",,}"#,
+                Category::Syntax,
+            ),
+        ] {
+            let err = NodeToken::parse(record).unwrap_err();
+            let text = err.to_string();
+            assert!(!text.contains("SHOULD-NOT-LEAK"), "{text}");
+            assert!(!text.contains("918273"), "{text}");
+            assert!(
+                text.starts_with("the node token record does not parse: "),
+                "{text}"
+            );
+            assert!(
+                matches!(err, TokenError::Invalid(fault) if fault.category == category),
+                "{record}: {text}"
+            );
+        }
     }
 
     #[test]

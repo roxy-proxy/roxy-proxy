@@ -13,7 +13,7 @@ use reqwest::{StatusCode, Url};
 use crate::protocol::{
     EnrolRequest, EnrolResponse, ErrorBody, FlowAck, Lease, NodeState, PREFIX, PROTOCOL_VERSION,
 };
-use crate::token::NodeToken;
+use crate::token::{JsonFault, NodeToken};
 
 /// Per-request timeout. Lease and token calls are small; a flow batch is
 /// at most `batch_max_bytes`.
@@ -281,8 +281,12 @@ impl ControlPlane {
     ) -> Result<EnrolResponse, EnrolError> {
         let (status, body) = send(req).await.map_err(EnrolError::Failed)?;
         if status.is_success() {
-            let res: EnrolResponse = serde_json::from_slice(&body)
-                .map_err(|e| EnrolError::Failed(Transient(format!("enrol response: {e}"))))?;
+            let res: EnrolResponse = serde_json::from_slice(&body).map_err(|e| {
+                EnrolError::Failed(Transient(format!(
+                    "enrol response: {}",
+                    JsonFault::from(&e)
+                )))
+            })?;
             // A token the header cannot carry is the server's bug, not a
             // reason to give up on it.
             NodeToken::from_response(&res)
@@ -640,6 +644,33 @@ pub(crate) mod tests {
                 ),
                 "{body}"
             );
+        }
+    }
+
+    /// A response that does not deserialise is reported by where it went
+    /// wrong, not by what it held: serde quotes the value it choked on.
+    #[tokio::test]
+    async fn a_malformed_enrol_response_is_not_echoed() {
+        let mock = MockServer::start().await;
+        let anon = anon(&mock);
+        for body in [
+            r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK","not_after":"2026-11-05T10:12:00Z","renew_after_seconds":"SHOULD-NOT-LEAK"}"#,
+            r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK","not_after":918273,"renew_after_seconds":1}"#,
+            r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK","#,
+        ] {
+            mock.push(
+                "/roxy/v1/enrol",
+                Reply::Status {
+                    status: 200,
+                    headers: vec![],
+                    body: body.as_bytes().to_vec(),
+                },
+            );
+            let err = anon.enrol("tok").await.unwrap_err().to_string();
+            assert!(!err.contains("SHOULD-NOT-LEAK"), "{err}");
+            assert!(!err.contains("918273"), "{err}");
+            assert!(err.starts_with("enrol response: "), "{err}");
+            assert!(err.contains("line 1 column "), "{err}");
         }
     }
 
