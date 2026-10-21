@@ -11,7 +11,7 @@ come first. Each release's GitHub page lists every merged pull request.
 
 ### Fixed
 
-- A request an addon holds across the policy's `valid_until` is denied `_expired` when the addon forwards it, as a request sent after the instant is ([#568](https://github.com/roxy-proxy/roxy-proxy/issues/568)).
+- A request held across the policy's `valid_until`, by an addon or while its body is buffered for inspection, is denied `_expired` when it reaches the rules, as a request sent after the instant is ([#568](https://github.com/roxy-proxy/roxy-proxy/issues/568)).
 
 </details>
 
