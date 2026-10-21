@@ -38,8 +38,9 @@
     <text x="315" y="140">CONNECT · TLS · strict parse → canonical request</text>
     <text x="315" y="158">lease still valid</text>
     <text x="315" y="184">response: canonical re-serialisation to the client</text>
-    <text x="315" y="420">deny wins · effects: secrets, headers, redirect, sign</text>
-    <text x="315" y="438">response: in-flight rules on the head and bodies</text>
+    <text x="315" y="418">lease still valid</text>
+    <text x="315" y="434">deny wins · effects: secrets, headers, redirect, sign</text>
+    <text x="315" y="450">response: in-flight rules on the head and bodies</text>
     <text x="315" y="544">DNS · address floor · upstream TLS</text>
     <text x="315" y="562">response: re-framed, streamed back up the stack</text>
   </g>
@@ -80,6 +81,7 @@
     <path d="M 500 256 H 546"/>
     <path d="M 500 297 H 546"/>
     <path d="M 500 402 H 546"/>
+    <path d="M 500 438 H 546"/>
     <path d="M 500 526 H 546"/>
   </g>
   <g fill="#ffffff" stroke="#5f6b68">
@@ -88,6 +90,7 @@
     <rect x="548" y="242" width="192" height="28" rx="6"/>
     <rect x="548" y="283" width="192" height="28" rx="6"/>
     <rect x="548" y="388" width="192" height="28" rx="6"/>
+    <rect x="548" y="424" width="192" height="28" rx="6"/>
     <rect x="548" y="512" width="192" height="28" rx="6"/>
   </g>
   <g fill="#5f6b68" font-size="11" text-anchor="middle">
@@ -96,6 +99,7 @@
     <text x="644" y="260">answers → response to the client</text>
     <text x="644" y="301">denies → deny (layer:name)</text>
     <text x="644" y="406">denies → deny (rule id)</text>
+    <text x="644" y="442">expired → deny (_expired)</text>
     <text x="644" y="530" font-size="10">address floor → deny (_address_policy)</text>
   </g>
 
@@ -110,6 +114,7 @@
     <line x1="740" y1="256" x2="752" y2="256"/>
     <line x1="740" y1="297" x2="752" y2="297"/>
     <line x1="740" y1="402" x2="752" y2="402"/>
+    <line x1="740" y1="438" x2="752" y2="438"/>
     <line x1="740" y1="526" x2="752" y2="526"/>
   </g>
   <rect x="752" y="100" width="36" height="488" rx="19" fill="#f8f9f8" stroke="#e6e8e7"/>
