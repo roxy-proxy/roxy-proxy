@@ -39,6 +39,10 @@ To check that `rule_eval`'s differential property actually bites: make
 `MapView::metric` report a missing metric as `Some(0)` (a fail-open bug)
 and run it. It finds a counterexample within a few hundred executions.
 
+To check `h1_hyper`'s: drop the `check_host` call for absolute-form targets
+in `h1/head.rs`, or stop `Connection: close` from setting `meta.close`. The
+seed corpus alone trips either, before fuzzing proper starts.
+
 ## Seeds
 
 `python3 fuzz/generate_seeds.py` generates `seeds/` from the project's own
