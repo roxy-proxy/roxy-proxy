@@ -3618,6 +3618,45 @@ async fn service_request_trailers_are_validated_before_body_inspection() {
 }
 
 #[tokio::test]
+async fn service_request_trailers_keep_client_byte_limit_errors_at_the_edge() {
+    for last_value_bytes in [37, 38] {
+        let kit = testing::kit_with(
+            super::ALLOW_UP,
+            vec![testing::addon("s", "pass", AddonMode::Enforce, |_| {})],
+            |b| {
+                b.flags(|f| f.allow_request_trailers = true)
+                    .limits(|l| l.max_header_bytes = 128)
+            },
+        )
+        .await;
+        let value = "a".repeat(38);
+        let last = "a".repeat(last_value_bytes);
+        // Both raw sections fit. Their canonical fields occupy 128 and
+        // 129 bytes respectively once the spaces after colons are counted.
+        let request = format!(
+            "POST /x HTTP/1.1\r\nhost: up.test\r\ntransfer-encoding: chunked\r\n\r\n0\r\nx:{value}\r\nx:{value}\r\nx:{last}\r\n\r\n"
+        );
+        let mut io = super::http_tests::h1_in_tunnel(&kit).await;
+        io.write_all(request.as_bytes()).await.unwrap();
+        let (head, _) = super::read_response(&mut io).await;
+        if last_value_bytes == 37 {
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+            let seen = kit.upstream.wait_seen(1).await;
+            let trailers = seen[0].trailers.as_ref().unwrap();
+            let values: Vec<_> = trailers.get_all("x").iter().collect();
+            assert_eq!(values, [value.as_str(), value.as_str(), last.as_str()]);
+        } else {
+            assert!(head.starts_with("HTTP/1.1 431"), "{head}");
+            let errors = kit.events("parse_error", 1).await;
+            assert_eq!(errors[0]["reason"], "head_too_large", "{errors:#?}");
+            assert!(kit.upstream.seen().iter().all(|s| s.complete != Some(true)));
+        }
+        let _ = kit.request_event().await;
+        no_layer_error(&kit);
+    }
+}
+
+#[tokio::test]
 async fn service_request_trailers_keep_their_producer_through_a_conditional_layer() {
     for mode in [AddonMode::Enforce, AddonMode::Observe] {
         let kit = testing::kit(
