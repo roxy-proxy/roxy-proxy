@@ -111,16 +111,16 @@ pub fn from_layer_request(
         .iter()
         .map(|(n, v)| (n.as_str().as_bytes(), v.as_bytes()))
         .collect();
+    let known = body.known_length();
     let hint = BodyHint::Stream {
         ended: http_body::Body::is_end_stream(&body),
-        known_length: body.known_length(),
+        known_length: known,
     };
     let fields = RequestFields::from_raw(&raw, &method, meta.version, hint, limits, flags)?;
     if let Some(h) = fields.host {
         check_host(h, &authority, scheme.default_port(), "the URI")?;
     }
     let headers = fields.headers;
-    let known = body.known_length();
     let gate = TrailersGate {
         inner: body,
         limits: limits.clone(),

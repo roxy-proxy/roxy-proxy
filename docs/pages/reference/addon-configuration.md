@@ -266,9 +266,11 @@ with no error.
 
 - What a layer passes on is re-validated as strictly as a client request:
   an absolute `http(s)` URI; `host`, hop-by-hop and framing fields refused
-  at the boundary (roxy derives them); the workload's limits applied. A
-  WASM layer may not set `content-length` either (the body carries its own
-  length); a service layer may, and the body it sends is held to it
+  at the boundary (roxy derives them); the workload's limits applied; the
+  body's trailers held to a client's rules
+  ([trailers](/reference/http#trailers)). A WASM layer may not set
+  `content-length` either (the body carries its own length); a service
+  layer may, and the body it sends is held to it
   ([service layers](/reference/service-layers#frames)). `chain.next`
   fills in the scheme and authority from the exchange when the layer
   leaves them unset.
