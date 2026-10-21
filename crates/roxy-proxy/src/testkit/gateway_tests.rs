@@ -225,3 +225,51 @@ async fn a_mapped_ipv4_peer_is_the_ipv4_client() {
     assert_eq!(a.status, 403, "the same client over IPv4: {a:?}");
     assert_eq!(a.headers["x-roxy-rule"], "limit");
 }
+
+/// Only IPv4-mapped peers share an IPv4 identity: other IPv6 forms must
+/// not gain access through an IPv4 allow, whether it uses equality, a
+/// CIDR or a named address list.
+#[tokio::test]
+async fn only_mapped_ipv6_peers_match_an_ipv4_allow() {
+    let kit = Kit::builder()
+        .rules(
+            r#"
+- id: equal
+  when: path == "/equal" and client.ip == 10.0.0.1
+  then: allow
+- id: cidr
+  when: path == "/cidr" and client.ip in [10.0.0.0/8]
+  then: allow
+- id: list
+  when: path == "/list" and client.ip in @clients
+  then: allow
+"#,
+        )
+        .address_list("clients", "10.0.0.0/8\n")
+        .start()
+        .await;
+    for (peer, allowed) in [
+        ("10.0.0.1:40000", true),
+        ("[::ffff:10.0.0.1]:40000", true),
+        ("[::10.0.0.1]:40000", false),
+        ("[64:ff9b::a00:1]:40000", false),
+        ("[64:ff9b:1::a00:1]:40000", false),
+        ("[2002:0a00:0001::1]:40000", false),
+        ("[2001:db8::a00:1]:40000", false),
+    ] {
+        for rule in ["equal", "cidr", "list"] {
+            let io = kit.connect_http_from(peer.parse().unwrap());
+            let mut client = Client::h1(io, Some("up.test")).await;
+            let a = client.call("GET", &format!("/{rule}"), &[], b"").await;
+            assert_eq!(
+                a.status,
+                if allowed { 200 } else { 403 },
+                "{peer} {rule}: {a:?}"
+            );
+            if !allowed {
+                assert_eq!(a.headers["x-roxy-rule"], "_default", "{peer} {rule}: {a:?}");
+            }
+        }
+    }
+    assert_eq!(kit.upstream.seen().len(), 6);
+}
