@@ -2,10 +2,11 @@
 //! id and expiry the server stated with the token, since nothing else on
 //! the node knows them after a restart.
 
-use crate::json::JsonFault;
-use crate::protocol::EnrolResponse;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+
+use crate::json::JsonFault;
+use crate::protocol::EnrolResponse;
 
 /// The longest token a server may issue.
 pub const MAX_TOKEN_BYTES: usize = 512;

@@ -45,6 +45,10 @@ impl Transient {
     fn status(status: StatusCode, body: &[u8], secrets: &[&str]) -> Self {
         Self(format!("{status}: {}", excerpt(body, secrets)))
     }
+
+    fn json(what: &str, e: serde_json::Error) -> Self {
+        Self(format!("{what}: {}", JsonFault::from(e)))
+    }
 }
 
 /// Up to 200 characters of a response body with every credential the
@@ -282,9 +286,8 @@ impl ControlPlane {
     ) -> Result<EnrolResponse, EnrolError> {
         let (status, body) = send(req).await.map_err(EnrolError::Failed)?;
         if status.is_success() {
-            let res: EnrolResponse = serde_json::from_slice(&body).map_err(|e| {
-                EnrolError::Failed(Transient(format!("enrol response: {}", JsonFault::from(e))))
-            })?;
+            let res: EnrolResponse = serde_json::from_slice(&body)
+                .map_err(|e| EnrolError::Failed(Transient::json("enrol response", e)))?;
             // A token the header cannot carry is the server's bug, not a
             // reason to give up on it.
             NodeToken::from_response(&res)
@@ -324,9 +327,7 @@ impl ControlPlane {
         match status {
             StatusCode::OK => match serde_json::from_slice::<Lease>(&body) {
                 Ok(lease) => LeaseFetch::Lease(Box::new(lease)),
-                Err(e) => {
-                    LeaseFetch::Failed(Transient(format!("lease body: {}", JsonFault::from(e))))
-                }
+                Err(e) => LeaseFetch::Failed(Transient::json("lease body", e)),
             },
             StatusCode::GONE => LeaseFetch::Revoked,
             StatusCode::UPGRADE_REQUIRED => LeaseFetch::Unsupported(error_body(&body, &secrets)),
@@ -359,9 +360,7 @@ impl ControlPlane {
         match status {
             StatusCode::OK => match serde_json::from_slice::<FlowAck>(&body) {
                 Ok(ack) => ShipOutcome::Acked(ack),
-                Err(e) => {
-                    ShipOutcome::Failed(Transient(format!("flow ack body: {}", JsonFault::from(e))))
-                }
+                Err(e) => ShipOutcome::Failed(Transient::json("flow ack body", e)),
             },
             StatusCode::INSUFFICIENT_STORAGE => ShipOutcome::QuotaExhausted,
             StatusCode::GONE => ShipOutcome::Revoked,
