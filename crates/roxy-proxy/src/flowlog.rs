@@ -353,8 +353,10 @@ pub enum FlowEvent<'a> {
 pub struct ClientInfo {
     /// The client as the rules see it (`client.ip`).
     pub ip: IpAddr,
-    /// The TCP peer the request arrived from. Its address is `ip` unless
-    /// the listener resolved the client from `X-Forwarded-For`.
+    /// The TCP peer the request arrived from, as the socket reports it.
+    /// `ip` is its canonical form (an IPv4-mapped address as the IPv4
+    /// address) unless the listener resolved the client from
+    /// `X-Forwarded-For`.
     pub peer: PeerInfo,
 }
 

@@ -828,10 +828,23 @@ impl Kit {
 
     /// A raw client connection to an `http` listener (named `gateway`).
     pub(crate) fn connect_http(&self) -> tokio::io::DuplexStream {
+        self.connect_http_as(client_conn_on(self.gateway.clone()))
+    }
+
+    /// [`connect_http`](Self::connect_http) from `peer` instead of the
+    /// kit's usual one.
+    pub(crate) fn connect_http_from(&self, peer: std::net::SocketAddr) -> tokio::io::DuplexStream {
+        self.connect_http_as(ClientConn {
+            peer,
+            ..client_conn_on(self.gateway.clone())
+        })
+    }
+
+    fn connect_http_as(&self, conn: ClientConn) -> tokio::io::DuplexStream {
         let (client, server) = tokio::io::duplex(64 * 1024);
         self.spawn_conn(crate::conn::serve_http(
             Box::new(server),
-            client_conn_on(self.gateway.clone()),
+            conn,
             self.server.shared().clone(),
         ));
         client
