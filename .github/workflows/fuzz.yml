@@ -98,6 +98,7 @@ jobs:
         target:
           - h1_request
           - h1_chunked
+          - h1_hyper
           - h2map
           - ws_frame
           - url

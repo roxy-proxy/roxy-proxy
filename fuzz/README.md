@@ -22,6 +22,7 @@ The first directory is the working corpus, which grows as the fuzzer runs.
 |---|---|---|
 | `h1_request` | `roxy-http` `h1::scan_head` / `parse_head` | Scanning is resumable. The canonical form is a fixed point: parse, serialise (`src/lib.rs`), parse and serialise again give the same bytes. |
 | `h1_chunked` | `h1::ChunkedDecoder` | The result does not depend on how input is split into reads, and the output is never longer than the input. |
+| `h1_hyper` | `h1::ServerConn` against hyper's HTTP/1 server | **roxy never accepts a request hyper rejects.** Where both accept, the requests agree: method, target (hyper's raw target through roxy's `url` normalisation), the header list without the framing and hop-by-hop fields (names lower-cased, values trimmed, sorted by name), body and trailers, and whether the connection reads on to the next request (a probe request is appended to every input). hyper accepting what roxy rejects is the design: the reason codes are counted, not asserted on. The one leniency excepted is a raw backtick in the path, which roxy percent-encodes and hyper refuses. |
 | `h2map` | `h2map::from_h2_parts` | An accepted request has the tunnel's authority and a normalised path, and no reserved (hop-by-hop, framing, routing) header. |
 | `ws_frame` | `roxy-http` `ws::frame::Decoder` | The result does not depend on how input is split into reads. No message is over its limit. Re-encoding the messages as roxy relays them and decoding again gives the same messages, without error. |
 | `url` | `url::*` | Path, query, origin-form, absolute-form and authority normalisation are idempotent. A normalised path starts with `/` and has no `.` or `..` segment, `%2E`-encoded or not. |
@@ -43,7 +44,7 @@ and run it. It finds a counterexample within a few hundred executions.
 `python3 fuzz/generate_seeds.py` generates `seeds/` from the project's own
 vectors, so the seeds are never stale and nothing derived is checked in:
 
-- **`h1_request`, `h1_chunked`:** the 168-case smuggling corpus in
+- **`h1_request`, `h1_chunked`, `h1_hyper`:** the smuggling corpus in
   `crates/roxy-http/tests/corpus`, with each case's role and flags in the
   config byte.
 - **`url`:** request targets from that corpus.
