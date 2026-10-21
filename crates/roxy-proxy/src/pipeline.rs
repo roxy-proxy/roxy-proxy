@@ -42,6 +42,7 @@ use roxy_rules::{
 };
 use ulid::Ulid;
 
+use crate::addr::canonical;
 use crate::body::{Collected, collect_prefix};
 use crate::budget::{self, BufferLease, Exhausted};
 use crate::capture::Tap;
@@ -418,8 +419,9 @@ pub(crate) struct FlowMeta {
     pub snap: Arc<Snapshot>,
     pub flow: Ulid,
     pub client: ClientConn,
-    /// `client.ip`: the TCP peer, or the client `forwarded_for` resolved
-    /// from `X-Forwarded-For`. The one client identity of the exchange.
+    /// `client.ip`: the canonical TCP peer address, or the client
+    /// `forwarded_for` resolved from `X-Forwarded-For`. The one client
+    /// identity of the exchange.
     pub client_ip: IpAddr,
     pub tls: Option<TlsInfo>,
     /// The secret generation this exchange resolves from and redacts
@@ -623,7 +625,7 @@ pub(crate) fn request_facts(req: &CanonicalRequest) -> RequestFacts {
 /// CONNECT, a head that did not parse): nothing has named a client but the
 /// TCP peer.
 pub(crate) fn client_info(c: &ClientConn) -> ClientInfo {
-    client_info_as(c, c.peer.ip())
+    client_info_as(c, canonical(c.peer.ip()))
 }
 
 fn client_info_as(c: &ClientConn, ip: IpAddr) -> ClientInfo {
@@ -663,9 +665,11 @@ impl FlowCx {
     ) -> Result<Self, ParseError> {
         // Identity first: the rules, metric keys and the flow log all key
         // on it, so an exchange whose client cannot be named never starts.
+        // The peer is canonical so an IPv4 client on a dual-stack listener
+        // is one address to the rules, the connection caps and the log.
         let client_ip = match client.listener.forwarded_for {
             Some(f) => crate::forwarded::client_ip(&req.headers, f.trusted_hops)?,
-            None => client.peer.ip(),
+            None => canonical(client.peer.ip()),
         };
         let facts = FlowFacts {
             client: client.clone(),
@@ -1586,5 +1590,37 @@ mod tests {
             r.rule,
             Some(Decider::Rule(RuleId::new(RuleId::FAIL_CLOSED)))
         );
+    }
+
+    /// An IPv4 client on a dual-stack listener arrives as an IPv4-mapped
+    /// peer. `client.ip` is the IPv4 address, as the connection caps and a
+    /// `forwarded_for` listener name it, with or without an exchange;
+    /// `client.peer` keeps the socket's form.
+    #[tokio::test]
+    async fn a_mapped_ipv4_peer_is_the_ipv4_client() {
+        let kit = crate::testkit::Kit::builder().start().await;
+        let shared = kit.server.shared().clone();
+        let snap = shared.snapshot();
+        let req = http::Request::get("http://up.test/")
+            .body(Body::empty())
+            .unwrap();
+        let meta =
+            roxy_http::RequestMeta::new(roxy_http::Version::H1_1, roxy_http::TargetForm::Absolute);
+        let creq =
+            roxy_http::layer::from_layer_request(req, meta, &snap.limits, &snap.flags).unwrap();
+        let mut client = crate::testkit::client_conn(crate::listener::ListenerMode::HttpProxy);
+        client.peer = "[::ffff:10.0.0.1]:40000".parse().unwrap();
+        let v4: IpAddr = "10.0.0.1".parse().unwrap();
+        let mapped: IpAddr = "::ffff:10.0.0.1".parse().unwrap();
+
+        let info = client_info(&client);
+        assert_eq!(info.ip, v4);
+        assert_eq!(info.peer.ip, mapped);
+
+        let cx = FlowCx::new(shared, snap, client, None, &creq).unwrap();
+        assert_eq!(cx.meta.client_ip, v4);
+        let info = cx.meta.client_info();
+        assert_eq!(info.ip, v4);
+        assert_eq!(info.peer.ip, mapped);
     }
 }

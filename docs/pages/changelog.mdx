@@ -4,6 +4,19 @@ User-facing changes in each release, newest first. Each release has a
 short summary; expand it for the itemised entries, where breaking changes
 come first. Each release's GitHub page lists every merged pull request.
 
+## Unreleased
+
+`client.ip` is canonical without `forwarded_for`: an IPv4 client on a dual-stack listener is `a.b.c.d`, not `::ffff:a.b.c.d`.
+
+<details>
+<summary>Details</summary>
+
+### Fixed
+
+- Without `forwarded_for`, `client.ip` is the canonical TCP peer address. An IPv4 client reaching a dual-stack `[::]` listener is `a.b.c.d` in rules, metric keys and the flow log, as it already was in the connection caps and on a `forwarded_for` listener, instead of `::ffff:a.b.c.d`; `client.peer.ip` in the flow log keeps the socket's form ([#530](https://github.com/roxy-proxy/roxy-proxy/issues/530)).
+
+</details>
+
 ## [0.3.0 (2026-10-15)](https://github.com/roxy-proxy/roxy-proxy/releases/tag/v0.3.0)
 
 Addons can now answer early and hold a request or response for approval, with the request and response lanes of an exchange living independent lives. This is a breaking change for addons: the service protocol is `roxy.layer.v6` and the WASM interface is `roxy:addon@0.3.0`.
