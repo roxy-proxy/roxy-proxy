@@ -3,6 +3,6 @@
 # unpinned upgrade can break it.
 # inspect_ai is not pinned: it follows inspect_sentinel's dependency on its `feature/sentinel` branch.
 inspect_sentinel @ git+https://github.com/meridianlabs-ai/inspect_sentinel@083a3a0c34fc55ef79e1314bbc622e89580011d4
-anthropic==1.11.0
+anthropic==1.13.0
 httpx2==2.13.1
 websockets==17.2
