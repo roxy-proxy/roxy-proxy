@@ -11,6 +11,7 @@ come first. Each release's GitHub page lists every merged pull request.
 
   ### Fixed
 
+  * A request held across the policy's `valid_until`, by an addon or while its body is buffered for inspection, is denied `_expired` when it reaches the rules, as a request sent after the instant is ([#568](https://github.com/roxy-proxy/roxy-proxy/issues/568)).
   * Without `forwarded_for`, `client.ip` is the canonical TCP peer address: an IPv4 client on a dual-stack `[::]` listener is `a.b.c.d`, not `::ffff:a.b.c.d`, in metric keys, the flow log and the addon principal. Rule comparisons already treated the two as one address. `client.peer.ip` in the flow log keeps the socket's form ([#579](https://github.com/roxy-proxy/roxy-proxy/pull/579)).
   * JSON the node cannot parse, whether the `node.token` record, an enrolment or renewal response, a lease or a flow upload's acknowledgement, is reported by the kind of fault and its line and column, never by quoting the input, which could put a token or a lease secret in the log ([#532](https://github.com/roxy-proxy/roxy-proxy/issues/532)).
 </details>

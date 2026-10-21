@@ -1,6 +1,6 @@
 # How roxy works
 
-<img src={howItWorks} alt="One exchange through roxy, top to bottom. The client's request enters roxy and passes through four stages: decrypt and parse (CONNECT, TLS, strict parse into the canonical request, and the lease check), the addon stack (enforce layers in order, with observers beside them on a copy), the rules (deny wins; effects: secrets, headers, redirect, sign) and connect (DNS, address floor, upstream TLS), then reaches the upstream. The response returns up the same stages: re-framed by the connector, re-checked by the rules, seen by the addons, and canonically re-serialised to the client. Each stage has an exit branching to the right: a parse failure is refused with parse_error, an expired policy denies with _expired, an addon can answer the client directly or deny with layer:name, the rules deny with the rule id, and the address floor denies with _address_policy. A flow-log strip down the right edge is fed by every stage and every exit: one record per exchange, never dropped." />
+<img src={howItWorks} alt="One exchange through roxy, top to bottom. The client's request enters roxy and passes through four stages: decrypt and parse (CONNECT, TLS, strict parse into the canonical request, and the lease check), the addon stack (enforce layers in order, with observers beside them on a copy), the rules (lease checked again; deny wins; effects: secrets, headers, redirect, sign) and connect (DNS, address floor, upstream TLS), then reaches the upstream. The response returns up the same stages: re-framed by the connector, re-checked by the rules, seen by the addons, and canonically re-serialised to the client. Each stage has an exit branching to the right: a parse failure is refused with parse_error, an expired policy denies with _expired at either lease check, an addon can answer the client directly or deny with layer:name, the rules deny with the rule id, and the address floor denies with _address_policy. A flow-log strip down the right edge is fed by every stage and every exit: one record per exchange, never dropped." />
 
 An exchange is one request and its response. Every exchange takes the same
 path, whichever way roxy is deployed.
@@ -67,7 +67,9 @@ rules:
 ```
 
 The request steps run in a fixed order: a bounded body buffer only when a
-rule reads `body.text`, then the admission decision and its effects. The only
+rule reads `body.text`, then the admission decision and its effects. The
+[lease](/guides/operations#lease) is checked before the addons run and again
+at admission, so a request an addon held across expiry is denied. The only
 verdict that leads to the upstream is `Continue`; every error maps to a
 deny or a close. The steps are not an extension point: extensions are
 addons, downstream of them.
@@ -100,6 +102,7 @@ drops a record; when it falls behind, traffic waits
 
 The compiled policy (rules, metrics, addons, address lists) is an immutable
 snapshot swapped atomically on reload, and an exchange runs to the end on
-the snapshot it started with. In [node mode](/guides/node-mode) the
+the snapshot it started with, except that each lease check uses the
+currently loaded policy's expiry. In [node mode](/guides/node-mode) the
 snapshot comes from a control plane's lease instead of a file, and the flow
 log is also shipped back to it.
