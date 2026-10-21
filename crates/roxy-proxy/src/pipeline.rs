@@ -744,30 +744,20 @@ impl FlowCx {
         }
     }
 
-    /// The deny every exchange gets once the policy's lease has run out,
-    /// recorded as the admission decision. Nothing of the policy (the addons
-    /// included) runs for it.
-    pub(crate) fn expiry_refusal(&mut self) -> Option<Refusal> {
-        if !self.shared.expired() {
-            return None;
-        }
-        self.record.stage = Some(Stage::Head);
-        if let Err(e) = self.record_admission_sample(true) {
-            self.meta.metric_error(Stage::Head, &e);
-        }
-        Some(Refusal::expired())
-    }
-
-    /// The refusal every exchange gets while the process is quarantined,
-    /// recorded as the admission decision. Checked before the lease: a
-    /// quarantine outlives any policy.
-    pub(crate) fn quarantine_refusal(&mut self) -> Option<Refusal> {
-        let refusal = self.quarantined()?;
+    /// The refusal every exchange gets, whatever its request, while the
+    /// process is quarantined or the policy's lease has run out. Recorded
+    /// as the admission decision. Every site that admits a request checks
+    /// it, so a request a layer held is refused if either began while it
+    /// was held. The quarantine comes first: it outlives any policy.
+    pub(crate) fn blanket_refusal(&mut self) -> Option<Refusal> {
+        let refusal = self
+            .quarantined()
+            .or_else(|| self.shared.expired().then(Refusal::expired))?;
         self.refused_at_admission();
         Some(refusal)
     }
 
-    /// The same refusal for an exchange that has been through the addon
+    /// The quarantine refusal for an exchange that has been through the addon
     /// stack. An admission decision the rules made stands, sample and stage
     /// included; a stack that answered without `next` left none, and the
     /// refusal is then the exchange's decision, as above the stack.
@@ -1166,9 +1156,9 @@ fn buffered_bytes(held: u64, inspected: &Inspected) -> u64 {
 
 /// The admission decision and its effects.
 fn request_rules(cx: &mut FlowCx, mut req: CanonicalRequest) -> Verdict {
-    // A layer above may have quarantined the process while it held the
-    // request; nothing of a quarantined exchange is forwarded.
-    if let Some(refusal) = cx.quarantine_refusal() {
+    // A layer above may have quarantined the process, or held the request
+    // past the lease; nothing of such an exchange is forwarded.
+    if let Some(refusal) = cx.blanket_refusal() {
         return Verdict::Deny(refusal);
     }
     let (out, mut refusal) = cx.evaluate_admission();

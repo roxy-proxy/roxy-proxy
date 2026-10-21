@@ -7,9 +7,10 @@ use std::time::Duration;
 
 use chrono::{TimeDelta, Utc};
 use futures_util::{SinkExt as _, StreamExt as _};
+use tokio::io::AsyncWriteExt as _;
 use tokio_tungstenite::tungstenite::Message;
 
-use super::{ALLOW_UP, AddonDef, Kit, Ws};
+use super::{ALLOW_UP, AddonDef, Kit, Ws, read_head, read_response};
 
 const WS_RULES: &str = r#"
 - id: ws
@@ -118,6 +119,51 @@ async fn an_expired_lease_denies_before_the_addons_run() {
     let ev = kit.request_event().await;
     assert_eq!(ev["addons"], serde_json::json!([]), "{ev:#}");
     assert_eq!(ev["terminal_rule"], "_expired", "{ev:#}");
+}
+
+/// Body inspection can hold a request past the lease even without addons.
+/// Admission checks the lease after the body arrives, before any rule runs.
+#[tokio::test]
+async fn a_request_buffered_across_the_lease_is_denied() {
+    let kit = Kit::builder()
+        .rules(
+            r#"
+- id: up
+  when: host == "up.test" and body.text == "hello"
+  then: allow
+"#,
+        )
+        .valid_until(future())
+        .start()
+        .await;
+    let mut io = kit.connect();
+    io.write_all(
+        b"POST http://up.test/x HTTP/1.1\r\nhost: up.test\r\ncontent-length: 5\r\nexpect: 100-continue\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    // The interim response confirms inspection has passed the initial
+    // lease check and is waiting for the body.
+    let interim = read_head(&mut io).await;
+    assert!(interim.starts_with("HTTP/1.1 100 Continue"), "{interim}");
+    kit.server.handle().extend_valid_until(past());
+    io.write_all(b"hello").await.unwrap();
+    let (head, body) = read_response(&mut io).await;
+    assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+    assert!(head.contains("x-roxy-rule: _expired\r\n"), "{head}");
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["rule"], "_expired", "{body:#}");
+    assert!(
+        kit.upstream.seen().is_empty(),
+        "nothing reached the upstream"
+    );
+    let ev = kit.request_event().await;
+    assert_eq!(ev["decision"], "deny", "{ev:#}");
+    assert_eq!(ev["terminal_rule"], "_expired", "{ev:#}");
+    assert_eq!(ev["reason"], "policy_expired", "{ev:#}");
+    assert_eq!(ev["stage"], "head", "{ev:#}");
+    assert_eq!(ev["rules"], serde_json::json!([]), "{ev:#}");
+    assert_eq!(kit.events("policy_expired", 1).await.len(), 1);
 }
 
 async fn read_to_close(ws: &mut Ws) -> Option<u16> {
