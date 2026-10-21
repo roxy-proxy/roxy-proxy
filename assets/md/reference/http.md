@@ -85,8 +85,9 @@ order). Entries to its left are the client's own and are never read.
   connection closed, counted by `quarantine_on.parse_errors`. It is never
   attributed to the peer: a bypassed or misconfigured load balancer must
   neither let a client choose its address nor fold every client into one.
-* An IPv4-mapped IPv6 entry (`::ffff:a.b.c.d`) is the IPv4 address it
-  embeds, as a host literal is.
+* An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`), as an entry or as the
+  peer of a dual-stack `[::]` listener, is the IPv4 address it embeds, as a
+  host literal is.
 * The header goes upstream as received; roxy neither appends the peer nor
   strips it.
 * `limits.max_connections_per_client` is applied when the connection is

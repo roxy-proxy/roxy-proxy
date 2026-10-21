@@ -85,6 +85,9 @@ request is forwarded; a rule reading one is re-checked in flight
 `client.ip` is the client as roxy establishes it: the TCP peer, or on a
 listener with `forwarded_for` the client `X-Forwarded-For` names at the
 trusted hop ([HTTP](/reference/http#clients-behind-a-load-balancer)).
+Either way it is canonical: an IPv4-mapped IPv6 address (`::ffff:10.0.0.1`,
+how an IPv4 client reaches a dual-stack `[::]` listener) is the IPv4 address
+it embeds, so `client.ip == 10.0.0.1` matches it.
 `path` is normalised ([HTTP](/reference/http#url-normalisation)). `host`
 and `tls.sni` are the name as roxy delivers it: lower-case, without a
 trailing dot, internationalised labels in A-label (`xn--`) form, and an IP
