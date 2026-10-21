@@ -3,7 +3,7 @@
 
 use tokio::io::AsyncWriteExt as _;
 
-use super::{Answer, Kit};
+use super::{Answer, Client, Kit};
 
 const SECRET: &str = "sk-ant-gateway-secret-0123456789";
 
@@ -186,4 +186,42 @@ async fn two_hosts_on_one_keep_alive_connection_are_two_exchanges() {
     assert_eq!(ev[0]["req"]["host"], "up.test");
     assert_eq!(ev[1]["req"]["host"], "alias.test");
     assert_eq!(ev[1]["terminal_rule"], "alias");
+}
+
+/// An IPv4 client on a dual-stack listener arrives as an IPv4-mapped peer
+/// (`::ffff:a.b.c.d`) and is the IPv4 address as `client.ip`: a metric
+/// keyed on it has one series for the client whichever way it connected,
+/// and the flow log keeps the socket's form only as `client.peer`.
+#[tokio::test]
+async fn a_mapped_ipv4_peer_is_the_ipv4_client() {
+    const LIMIT: &str = r#"
+- id: limit
+  when: metric.per_client >= 1
+  then: deny
+- id: up
+  when: host == "up.test"
+  then: allow
+"#;
+    let kit = Kit::builder()
+        .rules(LIMIT)
+        .metric_defs("- { id: per_client, count: requests, key: [client.ip], window: 1m }")
+        .start()
+        .await;
+    let io = kit.connect_http_from("[::ffff:10.0.0.1]:40000".parse().unwrap());
+    let a = Client::h1(io, Some("up.test"))
+        .await
+        .call("GET", "/", &[], b"")
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["client"]["ip"], "10.0.0.1", "{ev:#}");
+    assert_eq!(ev["client"]["peer"]["ip"], "::ffff:10.0.0.1", "{ev:#}");
+
+    let io = kit.connect_http_from("10.0.0.1:40001".parse().unwrap());
+    let a = Client::h1(io, Some("up.test"))
+        .await
+        .call("GET", "/", &[], b"")
+        .await;
+    assert_eq!(a.status, 403, "the same client over IPv4: {a:?}");
+    assert_eq!(a.headers["x-roxy-rule"], "limit");
 }

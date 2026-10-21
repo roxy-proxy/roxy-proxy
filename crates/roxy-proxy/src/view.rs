@@ -134,7 +134,8 @@ pub(crate) struct WsFacts {
 #[derive(Debug, Clone)]
 pub(crate) struct FlowFacts {
     pub client: ClientConn,
-    /// `client.ip`: the TCP peer, or the client `forwarded_for` resolved.
+    /// `client.ip`: the canonical TCP peer, or the client `forwarded_for`
+    /// resolved.
     pub client_ip: IpAddr,
     pub tls: Option<TlsInfo>,
     /// What the client sent: the flow log's `req`.

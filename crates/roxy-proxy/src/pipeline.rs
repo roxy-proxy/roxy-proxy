@@ -42,7 +42,6 @@ use roxy_rules::{
 };
 use ulid::Ulid;
 
-use crate::addr::canonical;
 use crate::body::{Collected, collect_prefix};
 use crate::budget::{self, BufferLease, Exhausted};
 use crate::capture::Tap;
@@ -621,11 +620,20 @@ pub(crate) fn request_facts(req: &CanonicalRequest) -> RequestFacts {
     }
 }
 
+/// The TCP peer as a client identity. An IPv4-mapped address (how an IPv4
+/// client reaches a dual-stack `[::]` listener) is the IPv4 address, and
+/// that is the only equivalence, as for `==` and `in @list` in a rule: a
+/// rule may `allow` on `client.ip`, so an IPv4-compatible or translated
+/// form is not the address it embeds.
+fn peer_ip(c: &ClientConn) -> IpAddr {
+    c.peer.ip().to_canonical()
+}
+
 /// `client` for an event with no exchange (a refused connection, a
 /// CONNECT, a head that did not parse): nothing has named a client but the
 /// TCP peer.
 pub(crate) fn client_info(c: &ClientConn) -> ClientInfo {
-    client_info_as(c, canonical(c.peer.ip()))
+    client_info_as(c, peer_ip(c))
 }
 
 fn client_info_as(c: &ClientConn, ip: IpAddr) -> ClientInfo {
@@ -665,11 +673,9 @@ impl FlowCx {
     ) -> Result<Self, ParseError> {
         // Identity first: the rules, metric keys and the flow log all key
         // on it, so an exchange whose client cannot be named never starts.
-        // The peer is canonical so an IPv4 client on a dual-stack listener
-        // is one address to the rules, the connection caps and the log.
         let client_ip = match client.listener.forwarded_for {
             Some(f) => crate::forwarded::client_ip(&req.headers, f.trusted_hops)?,
-            None => canonical(client.peer.ip()),
+            None => peer_ip(&client),
         };
         let facts = FlowFacts {
             client: client.clone(),
@@ -1592,35 +1598,23 @@ mod tests {
         );
     }
 
-    /// An IPv4 client on a dual-stack listener arrives as an IPv4-mapped
-    /// peer. `client.ip` is the IPv4 address, as the connection caps and a
-    /// `forwarded_for` listener name it, with or without an exchange;
-    /// `client.peer` keeps the socket's form.
-    #[tokio::test]
-    async fn a_mapped_ipv4_peer_is_the_ipv4_client() {
-        let kit = crate::testkit::Kit::builder().start().await;
-        let shared = kit.server.shared().clone();
-        let snap = shared.snapshot();
-        let req = http::Request::get("http://up.test/")
-            .body(Body::empty())
-            .unwrap();
-        let meta =
-            roxy_http::RequestMeta::new(roxy_http::Version::H1_1, roxy_http::TargetForm::Absolute);
-        let creq =
-            roxy_http::layer::from_layer_request(req, meta, &snap.limits, &snap.flags).unwrap();
+    /// An event with no exchange names the peer as its client: an
+    /// IPv4-mapped peer as the IPv4 address, with `client.peer` in the
+    /// socket's form. Only that equivalence applies: an IPv4-compatible peer
+    /// (`::a.b.c.d`) is not the IPv4 address it embeds, so an `allow` on
+    /// that address cannot be reached by presenting it.
+    #[test]
+    fn the_no_exchange_client_is_the_mapped_peer_as_ipv4() {
         let mut client = crate::testkit::client_conn(crate::listener::ListenerMode::HttpProxy);
         client.peer = "[::ffff:10.0.0.1]:40000".parse().unwrap();
-        let v4: IpAddr = "10.0.0.1".parse().unwrap();
-        let mapped: IpAddr = "::ffff:10.0.0.1".parse().unwrap();
-
         let info = client_info(&client);
-        assert_eq!(info.ip, v4);
-        assert_eq!(info.peer.ip, mapped);
+        assert_eq!(info.ip, "10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(info.peer.ip, "::ffff:10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(info.peer.port, 40000);
 
-        let cx = FlowCx::new(shared, snap, client, None, &creq).unwrap();
-        assert_eq!(cx.meta.client_ip, v4);
-        let info = cx.meta.client_info();
-        assert_eq!(info.ip, v4);
-        assert_eq!(info.peer.ip, mapped);
+        client.peer = "[::10.0.0.1]:40000".parse().unwrap();
+        let info = client_info(&client);
+        assert_eq!(info.ip, "::10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(info.ip, info.peer.ip);
     }
 }
