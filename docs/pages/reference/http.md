@@ -308,7 +308,9 @@ Applied to the request target, for matching and forwarding alike.
 1. The path starts with `/` and contains `pchar` and `/`, with well-formed
    percent-encodings. `[ ] { } | ^` and `` ` `` are percent-encoded rather
    than rejected (`/a|b` becomes `/a%7Cb`). Space, control bytes, `"`,
-   `<`, `>`, `\` and non-ASCII are rejected.
+   `<`, `>`, `\` and non-ASCII are rejected. The raw backtick is the one
+   request-target byte roxy accepts and hyper's HTTP/1.1 parser refuses;
+   everywhere else roxy is the stricter of the two.
 2. Percent-encoded unreserved characters (`A–Z a–z 0–9 - . _ ~`) are
    decoded; other encodings stay (`%2F` stays `%2F`).
 3. Hex digits in the remaining encodings are upper-cased.
