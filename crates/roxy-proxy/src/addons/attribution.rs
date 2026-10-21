@@ -131,7 +131,8 @@ pub(crate) enum Side {
     Client,
     /// The upstream's response body.
     Upstream,
-    /// A layer's request body after canonical validation.
+    /// The request body the layer at this index passed on, re-validated
+    /// for the stage after it.
     Layer(usize),
 }
 
@@ -145,9 +146,9 @@ impl Side {
                 name: st.snap.addons[index].name.clone(),
                 err: roxy_wasm::LayerError::InvalidRequest(e.to_string()).into(),
             },
-            // A deliberate lane cut is not a validation failure. Transport
-            // and service failures own their attribution, including lane
-            // cap and declared-length errors.
+            // A cut is the producer's own doing, not a fault, and the
+            // service mux records a lane's cap and declared-length faults
+            // itself.
             (Side::Layer(_), _) => return None,
         })
     }

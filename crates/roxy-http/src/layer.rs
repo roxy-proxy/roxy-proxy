@@ -16,8 +16,8 @@ use http_body::{Frame, SizeHint};
 
 use crate::model::{
     Body, BodyError, BodyHint, CanonicalRequest, CanonicalResponse, HttpFlags, Limits, Method,
-    ParseError, Reason, RequestFields, RequestMeta, Scheme, check_host, is_reserved, reject,
-    validate_request_trailers,
+    ParseError, Reason, RequestFields, RequestMeta, Scheme, check_host, header_map_wire_len,
+    is_reserved, reject, validate_request_trailers,
 };
 use crate::url;
 
@@ -87,11 +87,7 @@ pub fn from_layer_request(
     }
     let (path, query) = url::parse_origin_form(pq.as_bytes())?;
 
-    let head_bytes = parts.headers.iter().fold(0usize, |acc, (n, v)| {
-        acc.saturating_add(n.as_str().len())
-            .saturating_add(v.len())
-            .saturating_add(4)
-    });
+    let head_bytes = header_map_wire_len(&parts.headers);
     if head_bytes > limits.max_header_bytes {
         return reject(Reason::HeadTooLarge, format!("head is {head_bytes} bytes"));
     }

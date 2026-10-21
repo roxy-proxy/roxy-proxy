@@ -78,11 +78,25 @@ pub fn check_trailer_fields(trailers: &HeaderMap, limits: &Limits) -> Result<(),
     Ok(())
 }
 
+/// Approximate h1 wire size of `map` (`name: value\r\n` per field), the
+/// size `limits.max_header_bytes` bounds.
+pub fn header_map_wire_len(map: &HeaderMap) -> usize {
+    wire_len(map.iter())
+}
+
+fn wire_len<'a>(fields: impl Iterator<Item = (&'a HeaderName, &'a HeaderValue)>) -> usize {
+    fields.fold(0usize, |acc, (n, v)| {
+        acc.saturating_add(n.as_str().len())
+            .saturating_add(v.len())
+            .saturating_add(4)
+    })
+}
+
 /// Validates a request trailer section, wherever it enters: the client's
 /// HTTP/2 stream, or a layer's forwarded body. Any section is a rejection
 /// unless `http.allow_request_trailers`; with it, the field rules of
-/// [`check_trailer_fields`] apply and the values go through the header
-/// validator, as the h1 chunked decoder's do.
+/// [`check_trailer_fields`] and `limits.max_header_bytes` apply and the
+/// values go through the header validator, as the h1 chunked decoder's do.
 pub fn validate_request_trailers(
     trailers: &HeaderMap,
     limits: &Limits,
@@ -92,12 +106,7 @@ pub fn validate_request_trailers(
         return reject(Reason::Trailers, "trailer section present");
     }
     check_trailer_fields(trailers, limits)?;
-    let bytes = trailers.iter().fold(0usize, |acc, (name, value)| {
-        acc.saturating_add(name.as_str().len())
-            .saturating_add(value.len())
-            .saturating_add(4)
-    });
-    if bytes > limits.max_header_bytes {
+    if header_map_wire_len(trailers) > limits.max_header_bytes {
         return reject(Reason::HeadTooLarge, "trailer section too large");
     }
     let raw: Vec<(&[u8], &[u8])> = trailers
@@ -460,11 +469,7 @@ impl Headers {
 
     /// Approximate h1 wire size (`name: value\r\n` per field).
     pub fn wire_len(&self) -> usize {
-        self.entries.iter().fold(0usize, |acc, (n, v)| {
-            acc.saturating_add(n.as_str().len())
-                .saturating_add(v.len())
-                .saturating_add(4)
-        })
+        wire_len(self.entries.iter().map(|(n, v)| (n, v)))
     }
 
     /// Copies into an `http::HeaderMap` (repeated names appended in order).

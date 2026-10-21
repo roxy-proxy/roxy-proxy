@@ -464,8 +464,12 @@ impl StackFlow {
         (0..stage).rev().find(|&i| self.enforced(i))
     }
 
-    /// Attribute body validation where it happens, before a condition,
-    /// layer or HTTP client can turn the error into a cut or stream reset.
+    /// The request reaching `stage`, re-validated as a client's would be.
+    /// A body a layer passed on is attributed to that layer here, so a
+    /// trailer section refused as it flows is recorded as the layer's
+    /// `invalid_request` before a lane or HTTP client turns the error into
+    /// a cut or a stream reset. The client's own body was attributed at
+    /// the client edge.
     fn validate_request(
         self: &Arc<Self>,
         stage: usize,
@@ -477,10 +481,9 @@ impl StackFlow {
             &self.snap.limits,
             &self.snap.flags,
         )?;
-        let side = self
-            .passed_on_by(stage)
-            .map_or(attribution::Side::Client, attribution::Side::Layer);
-        req.body = attribution::attributed(self, side, req.body);
+        if let Some(layer) = self.passed_on_by(stage) {
+            req.body = attribution::attributed(self, attribution::Side::Layer(layer), req.body);
+        }
         Ok(req)
     }
 
