@@ -13,7 +13,7 @@ come first. Each release's GitHub page lists every merged pull request.
 
 ### Fixed
 
-- Without `forwarded_for`, `client.ip` is the canonical TCP peer address. An IPv4 client reaching a dual-stack `[::]` listener is `a.b.c.d` in rules, metric keys and the flow log, as it already was in the connection caps and on a `forwarded_for` listener, instead of `::ffff:a.b.c.d`; `client.peer.ip` in the flow log keeps the socket's form ([#530](https://github.com/roxy-proxy/roxy-proxy/issues/530)).
+- Without `forwarded_for`, `client.ip` is the canonical TCP peer address. An IPv4 client reaching a dual-stack `[::]` listener is `a.b.c.d` in rules, metric keys and the flow log, as it already was in the connection caps and on a `forwarded_for` listener, instead of `::ffff:a.b.c.d`; `client.peer.ip` in the flow log keeps the socket's form ([#579](https://github.com/roxy-proxy/roxy-proxy/pull/579)).
 
 </details>
 
