@@ -6,9 +6,14 @@ come first. Each release's GitHub page lists every merged pull request.
 
 ## Unreleased
 
+<details>
+<summary>Details</summary>
+
 ### Fixed
 
-- A `node.token` record or an enrol response that does not parse is reported by error category, line and column; the diagnostic no longer repeats serde's message, which can quote a value from the input ([#532](https://github.com/roxy-proxy/roxy-proxy/issues/532)).
+- A `node.token` record or an enrol response that does not parse is reported by the kind of fault and its line and column, never by quoting the input, which could put a token in the log ([#532](https://github.com/roxy-proxy/roxy-proxy/issues/532)).
+
+</details>
 
 ## [0.3.0 (2026-10-15)](https://github.com/roxy-proxy/roxy-proxy/releases/tag/v0.3.0)
 

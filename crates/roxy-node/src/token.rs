@@ -31,8 +31,8 @@ pub struct JsonFault {
     pub column: usize,
 }
 
-impl From<&serde_json::Error> for JsonFault {
-    fn from(e: &serde_json::Error) -> Self {
+impl From<serde_json::Error> for JsonFault {
+    fn from(e: serde_json::Error) -> Self {
         Self {
             category: e.classify(),
             line: e.line(),
@@ -43,17 +43,13 @@ impl From<&serde_json::Error> for JsonFault {
 
 impl std::fmt::Display for JsonFault {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let category = match self.category {
-            Category::Io => "io",
-            Category::Syntax => "syntax",
-            Category::Data => "data",
-            Category::Eof => "eof",
+        let what = match self.category {
+            Category::Io => "read error",
+            Category::Syntax => "syntax error",
+            Category::Data => "missing or unexpected value",
+            Category::Eof => "unexpected end of input",
         };
-        write!(
-            f,
-            "{category} error at line {} column {}",
-            self.line, self.column
-        )
+        write!(f, "{what} at line {} column {}", self.line, self.column)
     }
 }
 
@@ -89,7 +85,7 @@ impl NodeToken {
     /// Parses a record written by [`NodeToken::record`].
     pub fn parse(record: &str) -> Result<Self, TokenError> {
         let parsed: Self =
-            serde_json::from_str(record).map_err(|e| TokenError::Invalid(JsonFault::from(&e)))?;
+            serde_json::from_str(record).map_err(|e| TokenError::Invalid(e.into()))?;
         check_shape(&parsed.token)?;
         Ok(parsed)
     }

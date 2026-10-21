@@ -282,10 +282,7 @@ impl ControlPlane {
         let (status, body) = send(req).await.map_err(EnrolError::Failed)?;
         if status.is_success() {
             let res: EnrolResponse = serde_json::from_slice(&body).map_err(|e| {
-                EnrolError::Failed(Transient(format!(
-                    "enrol response: {}",
-                    JsonFault::from(&e)
-                )))
+                EnrolError::Failed(Transient(format!("enrol response: {}", JsonFault::from(e))))
             })?;
             // A token the header cannot carry is the server's bug, not a
             // reason to give up on it.
