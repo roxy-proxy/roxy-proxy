@@ -37,10 +37,11 @@ use bytes::Bytes;
 use h2::server::{Connection, SendResponse};
 use h2::{RecvStream, SendStream};
 use http_body::Frame;
-use roxy_http::h2map::{from_h2_parts, to_h2_response, validate_h2_trailers};
+use roxy_http::h2map::{from_h2_parts, to_h2_response};
 use roxy_http::{
     Authority, Body, BodyError, CanonicalResponse, DriveError, HttpFlags, Limits, Method,
-    ParseError, Reason, WriteError, status_forbids_body, validate_response_trailers,
+    ParseError, Reason, WriteError, status_forbids_body, validate_request_trailers,
+    validate_response_trailers,
 };
 use tokio::task::JoinSet;
 use tokio::time::{Instant, Sleep, sleep, sleep_until, timeout};
@@ -832,13 +833,15 @@ impl http_body::Body for H2Body {
                 this.finished = true;
                 Poll::Ready(None)
             }
-            Poll::Ready(Ok(Some(t))) => match validate_h2_trailers(&t, &this.limits, &this.flags) {
-                Ok(t) => {
-                    this.finished = true;
-                    Poll::Ready(Some(Ok(Frame::trailers(t))))
+            Poll::Ready(Ok(Some(t))) => {
+                match validate_request_trailers(&t, &this.limits, &this.flags) {
+                    Ok(t) => {
+                        this.finished = true;
+                        Poll::Ready(Some(Ok(Frame::trailers(t))))
+                    }
+                    Err(e) => this.failed(e.clone(), BodyError::Invalid(e)),
                 }
-                Err(e) => this.failed(e.clone(), BodyError::Invalid(e)),
-            },
+            }
             Poll::Ready(Err(e)) => {
                 this.fail.stream_failed(&e);
                 this.finished = true;

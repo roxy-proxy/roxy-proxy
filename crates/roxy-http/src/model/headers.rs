@@ -78,6 +78,27 @@ pub fn check_trailer_fields(trailers: &HeaderMap, limits: &Limits) -> Result<(),
     Ok(())
 }
 
+/// Validates a request trailer section, wherever it enters: the client's
+/// HTTP/2 stream, or a layer's forwarded body. Any section is a rejection
+/// unless `http.allow_request_trailers`; with it, the field rules of
+/// [`check_trailer_fields`] apply and the values go through the header
+/// validator, as the h1 chunked decoder's do.
+pub fn validate_request_trailers(
+    trailers: &HeaderMap,
+    limits: &Limits,
+    flags: &HttpFlags,
+) -> Result<HeaderMap, ParseError> {
+    if !flags.allow_request_trailers {
+        return reject(Reason::Trailers, "trailer section present");
+    }
+    check_trailer_fields(trailers, limits)?;
+    let raw: Vec<(&[u8], &[u8])> = trailers
+        .iter()
+        .map(|(n, v)| (n.as_str().as_bytes(), v.as_bytes()))
+        .collect();
+    Ok(Headers::try_from_raw(raw, limits, flags)?.to_header_map())
+}
+
 /// Validates a response trailer section as it is about to be written to
 /// the client. `Ok(None)` when `http.allow_response_trailers` is off: the
 /// trailers are dropped and the body ends after its data. With it, the
@@ -584,6 +605,47 @@ mod tests {
         }
         assert!(!is_forbidden_trailer("grpc-status"));
         assert!(!is_forbidden_trailer("x-checksum"));
+    }
+
+    #[test]
+    fn request_trailers_refused_unless_allowed() {
+        let mut t = HeaderMap::new();
+        t.insert("grpc-status", HeaderValue::from_static("0"));
+        assert_eq!(
+            validate_request_trailers(&t, &Limits::default(), &HttpFlags::default())
+                .unwrap_err()
+                .reason,
+            Reason::Trailers
+        );
+    }
+
+    #[test]
+    fn request_trailers_validated() {
+        let flags = HttpFlags {
+            allow_request_trailers: true,
+            ..HttpFlags::default()
+        };
+        let mut t = HeaderMap::new();
+        t.insert("grpc-status", HeaderValue::from_static("0"));
+        let ok = validate_request_trailers(&t, &Limits::default(), &flags).unwrap();
+        assert_eq!(ok.get("grpc-status").unwrap(), "0");
+        for bad in [
+            "authorization",
+            "content-length",
+            "content-md5",
+            "host",
+            "connection",
+        ] {
+            let mut t = HeaderMap::new();
+            t.insert(HeaderName::from_static(bad), HeaderValue::from_static("x"));
+            assert_eq!(
+                validate_request_trailers(&t, &Limits::default(), &flags)
+                    .unwrap_err()
+                    .reason,
+                Reason::Trailers,
+                "{bad}"
+            );
+        }
     }
 
     #[test]

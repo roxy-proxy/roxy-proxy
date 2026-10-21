@@ -9,11 +9,11 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use roxy_http::layer::{from_layer_request, to_layer_response};
-use roxy_http::{Body, CanonicalRequest};
+use roxy_http::{Body, CanonicalRequest, DriveError};
 use roxy_wasm::{LayerError, LayerRequest};
 
 use super::attribution::{Side, attributed};
-use super::chain::{CoreIo, Head, Headless, LaneState, LaneTx};
+use super::chain::{CoreIo, Head, Headless, LaneId, LaneState, LaneTx};
 use super::client_edge::refusal_for_fault;
 use super::{StackFlow, decode, ws};
 use crate::body::{Collected, collect_prefix};
@@ -93,20 +93,9 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
             drop(lease);
             refuse(&st, res_out, &refusal, res);
         }
-        // The request body failed on its way in. If a fault was recorded
-        // for it (the client's broken upload, a layer's failure, the
-        // budget), the corresponding HTTP error response is the answer. If none was,
-        // the lane was cut by a layer of its own accord: nothing answers
-        // that, and the response lane is cut as the request lane was.
-        Outcome::Close(_) => {
+        Outcome::Close(e) => {
             drop(lease);
-            if let LaneState::Cut(why) = st.chain().state(forward)
-                && st.attribution.fault().is_none()
-            {
-                res_out.cut_headless(why);
-            } else {
-                refused(&st, res_out).await;
-            }
+            closed(&st, res_out, forward, &e).await;
         }
         Outcome::Upgrade { res, upstream, key } => {
             relay_upgrade(
@@ -180,16 +169,44 @@ async fn relay_upgrade(
 /// not validate: the fault of the nearest enforcing layer that ran.
 pub(super) fn admit(st: &StackFlow, req: LayerRequest) -> Option<(CanonicalRequest, Option<Body>)> {
     let snap = &st.snap;
-    let last = snap.addons.len() - 1;
-    let layer = st.passed_on_by(last + 1).unwrap_or(last);
     let (req, stream) = ws::split_upgrade_stream(st, req);
     match from_layer_request(req, st.client_meta.clone(), &snap.limits, &snap.flags) {
         Ok(creq) => Some((creq, stream)),
         Err(e) => {
-            st.layer_failed(layer, LayerError::InvalidRequest(e.to_string()));
+            st.layer_failed(passing_layer(st), LayerError::InvalidRequest(e.to_string()));
             None
         }
     }
+}
+
+/// The request body failed on its way in. If a fault was recorded for it
+/// (the client's broken upload, a layer's failure, the budget), the
+/// corresponding HTTP error response is the answer. If none was, either
+/// the lane was cut by a layer of its own accord (nothing answers that,
+/// and the response lane is cut as the request lane was), or the core
+/// refused the body as it flowed (its trailers, cap or declared length):
+/// the passing-on layer's invalid request, as a head that does not
+/// validate is.
+async fn closed(st: &Arc<StackFlow>, res_out: LaneTx, forward: LaneId, e: &DriveError) {
+    if st.attribution.fault().is_none() {
+        if let LaneState::Cut(why) = st.chain().state(forward) {
+            return res_out.cut_headless(why);
+        }
+        if let DriveError::Client(pe) = e {
+            st.layer_failed(
+                passing_layer(st),
+                LayerError::InvalidRequest(pe.to_string()),
+            );
+        }
+    }
+    refused(st, res_out).await;
+}
+
+/// The layer whose request reaches the core: the nearest enforcing layer
+/// that passed one on, or the last layer.
+fn passing_layer(st: &StackFlow) -> usize {
+    let last = st.snap.addons.len() - 1;
+    st.passed_on_by(last + 1).unwrap_or(last)
 }
 
 fn answer(res_out: LaneTx, res: roxy_http::CanonicalResponse) {

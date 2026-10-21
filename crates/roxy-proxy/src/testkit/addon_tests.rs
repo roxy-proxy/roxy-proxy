@@ -9,7 +9,8 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use bytes::Bytes;
 
 use super::{AddonDef, Answer, Kit, MemState, no_layer_error, streaming_body, strs};
-use crate::addons::{EndpointPath, Part};
+use crate::addons::service::testing;
+use crate::addons::{AddonMode, EndpointPath, Part};
 
 const RULES: &str = r#"
 - id: no-rewritten
@@ -3479,4 +3480,83 @@ async fn a_failure_below_arrives_as_a_response_the_layer_above_may_reshape() {
     assert_eq!(ev["decision"], "deny", "{ev:#}");
     assert_eq!(ev["terminal_rule"], "layer:b");
     assert_eq!(ev["res"]["status"], 200);
+}
+
+/// A service layer's request trailers are held to the client edge's rules
+/// on their way to an h2 origin: refused without
+/// `http.allow_request_trailers`, and never a forbidden field. The section
+/// is the layer's invalid request, with the `trailers` reason a client's
+/// own would draw, and the origin never sees the request complete.
+#[tokio::test]
+async fn service_request_trailers_are_validated_like_a_clients() {
+    for (allow, path) in [(false, "/x"), (true, "/forbidden")] {
+        let kit = testing::kit_with(
+            super::ALLOW_UP,
+            vec![testing::addon(
+                "s",
+                "request-trailers",
+                AddonMode::Enforce,
+                |_| {},
+            )],
+            |b| b.flags(|f| f.allow_request_trailers = allow),
+        )
+        .await;
+        let a = kit
+            .tunnel("up.test", false)
+            .await
+            .call("POST", path, &[], b"abc")
+            .await;
+        assert_eq!(a.status, 503, "allow={allow} {path}: {a:?}");
+        let ev = kit.request_event().await;
+        assert_eq!(
+            ev["terminal_rule"], "layer:s",
+            "allow={allow} {path}: {ev:#}"
+        );
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(
+            errs[0]["kind"], "invalid_request",
+            "allow={allow} {path}: {errs:#?}"
+        );
+        let message = errs[0]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("trailer"),
+            "allow={allow} {path}: {errs:#?}"
+        );
+        let seen = kit.upstream.seen();
+        assert!(
+            seen.iter()
+                .all(|s| s.complete != Some(true) && s.trailers.is_none()),
+            "allow={allow} {path}: {seen:#?}"
+        );
+    }
+}
+
+/// With `http.allow_request_trailers`, a service layer's allowed trailers
+/// reach the h2 origin as the client's would.
+#[tokio::test]
+async fn service_request_trailers_reach_an_h2_origin_when_allowed() {
+    let kit = testing::kit_with(
+        super::ALLOW_UP,
+        vec![testing::addon(
+            "s",
+            "request-trailers",
+            AddonMode::Enforce,
+            |_| {},
+        )],
+        |b| b.flags(|f| f.allow_request_trailers = true),
+    )
+    .await;
+    let a = kit
+        .tunnel("up.test", true)
+        .await
+        .call("POST", "/x", &[], b"abc")
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].body, b"abc");
+    let trailers = seen[0]
+        .trailers
+        .as_ref()
+        .unwrap_or_else(|| panic!("{:?}", seen[0]));
+    assert_eq!(trailers["x-checksum"], "abc");
 }

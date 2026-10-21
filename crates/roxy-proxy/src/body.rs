@@ -32,6 +32,8 @@ struct Upload {
     body: Option<Body>,
     bytes: u64,
     timed_out: bool,
+    /// The error the body ended with, if it failed under the HTTP client.
+    failed: Option<BodyError>,
 }
 
 impl DeliveryState {
@@ -104,6 +106,13 @@ impl Delivery {
     pub(crate) fn cancel(&self) {
         self.0.finish(false);
     }
+
+    /// The error the body failed with while the HTTP client was sending
+    /// it. hyper's HTTP/2 client reports such a failure as a reset of its
+    /// own, without the error; this keeps the reason.
+    pub(crate) fn failure(&self) -> Option<BodyError> {
+        self.0.upload().failed.clone()
+    }
 }
 
 impl Drop for Delivery {
@@ -142,7 +151,11 @@ impl http_body::Body for DeliveredBody {
                 None => Poll::Ready(Some(Err(BodyError::Stopped))),
             };
             match &result {
-                Poll::Ready(None | Some(Err(_))) => self.shared.finish_locked(&mut upload, false),
+                Poll::Ready(None) => self.shared.finish_locked(&mut upload, false),
+                Poll::Ready(Some(Err(e))) => {
+                    upload.failed = Some(e.clone());
+                    self.shared.finish_locked(&mut upload, false);
+                }
                 Poll::Ready(Some(Ok(frame))) => {
                     if let Some(data) = frame.data_ref() {
                         upload.bytes += data.len() as u64;
@@ -188,6 +201,7 @@ pub(crate) fn delivery(body: Body) -> (Body, Delivery) {
             body: Some(body),
             bytes: 0,
             timed_out: false,
+            failed: None,
         }),
         finished: CancellationToken::new(),
         reader: futures_util::task::AtomicWaker::new(),

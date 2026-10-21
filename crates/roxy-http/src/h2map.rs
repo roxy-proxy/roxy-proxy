@@ -14,9 +14,9 @@ use http::{HeaderValue, Version as HttpVersion};
 
 use crate::chars::trim_ows;
 use crate::model::{
-    Authority, Body, BodyHint, CanonicalRequest, CanonicalResponse, Headers, HttpFlags, Limits,
-    Method, ParseError, Reason, RequestFields, RequestMeta, Scheme, TargetForm, Version,
-    check_host, check_trailer_fields, reject, status_forbids_body,
+    Authority, Body, BodyHint, CanonicalRequest, CanonicalResponse, HttpFlags, Limits, Method,
+    ParseError, Reason, RequestFields, RequestMeta, Scheme, TargetForm, Version, check_host,
+    reject, status_forbids_body,
 };
 use crate::url;
 
@@ -170,28 +170,6 @@ pub fn from_h2_parts(
         body,
         meta,
     })
-}
-
-/// Validates an h2 request trailer section. Any trailer section is a
-/// rejection unless `http.allow_request_trailers`; with it, the same field
-/// rules as the h1 chunked decoder apply: framing, routing, authentication
-/// and content metadata are refused, and values go through the header
-/// validator.
-pub fn validate_h2_trailers(
-    trailers: &http::HeaderMap,
-    limits: &Limits,
-    flags: &HttpFlags,
-) -> Result<http::HeaderMap, ParseError> {
-    if !flags.allow_request_trailers {
-        return reject(Reason::Trailers, "trailer section present");
-    }
-    check_trailer_fields(trailers, limits)?;
-    let raw: Vec<(&[u8], &[u8])> = trailers
-        .iter()
-        .map(|(n, v)| (n.as_str().as_bytes(), v.as_bytes()))
-        .collect();
-    let checked = Headers::try_from_raw(raw, limits, flags)?;
-    Ok(checked.to_header_map())
 }
 
 /// Response head for an h2 stream (the caller streams `res.body` as DATA
@@ -553,50 +531,6 @@ mod tests {
         .unwrap();
         assert_eq!(r.body.known_length(), Some(3));
         assert!(r.body.collect_up_to(100).await.is_err());
-    }
-
-    #[test]
-    fn trailers_refused_unless_allowed() {
-        let mut t = http::HeaderMap::new();
-        t.insert("grpc-status", HeaderValue::from_static("0"));
-        assert_eq!(
-            validate_h2_trailers(&t, &Limits::default(), &HttpFlags::default())
-                .unwrap_err()
-                .reason,
-            Reason::Trailers
-        );
-    }
-
-    #[test]
-    fn trailers_validated() {
-        let flags = HttpFlags {
-            allow_request_trailers: true,
-            ..HttpFlags::default()
-        };
-        let mut t = http::HeaderMap::new();
-        t.insert("grpc-status", HeaderValue::from_static("0"));
-        let ok = validate_h2_trailers(&t, &Limits::default(), &flags).unwrap();
-        assert_eq!(ok.get("grpc-status").unwrap(), "0");
-        for bad in [
-            "authorization",
-            "content-length",
-            "content-md5",
-            "host",
-            "connection",
-        ] {
-            let mut t = http::HeaderMap::new();
-            t.insert(
-                http::HeaderName::from_static(bad),
-                HeaderValue::from_static("x"),
-            );
-            assert_eq!(
-                validate_h2_trailers(&t, &Limits::default(), &flags)
-                    .unwrap_err()
-                    .reason,
-                Reason::Trailers,
-                "{bad}"
-            );
-        }
     }
 
     #[test]

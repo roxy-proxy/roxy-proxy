@@ -966,13 +966,15 @@ async fn plain_upstream<F: ClientTransport>(
             let e = ConnectError::Timeout(what);
             Err(Failed::Refuse(upstream_refusal(cx, &e, &host, port)))
         }
-        Ok(Some(Ok(Err(e)))) => Err(match request_body_failure(&e) {
-            Some(pe) => Failed::Close(DriveError::Client(pe)),
-            None => Failed::Refuse(match classify(&e) {
-                Some(ce) => upstream_refusal(cx, &ce, &host, port),
-                None => protocol_refusal(cx, &host, port, describe(&e)),
-            }),
-        }),
+        Ok(Some(Ok(Err(e)))) => Err(
+            match request_body_failure(&e, cx.request_delivery.as_ref()) {
+                Some(pe) => Failed::Close(DriveError::Client(pe)),
+                None => Failed::Refuse(match classify(&e) {
+                    Some(ce) => upstream_refusal(cx, &ce, &host, port),
+                    None => protocol_refusal(cx, &host, port, describe(&e)),
+                }),
+            },
+        ),
         Ok(Some(Ok(Ok(res)))) => {
             if let Some(delivery) = &cx.request_delivery {
                 delivery.start_monitor(limits.body_idle_timeout.saturating_mul(2), &cx.tasks);
@@ -988,10 +990,15 @@ async fn plain_upstream<F: ClientTransport>(
 }
 
 /// The request body failed while hyper was sending it (a frame roxy would
-/// not forward, or the client side's own failure), which hyper reports as
-/// its user's body error. That is the client's fault, mapped as body
+/// not forward, or the client side's own failure). hyper's HTTP/1.1 client
+/// reports that as its user's body error; its HTTP/2 client resets the
+/// stream and reports only the reset, so the body's own record of its
+/// failure is consulted too. That is the client's fault, mapped as body
 /// failures are elsewhere; `None` leaves the error to be the upstream's.
-fn request_body_failure(e: &hyper_util::client::legacy::Error) -> Option<ParseError> {
+fn request_body_failure(
+    e: &hyper_util::client::legacy::Error,
+    delivery: Option<&crate::body::Delivery>,
+) -> Option<ParseError> {
     let mut src: Option<&(dyn std::error::Error + 'static)> = Some(e);
     while let Some(s) = src {
         if let Some(b) = s.downcast_ref::<BodyError>() {
@@ -999,7 +1006,9 @@ fn request_body_failure(e: &hyper_util::client::legacy::Error) -> Option<ParseEr
         }
         src = s.source();
     }
-    None
+    delivery
+        .and_then(crate::body::Delivery::failure)
+        .map(|b| body_failure(&b))
 }
 
 fn set_host_override(cx: &FlowCx, req: &mut http::Request<Body>) {

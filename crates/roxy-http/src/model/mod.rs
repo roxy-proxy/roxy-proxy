@@ -17,7 +17,7 @@ pub(crate) use fields::{BodyHint, BodyPlan, RequestFields, check_host, parse_con
 pub(crate) use headers::parse_field_line;
 pub use headers::{
     Headers, RESERVED, check_trailer_fields, connection_tokens, is_forbidden_trailer, is_reserved,
-    requested_upgrade, validate_response_trailers,
+    requested_upgrade, validate_request_trailers, validate_response_trailers,
 };
 pub use limits::{HttpFlags, Limits};
 pub use message::{

@@ -8,9 +8,16 @@
 //! cannot express the protocol version, the target form, the upgrade or
 //! the time the head arrived, and those stay the client's.
 
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+use bytes::Bytes;
+use http_body::{Frame, SizeHint};
+
 use crate::model::{
-    Body, BodyHint, CanonicalRequest, CanonicalResponse, HttpFlags, Limits, Method, ParseError,
-    Reason, RequestFields, RequestMeta, Scheme, check_host, is_reserved, reject,
+    Body, BodyError, BodyHint, CanonicalRequest, CanonicalResponse, HttpFlags, Limits, Method,
+    ParseError, Reason, RequestFields, RequestMeta, Scheme, check_host, is_reserved, reject,
+    validate_request_trailers,
 };
 use crate::url;
 
@@ -49,7 +56,8 @@ pub fn to_layer_response(res: CanonicalResponse) -> http::Response<Body> {
 /// `content-length` must be valid and is checked against the body as it
 /// flows. Hop-by-hop and framing fields are refused, as is any field or
 /// value a client could not send. The body is capped at
-/// `limits.max_request_body_bytes`.
+/// `limits.max_request_body_bytes`, and its trailers are held to the rules
+/// of a client's ([`validate_request_trailers`]) as they flow.
 pub fn from_layer_request(
     req: http::Request<Body>,
     meta: RequestMeta,
@@ -112,7 +120,14 @@ pub fn from_layer_request(
         check_host(h, &authority, scheme.default_port(), "the URI")?;
     }
     let headers = fields.headers;
-    let body = body.checked(fields.body.cap, fields.body.known);
+    let known = body.known_length();
+    let gate = TrailersGate {
+        inner: body,
+        limits: limits.clone(),
+        flags: flags.clone(),
+        done: false,
+    };
+    let body = Body::wrap_native(gate, u64::MAX, known).checked(fields.body.cap, fields.body.known);
 
     Ok(CanonicalRequest {
         method,
@@ -124,6 +139,57 @@ pub fn from_layer_request(
         body,
         meta,
     })
+}
+
+/// Validates a trailers frame as the client edge would, and fails the body
+/// with [`BodyError::Invalid`] instead of yielding one that breaks the
+/// rules. Trailers ride the body stream, so this is where a layer's are
+/// re-validated; the head is re-validated by [`from_layer_request`] itself.
+struct TrailersGate {
+    inner: Body,
+    limits: Limits,
+    flags: HttpFlags,
+    done: bool,
+}
+
+impl http_body::Body for TrailersGate {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        if self.done {
+            return Poll::Ready(None);
+        }
+        let out = match Pin::new(&mut self.inner).poll_frame(cx) {
+            Poll::Pending => return Poll::Pending,
+            Poll::Ready(None) => {
+                self.done = true;
+                return Poll::Ready(None);
+            }
+            Poll::Ready(Some(Err(e))) => Err(e),
+            Poll::Ready(Some(Ok(f))) => match f.into_trailers() {
+                Ok(t) => validate_request_trailers(&t, &self.limits, &self.flags)
+                    .map(Frame::trailers)
+                    .map_err(BodyError::Invalid),
+                Err(f) => Ok(f),
+            },
+        };
+        if out.is_err() {
+            self.done = true;
+        }
+        Poll::Ready(Some(out))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.done || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
+    }
 }
 
 #[cfg(test)]
@@ -172,6 +238,67 @@ mod tests {
         assert_eq!(c.meta.version, Version::H2);
         assert_eq!(c.meta.head_bytes, 321);
         assert_eq!(c.meta.upgrade.as_deref(), Some("websocket"));
+    }
+
+    fn trailers(pairs: &[(&'static str, &'static str)]) -> http::HeaderMap {
+        let mut t = http::HeaderMap::new();
+        for (n, v) in pairs {
+            t.insert(
+                http::HeaderName::from_static(n),
+                http::HeaderValue::from_static(v),
+            );
+        }
+        t
+    }
+
+    /// The body a layer passes on carries its trailers through to the
+    /// collected result only when a client's would have: with
+    /// `allow_request_trailers`, and none of the forbidden fields.
+    async fn collected_trailers(
+        flags: &HttpFlags,
+        trailers: http::HeaderMap,
+    ) -> Result<Option<http::HeaderMap>, BodyError> {
+        let r = http::Request::builder()
+            .method("POST")
+            .uri("https://example.com/")
+            .body(Body::from_parts("abc", Some(trailers)))
+            .unwrap();
+        let c = from_layer_request(r, client_meta(), &Limits::default(), flags).unwrap();
+        let b = c.body.collect_up_to(100).await?;
+        Ok(b.trailers)
+    }
+
+    #[tokio::test]
+    async fn trailers_are_refused_unless_allowed() {
+        let e = collected_trailers(&HttpFlags::default(), trailers(&[("x-checksum", "abc")]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&e, BodyError::Invalid(p) if p.reason == Reason::Trailers),
+            "{e:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowed_trailers_are_held_to_the_clients_field_rules() {
+        let flags = HttpFlags {
+            allow_request_trailers: true,
+            ..HttpFlags::default()
+        };
+        let ok = collected_trailers(&flags, trailers(&[("x-checksum", "abc")]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ok["x-checksum"], "abc");
+        for bad in ["authorization", "cookie", "content-length", "host", "te"] {
+            let e = collected_trailers(&flags, trailers(&[("x-checksum", "abc"), (bad, "x")]))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&e, BodyError::Invalid(p) if p.reason == Reason::Trailers),
+                "{bad}: {e:?}"
+            );
+        }
     }
 
     #[test]
