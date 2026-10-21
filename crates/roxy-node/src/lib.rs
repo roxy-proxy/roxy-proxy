@@ -3,6 +3,7 @@
 //! `roxy` binary applies what the node fetches.
 
 pub mod client;
+pub mod json;
 pub mod node;
 pub mod protocol;
 pub mod spool;
