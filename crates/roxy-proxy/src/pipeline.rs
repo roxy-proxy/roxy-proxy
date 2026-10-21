@@ -734,13 +734,12 @@ impl FlowCx {
         }
     }
 
-    /// The refusal every exchange gets while the snapshot refuses them all:
-    /// the process is quarantined, or the policy's lease has run out.
-    /// Recorded as the admission decision. Every site that admits a request
-    /// checks it, so a request a layer held is refused if either state
-    /// began while it was held. The quarantine comes first: it outlives any
-    /// policy.
-    pub(crate) fn snapshot_refusal(&mut self) -> Option<Refusal> {
+    /// The refusal every exchange gets, whatever its request, while the
+    /// process is quarantined or the policy's lease has run out. Recorded
+    /// as the admission decision. Every site that admits a request checks
+    /// it, so a request a layer held is refused if either began while it
+    /// was held. The quarantine comes first: it outlives any policy.
+    pub(crate) fn blanket_refusal(&mut self) -> Option<Refusal> {
         let refusal = self
             .quarantined()
             .or_else(|| self.shared.expired().then(Refusal::expired))?;
@@ -1149,7 +1148,7 @@ fn buffered_bytes(held: u64, inspected: &Inspected) -> u64 {
 fn request_rules(cx: &mut FlowCx, mut req: CanonicalRequest) -> Verdict {
     // A layer above may have quarantined the process, or held the request
     // past the lease; nothing of such an exchange is forwarded.
-    if let Some(refusal) = cx.snapshot_refusal() {
+    if let Some(refusal) = cx.blanket_refusal() {
         return Verdict::Deny(refusal);
     }
     let (out, mut refusal) = cx.evaluate_admission();

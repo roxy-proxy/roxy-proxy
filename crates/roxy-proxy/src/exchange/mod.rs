@@ -484,7 +484,7 @@ pub(crate) async fn process<F: ClientTransport>(
             f.headers.remove("accept-encoding");
         }
     }
-    if let Some(refusal) = cx.snapshot_refusal() {
+    if let Some(refusal) = cx.blanket_refusal() {
         return (Reclaim::now(cx), Outcome::Refuse(refusal));
     }
     let (reclaim, outcome) = if cx.snap.addons.is_empty() {

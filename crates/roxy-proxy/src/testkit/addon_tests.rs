@@ -1352,8 +1352,10 @@ mod service {
             "nothing reached the upstream"
         );
         let ev = kit.request_event().await;
+        assert_eq!(ev["decision"], "deny", "{ev:#}");
         assert_eq!(ev["terminal_rule"], "_expired", "{ev:#}");
         assert_eq!(ev["reason"], "policy_expired", "{ev:#}");
+        assert_eq!(ev["stage"], "head", "{ev:#}");
         assert_eq!(strs(&ev["addons"]), ["s"], "{ev:#}");
         assert_eq!(kit.events("policy_expired", 1).await.len(), 1);
     }

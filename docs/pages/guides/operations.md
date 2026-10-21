@@ -98,8 +98,9 @@ Until that instant the policy applies as written. From it, every request
 is denied with `terminal_rule: _expired` and reason `policy_expired`,
 before the rules and the addons run, and again when the core admits a
 request an addon forwards, so a request an addon holds across the instant
-is denied too. An open WebSocket relay stops at its next chunk or message. The check is a wall-clock comparison on each
-exchange against the host's clock, using the loaded policy's instant
+is denied too. An open WebSocket relay stops at its next chunk or
+message. The check is a wall-clock comparison on each exchange against
+the host's clock, using the loaded policy's instant
 whichever policy the exchange began under: a reload that moves it later
 keeps open relays going, and one that moves it earlier stops them at their
 next chunk or message. The first exchange that finds the policy expired
