@@ -3502,7 +3502,7 @@ async fn service_request_trailers_are_validated_like_a_clients() {
         )
         .await;
         let a = kit
-            .tunnel("up.test", false)
+            .tunnel("up.test", true)
             .await
             .call("POST", path, &[], b"abc")
             .await;

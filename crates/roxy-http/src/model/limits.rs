@@ -10,7 +10,8 @@ const GIB: u64 = 1024 * MIB;
 /// defaults. The binary builds this from config.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Limits {
-    /// Total request head size (request line + headers + final CRLF).
+    /// Total request head size (request line + headers + final CRLF), and
+    /// the bound on a request trailer section.
     pub max_header_bytes: usize,
     /// Request-target length.
     pub max_url_bytes: usize,
