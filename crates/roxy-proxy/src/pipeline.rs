@@ -622,9 +622,9 @@ pub(crate) fn request_facts(req: &CanonicalRequest) -> RequestFacts {
 
 /// The TCP peer as a client identity. An IPv4-mapped address (how an IPv4
 /// client reaches a dual-stack `[::]` listener) is the IPv4 address, and
-/// that is the only equivalence, as for `==` and `in @list` in a rule: a
-/// rule may `allow` on `client.ip`, so an IPv4-compatible or translated
-/// form is not the address it embeds.
+/// that is the only equivalence, as in a rule's `==` and `in`: a rule may
+/// `allow` on `client.ip`, so an IPv4-compatible or translated form is not
+/// the address it embeds.
 fn peer_ip(c: &ClientConn) -> IpAddr {
     c.peer.ip().to_canonical()
 }
