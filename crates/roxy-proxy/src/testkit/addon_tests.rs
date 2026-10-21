@@ -3560,3 +3560,64 @@ async fn service_request_trailers_reach_an_h2_origin_when_allowed() {
         .unwrap_or_else(|| panic!("{:?}", seen[0]));
     assert_eq!(trailers["x-checksum"], "abc");
 }
+
+#[tokio::test]
+async fn service_request_trailers_keep_their_producer_through_a_conditional_layer() {
+    for mode in [AddonMode::Enforce, AddonMode::Observe] {
+        let kit = testing::kit(
+            super::ALLOW_UP,
+            vec![
+                testing::addon("producer", "request-trailers", AddonMode::Enforce, |_| {}),
+                testing::only_when(
+                    testing::addon("conditional", "pass", mode, |_| {}),
+                    r#"path == "/x""#,
+                ),
+            ],
+        )
+        .await;
+        let a = kit
+            .tunnel("up.test", true)
+            .await
+            .call("POST", "/x", &[], b"abc")
+            .await;
+        assert_eq!(a.status, 503, "{mode:?}: {a:?}");
+        let ev = kit.request_event().await;
+        assert_eq!(ev["terminal_rule"], "layer:producer", "{mode:?}: {ev:#}");
+        let errors = kit.events("layer_error", 1).await;
+        assert_eq!(errors[0]["kind"], "invalid_request", "{errors:#?}");
+        assert!(errors[0]["message"].as_str().unwrap().contains("trailer"));
+        assert!(kit.upstream.seen().iter().all(|s| s.complete != Some(true)));
+    }
+}
+
+#[tokio::test]
+async fn service_request_trailers_are_attributed_after_an_early_origin_answer() {
+    let kit = testing::kit(
+        super::ALLOW_UP,
+        vec![testing::addon(
+            "s",
+            "request-trailers",
+            AddonMode::Enforce,
+            |_| {},
+        )],
+    )
+    .await;
+    let mut client = kit.tunnel("up.test", true).await;
+    let (mut tx, body) = streaming_body();
+    let pending = client.start(client.request("POST", "/early", &[]).body(body).unwrap());
+    tx.send_data(Bytes::from_static(b"abc")).await.unwrap();
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(10), pending)
+        .await
+        .expect("the origin answers while the upload is open")
+        .unwrap()
+        .unwrap();
+    assert_eq!(answer.status, 200, "{answer:?}");
+    tx.finish().await.unwrap();
+    let _ = kit.request_event().await;
+    let errors = kit.events("layer_error", 1).await;
+    assert_eq!(errors[0]["kind"], "invalid_request", "{errors:#?}");
+    assert!(errors[0]["message"].as_str().unwrap().contains("trailer"));
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].complete, Some(false), "{seen:#?}");
+    assert!(seen[0].trailers.is_none());
+}

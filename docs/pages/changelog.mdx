@@ -13,7 +13,7 @@ The request trailers a service layer passes on are validated as a client's befor
 
 ### Fixed
 
-- A service layer's request trailers are held to the client edge's rules on their way to an origin: refused without `http.allow_request_trailers`, and never a framing, routing, authentication or `content-*` field. A section that breaks them is the layer's `invalid_request` with the trailer reason: the exchange is refused `503` `layer_error` and the origin never sees the request complete ([#581](https://github.com/roxy-proxy/roxy-proxy/pull/581)).
+- A service layer's request trailers are held to the client edge's rules on their way to an origin: refused without `http.allow_request_trailers`, bounded by the header count and byte limits, and never a framing, routing, authentication or `content-*` field. Canonical validation failures are attributed to the forwarding layer as `invalid_request`, including through conditional layers or after an early origin response. Before a response head, the exchange is refused `503` `layer_error`; after an early response, the layer error is logged. The origin never sees the request complete ([#581](https://github.com/roxy-proxy/roxy-proxy/pull/581)).
 
 </details>
 

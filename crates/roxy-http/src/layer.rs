@@ -270,11 +270,34 @@ mod tests {
 
     #[tokio::test]
     async fn trailers_are_refused_unless_allowed() {
-        let e = collected_trailers(&HttpFlags::default(), trailers(&[("x-checksum", "abc")]))
-            .await
-            .unwrap_err();
+        for t in [trailers(&[]), trailers(&[("x-checksum", "abc")])] {
+            let e = collected_trailers(&HttpFlags::default(), t)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&e, BodyError::Invalid(p) if p.reason == Reason::Trailers),
+                "{e:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn trailers_are_held_to_the_header_byte_limit() {
+        let req = http::Request::post("https://example.com/")
+            .body(Body::from_parts("abc", Some(trailers(&[("x-t", "abc")]))))
+            .unwrap();
+        let limits = Limits {
+            max_header_bytes: 9,
+            ..Limits::default()
+        };
+        let flags = HttpFlags {
+            allow_request_trailers: true,
+            ..HttpFlags::default()
+        };
+        let req = from_layer_request(req, client_meta(), &limits, &flags).unwrap();
+        let e = req.body.collect_up_to(100).await.unwrap_err();
         assert!(
-            matches!(&e, BodyError::Invalid(p) if p.reason == Reason::Trailers),
+            matches!(&e, BodyError::Invalid(p) if p.reason == Reason::HeadTooLarge),
             "{e:?}"
         );
     }

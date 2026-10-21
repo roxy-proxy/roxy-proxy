@@ -92,6 +92,14 @@ pub fn validate_request_trailers(
         return reject(Reason::Trailers, "trailer section present");
     }
     check_trailer_fields(trailers, limits)?;
+    let bytes = trailers.iter().fold(0usize, |acc, (name, value)| {
+        acc.saturating_add(name.as_str().len())
+            .saturating_add(value.len())
+            .saturating_add(4)
+    });
+    if bytes > limits.max_header_bytes {
+        return reject(Reason::HeadTooLarge, "trailer section too large");
+    }
     let raw: Vec<(&[u8], &[u8])> = trailers
         .iter()
         .map(|(n, v)| (n.as_str().as_bytes(), v.as_bytes()))
@@ -646,6 +654,66 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn request_trailers_limit_bytes_and_count_duplicate_fields() {
+        let flags = HttpFlags {
+            allow_request_trailers: true,
+            ..HttpFlags::default()
+        };
+        let mut trailers = HeaderMap::new();
+        trailers.append("x-t", HeaderValue::from_static("abc"));
+        trailers.append("x-t", HeaderValue::from_static("def"));
+        let mut limits = Limits {
+            max_header_bytes: 20,
+            max_headers: 2,
+            ..Limits::default()
+        };
+        assert_eq!(
+            validate_request_trailers(&trailers, &limits, &flags).unwrap(),
+            trailers
+        );
+        limits.max_header_bytes = 19;
+        assert_eq!(
+            validate_request_trailers(&trailers, &limits, &flags)
+                .unwrap_err()
+                .reason,
+            Reason::HeadTooLarge
+        );
+        limits.max_header_bytes = 20;
+        limits.max_headers = 1;
+        assert_eq!(
+            validate_request_trailers(&trailers, &limits, &flags)
+                .unwrap_err()
+                .reason,
+            Reason::TooManyHeaders
+        );
+    }
+
+    #[test]
+    fn request_trailers_validate_values_and_preserve_duplicates() {
+        let mut flags = HttpFlags {
+            allow_request_trailers: true,
+            ..HttpFlags::default()
+        };
+        let mut trailers = HeaderMap::new();
+        trailers.append("x-t", HeaderValue::from_static("  abc\t"));
+        trailers.append("x-t", HeaderValue::from_bytes(b"\xff").unwrap());
+        assert_eq!(
+            validate_request_trailers(&trailers, &Limits::default(), &flags)
+                .unwrap_err()
+                .reason,
+            Reason::NonAscii
+        );
+        flags.allow_obs_text = true;
+        let checked = validate_request_trailers(&trailers, &Limits::default(), &flags).unwrap();
+        let values: Vec<_> = checked
+            .get_all("x-t")
+            .iter()
+            .map(HeaderValue::as_bytes)
+            .collect();
+        assert_eq!(values, [b"abc".as_slice(), b"\xff".as_slice()]);
     }
 
     #[test]

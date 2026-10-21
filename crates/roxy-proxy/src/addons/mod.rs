@@ -464,6 +464,26 @@ impl StackFlow {
         (0..stage).rev().find(|&i| self.enforced(i))
     }
 
+    /// Attribute body validation where it happens, before a condition,
+    /// layer or HTTP client can turn the error into a cut or stream reset.
+    fn validate_request(
+        self: &Arc<Self>,
+        stage: usize,
+        req: roxy_wasm::LayerRequest,
+    ) -> Result<CanonicalRequest, roxy_http::ParseError> {
+        let mut req = roxy_http::layer::from_layer_request(
+            req,
+            self.client_meta.clone(),
+            &self.snap.limits,
+            &self.snap.flags,
+        )?;
+        let side = self
+            .passed_on_by(stage)
+            .map_or(attribution::Side::Client, attribution::Side::Layer);
+        req.body = attribution::attributed(self, side, req.body);
+        Ok(req)
+    }
+
     /// The last enforcing layer to pass a response towards the client.
     /// An observer or skipped layer cannot have changed the head.
     fn response_producer(&self) -> &str {
