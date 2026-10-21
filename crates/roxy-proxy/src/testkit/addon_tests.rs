@@ -3562,6 +3562,62 @@ async fn service_request_trailers_reach_an_h2_origin_when_allowed() {
 }
 
 #[tokio::test]
+async fn service_request_trailers_are_validated_before_body_inspection() {
+    let rules = r#"
+- id: no-secret
+  when: host == "up.test" and body.text contains "SECRET"
+  then: deny
+- id: up
+  when: host == "up.test"
+  then: allow
+"#;
+    for (allow, data) in [
+        (false, b"".as_slice()),
+        (false, b"abc"),
+        (true, b""),
+        (true, b"abc"),
+    ] {
+        let kit = testing::kit_with(
+            rules,
+            vec![testing::addon(
+                "s",
+                "request-trailers",
+                AddonMode::Enforce,
+                |_| {},
+            )],
+            |b| b.flags(|f| f.allow_request_trailers = allow),
+        )
+        .await;
+        let answer = kit
+            .tunnel("up.test", true)
+            .await
+            .call("POST", "/x", &[], data)
+            .await;
+        assert_eq!(
+            answer.status,
+            if allow { 200 } else { 503 },
+            "allow={allow}, data={data:?}: {answer:?}"
+        );
+        let event = kit.request_event().await;
+        if allow {
+            let seen = kit.upstream.wait_seen(1).await;
+            assert_eq!(seen[0].body, data);
+            assert_eq!(seen[0].trailers.as_ref().unwrap()["x-checksum"], "abc");
+            no_layer_error(&kit);
+        } else {
+            assert_eq!(event["terminal_rule"], "layer:s", "{event:#}");
+            let errors = kit.events("layer_error", 1).await;
+            assert_eq!(errors[0]["kind"], "invalid_request", "{errors:#?}");
+            assert!(errors[0]["message"].as_str().unwrap().contains("trailer"));
+            assert!(
+                kit.upstream.seen().is_empty(),
+                "inspection fails before connecting to the origin"
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn service_request_trailers_keep_their_producer_through_a_conditional_layer() {
     for mode in [AddonMode::Enforce, AddonMode::Observe] {
         let kit = testing::kit(
