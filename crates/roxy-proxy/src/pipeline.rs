@@ -418,8 +418,9 @@ pub(crate) struct FlowMeta {
     pub snap: Arc<Snapshot>,
     pub flow: Ulid,
     pub client: ClientConn,
-    /// `client.ip`: the TCP peer, or the client `forwarded_for` resolved
-    /// from `X-Forwarded-For`. The one client identity of the exchange.
+    /// `client.ip`: the canonical TCP peer address, or the client
+    /// `forwarded_for` resolved from `X-Forwarded-For`. The one client
+    /// identity of the exchange.
     pub client_ip: IpAddr,
     pub tls: Option<TlsInfo>,
     /// The secret generation this exchange resolves from and redacts
@@ -619,11 +620,20 @@ pub(crate) fn request_facts(req: &CanonicalRequest) -> RequestFacts {
     }
 }
 
+/// The TCP peer as a client identity. An IPv4-mapped address (how an IPv4
+/// client reaches a dual-stack `[::]` listener) is the IPv4 address, and
+/// that is the only equivalence, as in a rule's `==` and `in`: a rule may
+/// `allow` on `client.ip`, so an IPv4-compatible or translated form is not
+/// the address it embeds.
+fn peer_ip(c: &ClientConn) -> IpAddr {
+    c.peer.ip().to_canonical()
+}
+
 /// `client` for an event with no exchange (a refused connection, a
 /// CONNECT, a head that did not parse): nothing has named a client but the
 /// TCP peer.
 pub(crate) fn client_info(c: &ClientConn) -> ClientInfo {
-    client_info_as(c, c.peer.ip())
+    client_info_as(c, peer_ip(c))
 }
 
 fn client_info_as(c: &ClientConn, ip: IpAddr) -> ClientInfo {
@@ -665,7 +675,7 @@ impl FlowCx {
         // on it, so an exchange whose client cannot be named never starts.
         let client_ip = match client.listener.forwarded_for {
             Some(f) => crate::forwarded::client_ip(&req.headers, f.trusted_hops)?,
-            None => client.peer.ip(),
+            None => peer_ip(&client),
         };
         let facts = FlowFacts {
             client: client.clone(),
@@ -1576,5 +1586,25 @@ mod tests {
             r.rule,
             Some(Decider::Rule(RuleId::new(RuleId::FAIL_CLOSED)))
         );
+    }
+
+    /// An event with no exchange names the peer as its client: an
+    /// IPv4-mapped peer as the IPv4 address, with `client.peer` in the
+    /// socket's form. Only that equivalence applies: an IPv4-compatible peer
+    /// (`::a.b.c.d`) is not the IPv4 address it embeds, so an `allow` on
+    /// that address cannot be reached by presenting it.
+    #[test]
+    fn the_no_exchange_client_is_the_mapped_peer_as_ipv4() {
+        let mut client = crate::testkit::client_conn(crate::listener::ListenerMode::HttpProxy);
+        client.peer = "[::ffff:10.0.0.1]:40000".parse().unwrap();
+        let info = client_info(&client);
+        assert_eq!(info.ip, "10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(info.peer.ip, "::ffff:10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(info.peer.port, 40000);
+
+        client.peer = "[::10.0.0.1]:40000".parse().unwrap();
+        let info = client_info(&client);
+        assert_eq!(info.ip, "::10.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(info.ip, info.peer.ip);
     }
 }
