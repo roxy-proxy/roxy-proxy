@@ -86,6 +86,11 @@ Workloads fetch the CA from `ca_server` as usual
    ([restart-only settings](/guides/operations#restart-only-settings)); a
    restart picks them up.
 
+A `node.token` record that does not parse stops startup. A successful
+enrolment or renewal response that does not parse is retried with backoff.
+These diagnostics report only the kind of fault and its JSON line and
+column, without quoting input that may contain a token.
+
 ## The lease
 
 Every poll answers with the whole lease, applied in full or not at all.

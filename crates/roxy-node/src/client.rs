@@ -647,27 +647,59 @@ pub(crate) mod tests {
     /// A response that does not deserialise is reported by where it went
     /// wrong, not by what it held: serde quotes the value it choked on.
     #[tokio::test]
-    async fn a_malformed_enrol_response_is_not_echoed() {
+    async fn malformed_enrol_and_renewal_responses_are_not_echoed() {
         let mock = MockServer::start().await;
         let anon = anon(&mock);
-        for body in [
-            r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK","not_after":"2026-11-05T10:12:00Z","renew_after_seconds":"SHOULD-NOT-LEAK"}"#,
-            r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK","not_after":918273,"renew_after_seconds":1}"#,
-            r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK","#,
+        let (cp, _) = enrolled(&mock).await;
+        for (body, diagnostic) in [
+            (
+                "\n\"SHOULD\\u002dNOT\\u002dLEAK\"",
+                "missing or unexpected value at line 2 column 27",
+            ),
+            (
+                r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK","not_after":"2026-11-05T10:12:00Z","renew_after_seconds":"SHOULD-NOT-LEAK"}"#,
+                "missing or unexpected value at line 1 column 116",
+            ),
+            (
+                r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK","not_after":918273,"renew_after_seconds":1}"#,
+                "missing or unexpected value at line 1 column 60",
+            ),
+            (
+                r#"{
+"node_id":"n1","token":"SHOULD-NOT-LEAK","#,
+                "unexpected end of input at line 2 column 41",
+            ),
+            (
+                r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK",,}"#,
+                "syntax error at line 1 column 43",
+            ),
         ] {
-            mock.push(
-                "/roxy/v1/enrol",
-                Reply::Status {
-                    status: 200,
-                    headers: vec![],
-                    body: body.as_bytes().to_vec(),
-                },
-            );
-            let err = anon.enrol("tok").await.unwrap_err().to_string();
-            assert!(!err.contains("SHOULD-NOT-LEAK"), "{err}");
-            assert!(!err.contains("918273"), "{err}");
-            assert!(err.starts_with("enrol response: "), "{err}");
-            assert!(err.contains("line 1 column "), "{err}");
+            for renew in [false, true] {
+                let path = if renew {
+                    "/roxy/v1/renew"
+                } else {
+                    "/roxy/v1/enrol"
+                };
+                mock.push(
+                    path,
+                    Reply::Status {
+                        status: 200,
+                        headers: vec![],
+                        body: body.as_bytes().to_vec(),
+                    },
+                );
+                let err = if renew {
+                    cp.renew().await
+                } else {
+                    anon.enrol("tok").await
+                }
+                .unwrap_err();
+                assert!(matches!(err, EnrolError::Failed(_)), "{err}");
+                assert_eq!(err.to_string(), format!("enrol response: {diagnostic}"));
+                let debug = format!("{err:?}");
+                assert!(!debug.contains("SHOULD-NOT-LEAK"), "{debug}");
+                assert!(!debug.contains("918273"), "{debug}");
+            }
         }
     }
 

@@ -23,7 +23,7 @@ pub enum TokenError {
 
 /// Where a JSON document stopped deserialising, without any of its text.
 /// serde's own message quotes the value it rejected, and in a token record
-/// or an enrol response that value may be the token.
+/// or an enrolment or renewal response that value may be the token.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JsonFault {
     pub category: Category,
@@ -143,32 +143,48 @@ mod tests {
     /// record may be the token itself.
     #[test]
     fn a_record_that_does_not_parse_is_not_echoed() {
-        for (record, category) in [
+        for (record, category, diagnostic) in [
+            (
+                "\n\"SHOULD\\u002dNOT\\u002dLEAK\"",
+                Category::Data,
+                "missing or unexpected value at line 2 column 27",
+            ),
             (
                 r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK","not_after":918273}"#,
                 Category::Data,
+                "missing or unexpected value at line 1 column 60",
             ),
             (
                 r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK","not_after":"SHOULD-NOT-LEAK"}"#,
                 Category::Data,
+                "missing or unexpected value at line 1 column 71",
             ),
             (
-                r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK","not_after":"#,
+                r#"{
+"node_id":"n1","token":"SHOULD-NOT-LEAK","not_after":"#,
                 Category::Eof,
+                "unexpected end of input at line 2 column 53",
             ),
             (
                 r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK",,}"#,
                 Category::Syntax,
+                "syntax error at line 1 column 43",
             ),
         ] {
             let err = NodeToken::parse(record).unwrap_err();
             let text = err.to_string();
-            assert!(!text.contains("SHOULD-NOT-LEAK"), "{text}");
-            assert!(!text.contains("918273"), "{text}");
-            assert!(
-                text.starts_with("the node token record does not parse: "),
-                "{text}"
+            assert_eq!(
+                text,
+                format!("the node token record does not parse: {diagnostic}")
             );
+            let mut cause: Option<&dyn std::error::Error> = Some(&err);
+            while let Some(error) = cause {
+                for text in [error.to_string(), format!("{error:?}")] {
+                    assert!(!text.contains("SHOULD-NOT-LEAK"), "{text}");
+                    assert!(!text.contains("918273"), "{text}");
+                }
+                cause = error.source();
+            }
             assert!(
                 matches!(err, TokenError::Invalid(fault) if fault.category == category),
                 "{record}: {text}"
