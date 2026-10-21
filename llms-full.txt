@@ -240,6 +240,16 @@ User-facing changes in each release, newest first. Each release has a
 short summary; expand it for the itemised entries, where breaking changes
 come first. Each release's GitHub page lists every merged pull request.
 
+## Unreleased
+
+<details>
+  <summary>Details</summary>
+
+  ### Fixed
+
+  * JSON the node cannot parse, whether the `node.token` record, an enrolment or renewal response, a lease or a flow upload's acknowledgement, is reported by the kind of fault and its line and column, never by quoting the input, which could put a token or a lease secret in the log ([#532](https://github.com/roxy-proxy/roxy-proxy/issues/532)).
+</details>
+
 ## [0.3.0 (2026-10-15)](https://github.com/roxy-proxy/roxy-proxy/releases/tag/v0.3.0)
 
 Addons can now answer early and hold a request or response for approval, with the request and response lanes of an exchange living independent lives. This is a breaking change for addons: the service protocol is `roxy.layer.v6` and the WASM interface is `roxy:addon@0.3.0`.
@@ -805,6 +815,11 @@ Workloads fetch the CA from `ca_server` as usual
    settings keep the running value and warn, as a file reload does
    ([restart-only settings](/guides/operations#restart-only-settings)); a
    restart picks them up.
+
+A `node.token` record that does not parse stops startup. A `200` enrolment,
+renewal, lease or flow-upload response that does not parse is retried with
+backoff. These diagnostics report only the kind of fault and its JSON line
+and column, never the input, which may hold a token or a lease secret.
 
 ## The lease
 
