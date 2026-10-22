@@ -292,10 +292,10 @@ the others refuse for the same reason.
   (RFC 9113 §8.2.2). `te` is accepted only as `trailers`.
 - `:path` goes through the same normaliser and `limits.max_url_bytes` cap
   once the `h2` crate has accepted it: a raw space or control byte, `<` or
-  `>` anywhere in `:path`, a backtick in its path or `"` in its query, resets
-  the stream before roxy sees it, with no `parse_error` event. `:authority`
-  must equal the CONNECT authority; a `host` header, if present, must equal
-  `:authority`.
+  `>` anywhere in `:path`, a backtick in its path, `"` in its query, or bytes
+  that are not UTF-8, resets the stream before roxy sees it, with no
+  `parse_error` event. `:authority` must equal the CONNECT authority; a
+  `host` header, if present, must equal `:authority`.
 - `limits.h2_max_concurrent_streams` and `limits.h2_max_header_list_bytes`
   cap streams per connection and header bytes per stream.
   CONTINUATION-flood and rapid-reset defences come from the `h2` crate.

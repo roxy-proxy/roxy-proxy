@@ -497,6 +497,15 @@ fn compare(roxy: &Side<RoxyEnd>, hyper: &Side<HyperEnd>, wire: &[u8]) {
                 shown()
             ),
         }
+    } else if let (RoxyEnd::Rejected(reason), HyperEnd::Done) = (&roxy.end, &hyper.end) {
+        // Same requests, so the same bytes consumed, and the probe means some
+        // remain: hyper's `Done` is a close decision roxy did not take.
+        panic!(
+            "hyper stopped reading before request #{} and roxy read on ({} on what followed):\n{}",
+            roxy.msgs.len(),
+            reason.as_str(),
+            shown()
+        );
     }
 }
 
