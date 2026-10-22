@@ -10,7 +10,7 @@
 //! hyper is the lenient reference and roxy is meant to be strictly stricter,
 //! so the property is one-sided, request by request down the connection:
 //! - roxy accepts a request hyper rejects: a roxy bug;
-//! - both accept: method, request target (hyper's raw target through roxy's
+//! - both accept: version, method, request target (hyper's URI through roxy's
 //!   `url` normalisation), the header list without the fields roxy consumes
 //!   (hop-by-hop, framing, `Host`, `Expect`; names lower-case, values
 //!   OWS-trimmed, sorted by name), the body bytes and the trailers agree,
@@ -147,6 +147,9 @@ type Fields = Vec<(String, String)>;
 /// in.
 #[derive(Debug, PartialEq, Eq)]
 struct Msg {
+    /// Checked independently so the HTTP/1.0 close allowance cannot hide a
+    /// version misparse in roxy.
+    version: http::Version,
     method: String,
     /// `scheme://host:port/path?query`; `host:port` for CONNECT.
     target: String,
@@ -263,7 +266,7 @@ fn named_by_host(
     }
 }
 
-/// hyper's raw request target through roxy's URL normalisation, printed as
+/// hyper's URI through roxy's URL normalisation, printed as
 /// `CanonicalRequest::url` prints roxy's. For origin-form the authority is
 /// the one `Host` names, with the role's scheme, as roxy's is. A target
 /// roxy's normaliser refuses prints as its reason code: roxy did not accept
@@ -300,8 +303,17 @@ fn hyper_target(parts: &Parts, role: &Role) -> String {
     }
 }
 
+fn roxy_version(version: Version) -> http::Version {
+    match version {
+        Version::H1_0 => http::Version::HTTP_10,
+        Version::H1_1 => http::Version::HTTP_11,
+        Version::H2 => http::Version::HTTP_2,
+    }
+}
+
 fn roxy_msg(req: &CanonicalRequest, body: Buffered) -> Msg {
     Msg {
+        version: roxy_version(req.meta.version),
         method: req.method.as_str().to_owned(),
         target: req.url(),
         headers: fields(req.headers.iter()),
@@ -317,6 +329,7 @@ fn roxy_msg(req: &CanonicalRequest, body: Buffered) -> Msg {
 /// the request, so there is nothing to drop from hyper's.
 fn hyper_msg(parts: &Parts, body: Collected<Bytes>, role: &Role) -> Msg {
     Msg {
+        version: parts.version,
         method: parts.method.as_str().to_owned(),
         target: hyper_target(parts, role),
         headers: end_to_end(&parts.headers),
@@ -339,9 +352,12 @@ fn roxy_side(cfg: u8, role: &Role, wire: Bytes) -> Side<RoxyEnd> {
                     Ok(None) => return RoxyEnd::Eof,
                     Err(e) => return RoxyEnd::Rejected(e.reason),
                     Ok(Some(Incoming::Connect {
-                        authority, headers, ..
+                        authority,
+                        headers,
+                        meta,
                     })) => {
                         msgs.push(Msg {
+                            version: roxy_version(meta.version),
                             method: "CONNECT".to_owned(),
                             target: authority.to_string(),
                             headers: fields(headers.iter()),
