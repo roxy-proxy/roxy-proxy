@@ -18,7 +18,7 @@
 //! - hyper accepts and roxy rejects, or closes an HTTP/1.0 connection hyper
 //!   keeps alive: fine. The reason codes are counted and printed now and
 //!   then, never asserted on.
-#![no_main]
+#![cfg_attr(not(test), no_main)]
 
 use std::cell::RefCell;
 use std::convert::Infallible;
@@ -449,7 +449,7 @@ fn report() {
     if EXECS.fetch_add(1, Ordering::Relaxed) % REPORT_EVERY != REPORT_EVERY - 1 {
         return;
     }
-    let mut line = String::from("h1_hyper: hyper accepted, roxy did not:");
+    let mut line = String::from("h1_hyper: roxy refusals and HTTP/1.0 closes:");
     for (i, n) in ROXY_ONLY.iter().enumerate() {
         let n = n.load(Ordering::Relaxed);
         if n > 0 {
@@ -497,15 +497,29 @@ fn compare(roxy: &Side<RoxyEnd>, hyper: &Side<HyperEnd>, wire: &[u8]) {
                 shown()
             ),
         }
-    } else if let (RoxyEnd::Rejected(reason), HyperEnd::Done) = (&roxy.end, &hyper.end) {
-        // Same requests, so the same bytes consumed, and the probe means some
-        // remain: hyper's `Done` is a close decision roxy did not take.
-        panic!(
+        return;
+    }
+    // A rejection after the common prefix still records a read-on attempt.
+    // Ending instead is a disagreement, except for roxy's HTTP/1.0 policy.
+    match (&roxy.end, &hyper.end) {
+        (RoxyEnd::Rejected(reason), HyperEnd::Done) => panic!(
             "hyper stopped reading before request #{} and roxy read on ({} on what followed):\n{}",
             roxy.msgs.len(),
             reason.as_str(),
             shown()
-        );
+        ),
+        (RoxyEnd::Closed(Version::H1_0), HyperEnd::Rejected(_) | HyperEnd::BodyRejected(_)) => {
+            count(CLOSED)
+        }
+        (
+            RoxyEnd::Closed(_) | RoxyEnd::Eof | RoxyEnd::Connect,
+            HyperEnd::Rejected(e) | HyperEnd::BodyRejected(e),
+        ) => panic!(
+            "roxy ended the connection before request #{} and hyper read on ({e} on what followed):\n{}",
+            roxy.msgs.len(),
+            shown()
+        ),
+        _ => {}
     }
 }
 
@@ -524,3 +538,56 @@ fuzz_target!(|data: &[u8]| {
     compare(&roxy, &hyper, &wire);
     report();
 });
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wire(version: &str, connection: &str, next: &[u8]) -> Bytes {
+        let mut wire = BytesMut::from(
+            format!(
+                "GET / HTTP/{version}\r\nHost: example.com\r\nConnection: {connection}\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        wire.extend_from_slice(next);
+        wire.extend_from_slice(probe(&Role::Origin));
+        wire.freeze()
+    }
+
+    const BAD_HEAD: &[u8] = b"not a request\r\n\r\n";
+    const BAD_BODY: &[u8] =
+        b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 99999\r\n\r\nshort";
+
+    // The first requests compare equal because Connection is consumed by
+    // each codec; the ending must still expose their different decisions.
+    fn different_close_decisions(version: &str, next: &[u8]) {
+        let roxy_wire = wire(version, "close", next);
+        let hyper_wire = wire(version, "keep-alive", next);
+        let roxy = roxy_side(1, &Role::Origin, roxy_wire.clone());
+        let hyper = hyper_side(&Role::Origin, hyper_wire);
+        assert_eq!(roxy.msgs.len(), 1);
+        assert_eq!(roxy.msgs, hyper.msgs);
+        compare(&roxy, &hyper, &roxy_wire);
+    }
+
+    #[test]
+    #[should_panic(expected = "roxy ended the connection")]
+    fn close_before_rejected_head_disagrees() {
+        different_close_decisions("1.1", BAD_HEAD);
+    }
+
+    #[test]
+    #[should_panic(expected = "roxy ended the connection")]
+    fn close_before_rejected_body_disagrees() {
+        different_close_decisions("1.1", BAD_BODY);
+    }
+
+    #[test]
+    fn http10_close_before_rejection_is_counted() {
+        let before = ROXY_ONLY[CLOSED].load(Ordering::Relaxed);
+        different_close_decisions("1.0", BAD_HEAD);
+        different_close_decisions("1.0", BAD_BODY);
+        assert_eq!(ROXY_ONLY[CLOSED].load(Ordering::Relaxed), before + 2);
+    }
+}

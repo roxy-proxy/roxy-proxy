@@ -43,6 +43,10 @@ To check `h1_hyper`'s: drop the `check_host` call for absolute-form targets
 in `h1/head.rs`, or stop `Connection: close` from setting `meta.close`. The
 seed corpus alone trips either, before fuzzing proper starts.
 
+Run `cargo +nightly test --bin h1_hyper` from `fuzz/` to check connection
+decisions when the next request or its body is rejected. The fuzz workflow
+runs these regressions before building the targets.
+
 ## Seeds
 
 `python3 fuzz/generate_seeds.py` generates `seeds/` from the project's own

@@ -291,11 +291,13 @@ the others refuse for the same reason.
   `transfer-encoding`, `upgrade`, `proxy-connection`) reset the stream
   (RFC 9113 §8.2.2). `te` is accepted only as `trailers`.
 - `:path` goes through the same normaliser and `limits.max_url_bytes` cap
-  once the `h2` crate has accepted it: a raw space or control byte, `<` or
-  `>` anywhere in `:path`, a backtick in its path, `"` in its query, or bytes
-  that are not UTF-8, resets the stream before roxy sees it, with no
-  `parse_error` event. `:authority` must equal the CONNECT authority; a
-  `host` header, if present, must equal `:authority`.
+  once the `h2` crate has accepted it. The entire `:path` must be UTF-8;
+  invalid UTF-8 closes the connection. In the path or query, a raw space or
+  control byte, `<` or `>` resets the stream; so does a backtick in the path
+  or `"` in the query. A fragment is discarded after UTF-8 validation.
+  These failures happen before roxy sees the request, with no `parse_error`
+  event. `:authority` must equal the CONNECT authority; a `host` header,
+  if present, must equal `:authority`.
 - `limits.h2_max_concurrent_streams` and `limits.h2_max_header_list_bytes`
   cap streams per connection and header bytes per stream.
   CONTINUATION-flood and rapid-reset defences come from the `h2` crate.
