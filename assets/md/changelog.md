@@ -11,6 +11,10 @@ The request trailers a service layer passes on are validated as a client's befor
 <details>
   <summary>Details</summary>
 
+  ### Breaking
+
+  * A raw backtick in an HTTP/1 request path is rejected with `invalid_path` instead of being percent-encoded; HTTP/2 already refused it. In a query it is still percent-encoded to `%60` ([#582](https://github.com/roxy-proxy/roxy-proxy/pull/582)).
+
   ### Fixed
 
   * A service layer's request trailers are held to a client's rules on their way to an origin: refused without `http.allow_request_trailers`, held to `limits.max_header_bytes`, and never a framing, routing, authentication or `content-*` field. A section that breaks them is the layer's `invalid_request`: the exchange is refused `503` `layer_error`, or the error is logged if the origin has already answered, and the origin never sees the request complete. More than `limits.max_headers` fields is a service protocol violation ([#581](https://github.com/roxy-proxy/roxy-proxy/pull/581)).
