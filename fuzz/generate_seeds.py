@@ -6,7 +6,8 @@ fuzzing; the Fuzz workflow does. From anywhere:
     python3 fuzz/generate_seeds.py
 
 Sources:
-- h1_request, h1_chunked: the smuggling corpus, crates/roxy-http/tests/corpus
+- h1_request, h1_chunked, h1_hyper: the smuggling corpus,
+  crates/roxy-http/tests/corpus
   (each case's role and flags are encoded in the leading config byte, see
   fuzz/src/lib.rs `flags` / `role`);
 - url: request targets from that corpus plus a few path / query shapes;
@@ -190,13 +191,14 @@ def ws_frames():
 
 
 def main():
-    for target in ("h1_request", "h1_chunked", "url", "client_hello", "client_hello_rustls", "rule_compile",
+    for target in ("h1_request", "h1_chunked", "h1_hyper", "url", "client_hello", "client_hello_rustls", "rule_compile",
                    "h2map", "rule_eval", "ws_frame", "content_coding"):
         for old in (OUT / target).glob("*") if (OUT / target).is_dir() else []:
             old.unlink()
     n = 0
     for name, cfg, data in corpus_cases():
         write("h1_request", name, bytes([cfg]) + data)
+        write("h1_hyper", name, bytes([cfg]) + data)
         head, sep, body = data.partition(b"\r\n\r\n")
         if sep and b"chunked" in head.lower():
             write("h1_chunked", name, bytes([cfg & 3]) + body)

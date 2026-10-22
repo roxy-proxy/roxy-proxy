@@ -7,7 +7,9 @@ use std::borrow::Cow;
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::chars::{hex_upper, hex_val, is_pchar_literal, is_unreserved, is_url_encodable};
+use crate::chars::{
+    hex_upper, hex_val, is_path_encodable, is_pchar_literal, is_unreserved, is_url_encodable,
+};
 use crate::model::{Authority, Host, ParseError, Reason, Scheme, reject};
 
 /// Longest DNS name accepted (RFC 1035).
@@ -119,11 +121,12 @@ fn decode_form(s: &str) -> Cow<'_, str> {
 
 /// Validates percent-encodings and literal characters, decoding encoded
 /// unreserved bytes when `decode_unreserved`, upper-casing the rest. Bytes
-/// that are not `allowed` but [`is_url_encodable`] are percent-encoded;
+/// that are not `allowed` but `encodable` are percent-encoded;
 /// anything else visible is rejected with `invalid`.
 fn canonicalize_encodings(
     raw: &[u8],
     allowed: impl Fn(u8) -> bool,
+    encodable: impl Fn(u8) -> bool,
     invalid: Reason,
     decode_unreserved: bool,
 ) -> Result<String, ParseError> {
@@ -165,7 +168,7 @@ fn canonicalize_encodings(
         }
         if allowed(byte) {
             out.push(char::from(byte));
-        } else if is_url_encodable(byte) {
+        } else if encodable(byte) {
             out.push('%');
             out.push(char::from(hex_upper(byte >> 4)));
             out.push(char::from(hex_upper(byte)));
@@ -193,6 +196,7 @@ pub fn normalize_path(raw: &[u8]) -> Result<Path, ParseError> {
     let decoded = canonicalize_encodings(
         raw,
         |b| b == b'/' || is_pchar_literal(b),
+        is_path_encodable,
         Reason::InvalidPath,
         true,
     )?;
@@ -243,6 +247,7 @@ pub fn normalize_query(raw: &[u8]) -> Result<Query, ParseError> {
     canonicalize_encodings(
         raw,
         |b| matches!(b, b'/' | b'?' | b'[' | b']') || is_pchar_literal(b),
+        is_url_encodable,
         Reason::InvalidQuery,
         false,
     )
@@ -456,7 +461,7 @@ mod tests {
         assert_eq!(np("/%e2%82%ac").unwrap(), "/%E2%82%AC");
         assert_eq!(np("/a:b@c;d=e,f!$&'()*+").unwrap(), "/a:b@c;d=e,f!$&'()*+");
         assert_eq!(np("/a|b^c").unwrap(), "/a%7Cb%5Ec");
-        assert_eq!(np("/a[b]{c}`d").unwrap(), "/a%5Bb%5D%7Bc%7D%60d");
+        assert_eq!(np("/a[b]{c}%60d").unwrap(), "/a%5Bb%5D%7Bc%7D%60d");
         assert_eq!(np("/%7c%5e").unwrap(), "/%7C%5E");
     }
 
@@ -477,6 +482,8 @@ mod tests {
         assert_eq!(np("/a\\b"), Err(Reason::InvalidPath));
         assert_eq!(np("/a\"b"), Err(Reason::InvalidPath));
         assert_eq!(np("/a<b>"), Err(Reason::InvalidPath));
+        assert_eq!(np("/a`b"), Err(Reason::InvalidPath));
+        assert_eq!(np("/`/../"), Err(Reason::InvalidPath));
         assert_eq!(np("/a?b"), Err(Reason::InvalidPath));
         assert_eq!(np("/a\x7f"), Err(Reason::InvalidPath));
         assert_eq!(np("/a\x00"), Err(Reason::InvalidPath));
@@ -702,7 +709,7 @@ mod tests {
             let b = u8::try_from(u32::from(c)).unwrap();
             let raw = format!("/x{c}y");
             let encoded = format!("/x%{b:02X}y");
-            let path_rejects = matches!(b, b'"' | b'#' | b'%' | b'<' | b'>' | b'?' | b'\\');
+            let path_rejects = matches!(b, b'"' | b'#' | b'%' | b'<' | b'>' | b'?' | b'\\' | b'`');
             match normalize_path(raw.as_bytes()) {
                 Ok(p) => {
                     prop_assert!(!path_rejects);

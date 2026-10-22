@@ -41,7 +41,7 @@ env:
   NIGHTLY: nightly-2026-10-10
 
 jobs:
-  # Every target is compiled once here; the matrix below only runs them.
+  # Every fuzz binary is compiled here; the matrix below only runs them.
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
@@ -73,9 +73,10 @@ jobs:
             cargo install cargo-fuzz --locked --version "$CARGO_FUZZ_VERSION" --force
           fi
 
-      - name: Build every target
+      - name: Test comparisons and build every target
         run: |
           cd fuzz
+          cargo +"$NIGHTLY" test --bin h1_hyper
           cargo +"$NIGHTLY" fuzz build
           mkdir -p ../fuzz-bin
           for t in $(cargo +"$NIGHTLY" fuzz list); do
@@ -98,6 +99,7 @@ jobs:
         target:
           - h1_request
           - h1_chunked
+          - h1_hyper
           - h2map
           - ws_frame
           - url
