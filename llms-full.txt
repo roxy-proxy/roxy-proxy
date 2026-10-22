@@ -242,11 +242,16 @@ come first. Each release's GitHub page lists every merged pull request.
 
 ## Unreleased
 
+The request trailers a service layer passes on are validated as a client's before they reach an origin.
+
 <details>
   <summary>Details</summary>
 
   ### Fixed
 
+  * A service layer's request trailers are held to a client's rules on their way to an origin: refused without `http.allow_request_trailers`, held to `limits.max_header_bytes`, and never a framing, routing, authentication or `content-*` field. A section that breaks them is the layer's `invalid_request`: the exchange is refused `503` `layer_error`, or the error is logged if the origin has already answered, and the origin never sees the request complete. More than `limits.max_headers` fields is a service protocol violation ([#581](https://github.com/roxy-proxy/roxy-proxy/pull/581)).
+  * An HTTP/2 client's request trailer section is held to `limits.max_header_bytes`, as an HTTP/1.1 client's chunked trailer section is; one over it is a stream reset, `parse_error` reason `head_too_large` ([#581](https://github.com/roxy-proxy/roxy-proxy/pull/581)).
+  * HTTP/1.1 request trailers also meet the byte limit after normalisation, so a pass-through layer is not blamed for the client's oversized section (`431`, `parse_error` reason `head_too_large`).
   * A request held across the policy's `valid_until`, by an addon or while its body is buffered for inspection, is denied `_expired` when it reaches the rules, as a request sent after the instant is ([#568](https://github.com/roxy-proxy/roxy-proxy/issues/568)).
   * Without `forwarded_for`, `client.ip` is the canonical TCP peer address: an IPv4 client on a dual-stack `[::]` listener is `a.b.c.d`, not `::ffff:a.b.c.d`, in metric keys, the flow log and the addon principal. Rule comparisons already treated the two as one address. `client.peer.ip` in the flow log keeps the socket's form ([#579](https://github.com/roxy-proxy/roxy-proxy/pull/579)).
   * JSON the node cannot parse, whether the `node.token` record, an enrolment or renewal response, a lease or a flow upload's acknowledgement, is reported by the kind of fault and its line and column, never by quoting the input, which could put a token or a lease secret in the log ([#532](https://github.com/roxy-proxy/roxy-proxy/issues/532)).
@@ -2994,7 +2999,12 @@ trailer section may not carry framing, routing, authentication or
 `content-*` fields (`authorization`, `cookie`, `set-cookie`, `range`,
 `max-forwards`, `cache-control`, every hop-by-hop name): on a request that
 is a rejection, on a response the body is cut before the client sees it
-complete. A body a rule or addon buffers to read keeps its trailers.
+complete. A body a rule or addon buffers to read keeps its trailers, and
+the trailers a layer attaches to the request it passes on are held to the
+same rules as a client's. A request trailer section is held to
+`limits.max_headers` and `limits.max_header_bytes`, as a head is. The byte
+limit counts each decoded field as `name: value\r\n`; HTTP/1.1 also checks
+the raw section, including its final CRLF.
 
 Request trailers reach an origin only over `h2`: HTTP/1.1 needs the names
 in a `Trailer` header before the body. Trailers to an HTTP/1.1 origin fail
@@ -3428,7 +3438,7 @@ accept and the upstream connect produces a deny response or a closed socket
 | body to sign over `max_sign_body_bytes` | `413`, `_sign`, `sign_body_too_large` |
 | buffer budget cannot cover the exchange's inspection, decoding, signing or WebSocket buffers | deny, `_fail_closed`, `buffer_budget_exhausted`; an observer's copy is cut instead (`observer_lagged`), an endpoint call refused, a body decoded for a layer failed |
 | body or header limit exceeded mid-stream | close both sides |
-| request trailers without `http.allow_request_trailers`, or a forbidden field in a trailer section | request: `400` and close, or a stream reset, `parse_error` reason `trailers`; response: body cut, `response_error` ([trailers](/reference/http#trailers)) |
+| request trailers without `http.allow_request_trailers`, or a forbidden field in a trailer section | request: `400` and close, or a stream reset, `parse_error` reason `trailers`; on a request a layer passes on: `503`, `layer_error`, the layer's `invalid_request` (logged if a response head is already out); response: body cut, `response_error` ([trailers](/reference/http#trailers)) |
 | upstream DNS, connect or TLS failure | `502`, `upstream_error` |
 | upstream connect, TLS handshake or response-header timeout | `504`, `upstream_error`, reason `timeout` |
 | address floor | `403`, `_address_policy` |
@@ -3897,9 +3907,11 @@ with no error.
 
 * What a layer passes on is re-validated as strictly as a client request:
   an absolute `http(s)` URI; `host`, hop-by-hop and framing fields refused
-  at the boundary (roxy derives them); the workload's limits applied. A
-  WASM layer may not set `content-length` either (the body carries its own
-  length); a service layer may, and the body it sends is held to it
+  at the boundary (roxy derives them); the workload's limits applied; the
+  body's trailers held to a client's rules
+  ([trailers](/reference/http#trailers)). A WASM layer may not set
+  `content-length` either (the body carries its own length); a service
+  layer may, and the body it sends is held to it
   ([service layers](/reference/service-layers#frames)). `chain.next`
   fills in the scheme and authority from the exchange when the layer
   leaves them unset.
@@ -4146,8 +4158,9 @@ without changing the already-complete HTTP response.
 
 | rule | detail |
 |---|---|
-| heads | `url` is absolute; `headers` are end-to-end fields as a WASM layer sees them (no hop-by-hop or framing fields), at most [`limits.max_headers`](/reference/limits#limits) of them in a head the service sends: more is a protocol violation. `content-length` is present when the length is known and not zero; one the service sends is enforced: more or fewer bytes than declared is a protocol violation |
+| heads | `url` is absolute; `headers` are end-to-end fields as a WASM layer sees them (no hop-by-hop or framing fields), at most [`limits.max_headers`](/reference/limits#limits) of them in a head or trailer section the service sends: more is a protocol violation. `content-length` is present when the length is known and not zero; one the service sends is enforced: more or fewer bytes than declared is a protocol violation |
 | header values | byte strings: each byte is the code point of the same value (ISO-8859-1), so obs-text bytes (`http.allow_obs_text`) read as Latin-1 and go back as the same bytes. A code point above U+00FF is a protocol violation |
+| trailers | a request `trailers` the service sends is held to a client's rules ([trailers](/reference/http#trailers)): it needs `http.allow_request_trailers`, fits `limits.max_header_bytes`, and may not carry a framing, routing, authentication or `content-*` field. One that breaks them is the service's `invalid_request`: the forward never completes, and the exchange is refused `503`, `layer_error`, or the error is logged if a response head is already out. A response `trailers` is held to an origin's rules as it is written to the client |
 | order | on each lane, from each side: head, bytes, trailers, end. Bytes or trailers before their head or after their end, a second head, a second `trailers`, a second end: each is a protocol violation. The two lanes are independent, and so are the two sides: roxy sends its `response` head as soon as the layer upstream answers, even while the client's body is still arriving; the service sends its `request` at most once and its `response` exactly once, in either order, and may send either while the other lane is still streaming. A `request_end` with no `request` before it forwards nothing. Answering says nothing about forwarding, and a service that wants nothing forwarded forwards nothing |
 | cuts | an end that carries `"error"` cuts its lane: the bytes before it are not the whole. From roxy, the body stopped short on its way (an in-flight deny cut it, the upstream's body failed, the client gave up, the service's own forward was cut); the text is for diagnostics only, is not stable, and may be another layer's own. The stream, and the service's own lanes, go on. A `response_end` with `"error"` and no `response` before it says nothing came back for the forward: it was cut. From the service, a cut is its own doing and not a fault: the exchange's record says `forward_aborted` or `answer_aborted`, and what is downstream of the cut lane sees it cut. If the service cuts its response lane without ever providing a head, roxy also records `no_response` and generates a refusal. An error on the end of a head-only lane, which carries no body to cut, is a protocol violation |
 | stop | `stop` says its sender reads no more of that body: the receiver sends no more of it, need not end it, and credits nothing for it. roxy sends `stop` for the request lane when the upstream stops reading the forward. A service that stops the response lane gives the forward up: nothing upstream carries a response nobody waits for, so the upstream request is cancelled. A service that stops the request lane keeps everything else |

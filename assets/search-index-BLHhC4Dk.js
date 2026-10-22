@@ -1,0 +1,1 @@
+var e=async()=>JSON.stringify(await(await fetch(`/roxy-proxy/assets/search-index-81251e4a4761.json`)).json());export{e as getSearchIndex};

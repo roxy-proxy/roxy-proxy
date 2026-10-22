@@ -162,7 +162,12 @@ trailer section may not carry framing, routing, authentication or
 `content-*` fields (`authorization`, `cookie`, `set-cookie`, `range`,
 `max-forwards`, `cache-control`, every hop-by-hop name): on a request that
 is a rejection, on a response the body is cut before the client sees it
-complete. A body a rule or addon buffers to read keeps its trailers.
+complete. A body a rule or addon buffers to read keeps its trailers, and
+the trailers a layer attaches to the request it passes on are held to the
+same rules as a client's. A request trailer section is held to
+`limits.max_headers` and `limits.max_header_bytes`, as a head is. The byte
+limit counts each decoded field as `name: value\r\n`; HTTP/1.1 also checks
+the raw section, including its final CRLF.
 
 Request trailers reach an origin only over `h2`: HTTP/1.1 needs the names
 in a `Trailer` header before the body. Trailers to an HTTP/1.1 origin fail
