@@ -464,6 +464,29 @@ impl StackFlow {
         (0..stage).rev().find(|&i| self.enforced(i))
     }
 
+    /// The request reaching `stage`, re-validated as a client's would be.
+    /// A body a layer passed on is attributed to that layer here, so a
+    /// trailer section refused as it flows is recorded as the layer's
+    /// `invalid_request` before a lane or HTTP client turns the error into
+    /// a cut or a stream reset. The client's own body was attributed at
+    /// the client edge.
+    fn validate_request(
+        self: &Arc<Self>,
+        stage: usize,
+        req: roxy_wasm::LayerRequest,
+    ) -> Result<CanonicalRequest, roxy_http::ParseError> {
+        let mut req = roxy_http::layer::from_layer_request(
+            req,
+            self.client_meta.clone(),
+            &self.snap.limits,
+            &self.snap.flags,
+        )?;
+        if let Some(layer) = self.passed_on_by(stage) {
+            req.body = attribution::attributed(self, attribution::Side::Layer(layer), req.body);
+        }
+        Ok(req)
+    }
+
     /// The last enforcing layer to pass a response towards the client.
     /// An observer or skipped layer cannot have changed the head.
     fn response_producer(&self) -> &str {

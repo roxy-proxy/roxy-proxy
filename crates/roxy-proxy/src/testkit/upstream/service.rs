@@ -277,6 +277,9 @@ struct Sess {
     lanes: [Lane; 2],
     /// Host-service calls not yet answered with a `result`.
     calls_waiting: usize,
+    /// Whether `request-trailers` adds the forbidden fields to this
+    /// stream's trailer section (the request's URL ends in `/forbidden`).
+    forbidden_trailers: bool,
 }
 
 impl Sess {
@@ -284,6 +287,7 @@ impl Sess {
         Self {
             lanes: [Lane::new(), Lane::new()],
             calls_waiting: 0,
+            forbidden_trailers: false,
         }
     }
 }
@@ -353,6 +357,11 @@ enum Mode {
     /// id 1), sending its own `response_end` only once the call is
     /// answered: an observer that records what it has read.
     Audit,
+    /// Passes through, attaching a request trailer section after the
+    /// forwarded head: `x-checksum` alone, or with `authorization`,
+    /// `cookie` and `content-length` beside it for a request whose URL
+    /// ends in `/forbidden`.
+    RequestTrailers,
 }
 
 /// What the `host` behaviour writes to the state store, under `svc`.
@@ -416,6 +425,8 @@ impl Mode {
             Self::LateQuarantine
         } else if path.ends_with("/audit") {
             Self::Audit
+        } else if path.ends_with("/request-trailers") {
+            Self::RequestTrailers
         } else {
             Self::Flood
         }
@@ -459,7 +470,8 @@ impl Conn {
             | Mode::Host
             | Mode::Quarantine
             | Mode::LateQuarantine
-            | Mode::Audit => true,
+            | Mode::Audit
+            | Mode::RequestTrailers => true,
             Mode::Hold
             | Mode::Forward
             | Mode::Early
@@ -683,6 +695,14 @@ impl Conn {
                     lock(&self.log.unknown_resets).push(id);
                 }
             }
+            "request" if self.mode == Mode::RequestTrailers => {
+                self.note_forbidden_trailers(id, &v);
+                self.pass_control(id, &kind, v);
+            }
+            "request_end" if self.mode == Mode::RequestTrailers => {
+                self.attach_request_trailers(id);
+                self.pass_control(id, &kind, v);
+            }
             "response_end" if self.mode == Mode::Hold => {}
             "response_end" if self.mode == Mode::Audit => {
                 // The whole response has been read: record it, and end the
@@ -708,6 +728,33 @@ impl Conn {
             lane.stopped = true;
             lane.queue.clear();
         }
+    }
+
+    fn note_forbidden_trailers(&mut self, id: u32, request: &Value) {
+        let forbidden = request["url"]
+            .as_str()
+            .is_some_and(|u| u.ends_with("/forbidden"));
+        if let Some(s) = self.streams.get_mut(&id) {
+            s.forbidden_trailers = forbidden;
+        }
+    }
+
+    /// Queues the request trailer section behind the forwarded body bytes,
+    /// before the end.
+    fn attach_request_trailers(&mut self, id: u32) {
+        let mut headers = vec![["x-checksum", "abc"]];
+        if self.streams.get(&id).is_some_and(|s| s.forbidden_trailers) {
+            headers.extend([
+                ["authorization", "Bearer smuggled"],
+                ["cookie", "sess=smuggled"],
+                ["content-length", "999"],
+            ]);
+        }
+        self.pass_control(
+            id,
+            "trailers",
+            json!({"type": "trailers", "dir": "request", "headers": headers}),
+        );
     }
 
     /// Answers `status` with no body and forwards nothing: the request
@@ -767,7 +814,8 @@ impl Conn {
             | Mode::CutWait
             | Mode::TrailersCut
             | Mode::LateQuarantine
-            | Mode::Audit => {}
+            | Mode::Audit
+            | Mode::RequestTrailers => {}
             Mode::ForwardOnOpen => {
                 self.send(text(id, json!({"type": "request", "method": "POST", "url": "http://up.test/x", "headers": []})));
                 self.send(text(id, json!({"type": "request_end"})));

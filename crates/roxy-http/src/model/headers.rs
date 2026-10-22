@@ -78,6 +78,44 @@ pub fn check_trailer_fields(trailers: &HeaderMap, limits: &Limits) -> Result<(),
     Ok(())
 }
 
+/// Approximate h1 wire size of `map` (`name: value\r\n` per field), the
+/// size `limits.max_header_bytes` bounds.
+pub fn header_map_wire_len(map: &HeaderMap) -> usize {
+    wire_len(map.iter())
+}
+
+fn wire_len<'a>(fields: impl Iterator<Item = (&'a HeaderName, &'a HeaderValue)>) -> usize {
+    fields.fold(0usize, |acc, (n, v)| {
+        acc.saturating_add(n.as_str().len())
+            .saturating_add(v.len())
+            .saturating_add(4)
+    })
+}
+
+/// Validates a request trailer section, wherever it enters: the client's
+/// HTTP/2 stream, or a layer's forwarded body. Any section is a rejection
+/// unless `http.allow_request_trailers`; with it, the field rules of
+/// [`check_trailer_fields`] and `limits.max_header_bytes` apply and the
+/// values go through the header validator, as the h1 chunked decoder's do.
+pub fn validate_request_trailers(
+    trailers: &HeaderMap,
+    limits: &Limits,
+    flags: &HttpFlags,
+) -> Result<HeaderMap, ParseError> {
+    if !flags.allow_request_trailers {
+        return reject(Reason::Trailers, "trailer section present");
+    }
+    check_trailer_fields(trailers, limits)?;
+    if header_map_wire_len(trailers) > limits.max_header_bytes {
+        return reject(Reason::HeadTooLarge, "trailer section too large");
+    }
+    let raw: Vec<(&[u8], &[u8])> = trailers
+        .iter()
+        .map(|(n, v)| (n.as_str().as_bytes(), v.as_bytes()))
+        .collect();
+    Ok(Headers::try_from_raw(raw, limits, flags)?.to_header_map())
+}
+
 /// Validates a response trailer section as it is about to be written to
 /// the client. `Ok(None)` when `http.allow_response_trailers` is off: the
 /// trailers are dropped and the body ends after its data. With it, the
@@ -431,11 +469,7 @@ impl Headers {
 
     /// Approximate h1 wire size (`name: value\r\n` per field).
     pub fn wire_len(&self) -> usize {
-        self.entries.iter().fold(0usize, |acc, (n, v)| {
-            acc.saturating_add(n.as_str().len())
-                .saturating_add(v.len())
-                .saturating_add(4)
-        })
+        wire_len(self.entries.iter().map(|(n, v)| (n, v)))
     }
 
     /// Copies into an `http::HeaderMap` (repeated names appended in order).
@@ -584,6 +618,107 @@ mod tests {
         }
         assert!(!is_forbidden_trailer("grpc-status"));
         assert!(!is_forbidden_trailer("x-checksum"));
+    }
+
+    #[test]
+    fn request_trailers_refused_unless_allowed() {
+        let mut t = HeaderMap::new();
+        t.insert("grpc-status", HeaderValue::from_static("0"));
+        assert_eq!(
+            validate_request_trailers(&t, &Limits::default(), &HttpFlags::default())
+                .unwrap_err()
+                .reason,
+            Reason::Trailers
+        );
+    }
+
+    #[test]
+    fn request_trailers_validated() {
+        let flags = HttpFlags {
+            allow_request_trailers: true,
+            ..HttpFlags::default()
+        };
+        let mut t = HeaderMap::new();
+        t.insert("grpc-status", HeaderValue::from_static("0"));
+        let ok = validate_request_trailers(&t, &Limits::default(), &flags).unwrap();
+        assert_eq!(ok.get("grpc-status").unwrap(), "0");
+        for bad in [
+            "authorization",
+            "content-length",
+            "content-md5",
+            "host",
+            "connection",
+        ] {
+            let mut t = HeaderMap::new();
+            t.insert(HeaderName::from_static(bad), HeaderValue::from_static("x"));
+            assert_eq!(
+                validate_request_trailers(&t, &Limits::default(), &flags)
+                    .unwrap_err()
+                    .reason,
+                Reason::Trailers,
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn request_trailers_limit_bytes_and_count_duplicate_fields() {
+        let flags = HttpFlags {
+            allow_request_trailers: true,
+            ..HttpFlags::default()
+        };
+        let mut trailers = HeaderMap::new();
+        trailers.append("x-t", HeaderValue::from_static("abc"));
+        trailers.append("x-t", HeaderValue::from_static("def"));
+        let mut limits = Limits {
+            max_header_bytes: 20,
+            max_headers: 2,
+            ..Limits::default()
+        };
+        assert_eq!(
+            validate_request_trailers(&trailers, &limits, &flags).unwrap(),
+            trailers
+        );
+        limits.max_header_bytes = 19;
+        assert_eq!(
+            validate_request_trailers(&trailers, &limits, &flags)
+                .unwrap_err()
+                .reason,
+            Reason::HeadTooLarge
+        );
+        limits.max_header_bytes = 20;
+        limits.max_headers = 1;
+        assert_eq!(
+            validate_request_trailers(&trailers, &limits, &flags)
+                .unwrap_err()
+                .reason,
+            Reason::TooManyHeaders
+        );
+    }
+
+    #[test]
+    fn request_trailers_validate_values_and_preserve_duplicates() {
+        let mut flags = HttpFlags {
+            allow_request_trailers: true,
+            ..HttpFlags::default()
+        };
+        let mut trailers = HeaderMap::new();
+        trailers.append("x-t", HeaderValue::from_static("  abc\t"));
+        trailers.append("x-t", HeaderValue::from_bytes(b"\xff").unwrap());
+        assert_eq!(
+            validate_request_trailers(&trailers, &Limits::default(), &flags)
+                .unwrap_err()
+                .reason,
+            Reason::NonAscii
+        );
+        flags.allow_obs_text = true;
+        let checked = validate_request_trailers(&trailers, &Limits::default(), &flags).unwrap();
+        let values: Vec<_> = checked
+            .get_all("x-t")
+            .iter()
+            .map(HeaderValue::as_bytes)
+            .collect();
+        assert_eq!(values, [b"abc".as_slice(), b"\xff".as_slice()]);
     }
 
     #[test]

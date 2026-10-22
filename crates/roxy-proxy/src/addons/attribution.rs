@@ -131,15 +131,26 @@ pub(crate) enum Side {
     Client,
     /// The upstream's response body.
     Upstream,
+    /// The request body the layer at this index passed on, re-validated
+    /// for the stage after it.
+    Layer(usize),
 }
 
 impl Side {
-    fn fault(self, e: &BodyError) -> Fault {
-        match (self, e) {
+    fn fault(self, st: &StackFlow, e: &BodyError) -> Option<Fault> {
+        Some(match (self, e) {
             (_, BodyError::BudgetExhausted) => Fault::Budget,
             (Side::Client, e) => Fault::Client(body_failure(e)),
             (Side::Upstream, _) => Fault::UpstreamBody,
-        }
+            (Side::Layer(index), BodyError::Invalid(e)) => Fault::Layer {
+                name: st.snap.addons[index].name.clone(),
+                err: roxy_wasm::LayerError::InvalidRequest(e.to_string()).into(),
+            },
+            // A cut is the producer's own doing, not a fault, and the
+            // service mux records a lane's cap and declared-length faults
+            // itself.
+            (Side::Layer(_), _) => return None,
+        })
     }
 }
 
@@ -165,8 +176,9 @@ impl HttpBody for Attributed {
         // not a new parse/upstream fault. Any earlier fault still stands.
         if let Some(Err(e)) = &frame
             && this.st.cancellation() != Some(super::Cancellation::ClientGone)
+            && let Some(fault) = this.side.fault(&this.st, e)
         {
-            this.st.attribution.record(this.side.fault(e));
+            this.st.attribution.record(fault);
         }
         Poll::Ready(frame)
     }
@@ -241,6 +253,51 @@ mod tests {
     use http_body_util::BodyExt as _;
 
     use super::*;
+
+    #[tokio::test]
+    async fn layer_trailer_validation_preserves_prior_faults_and_lane_errors() {
+        let kit = crate::testkit::Kit::builder()
+            .addon(crate::testkit::AddonDef::test_layer("producer"))
+            .start()
+            .await;
+        for (error, invalid) in [
+            (BodyError::Incomplete, false),
+            (BodyError::Abandoned, false),
+            (
+                BodyError::Invalid(ParseError::new(Reason::Trailers, "forbidden")),
+                true,
+            ),
+            (BodyError::LengthMismatch, false),
+            (BodyError::TooLarge { limit: 1 }, false),
+        ] {
+            for prior_fault in [false, true] {
+                let (st, _cx, _ends) = crate::addons::test_flow(&kit);
+                if prior_fault {
+                    st.attribution.record(Fault::Client(ParseError::new(
+                        Reason::UnexpectedEof,
+                        "client upload",
+                    )));
+                }
+                let (sender, source) = Body::channel(u64::MAX, None);
+                let mut body = attributed(&st, Side::Layer(0), source);
+                sender.abort(error.clone());
+                assert_eq!(body.frame().await.unwrap().unwrap_err(), error);
+                match st.attribution.fault() {
+                    Some(Fault::Client(_)) => assert!(prior_fault),
+                    Some(Fault::Layer { name, err }) => {
+                        assert!(!prior_fault && invalid);
+                        assert_eq!(name, "producer");
+                        assert!(matches!(
+                            err,
+                            StackError::Layer(roxy_wasm::LayerError::InvalidRequest(_))
+                        ));
+                    }
+                    None => assert!(!prior_fault && !invalid),
+                    fault => panic!("unexpected fault: {fault:?}"),
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn cancellation_body_errors_do_not_replace_the_observed_cause() {
