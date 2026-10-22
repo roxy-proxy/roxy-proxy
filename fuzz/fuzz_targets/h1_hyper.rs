@@ -3,9 +3,12 @@
 //!
 //! Input: one config byte (parser flags and role, see `roxy_fuzz::flags` /
 //! `roxy_fuzz::role`), then the raw bytes of a client connection. A probe
-//! request legal for the role is appended to every input, so whether a codec
-//! reads on after the input's last request (keep-alive, and where it took
-//! that request to end) shows as whether it parses the probe.
+//! request legal for the role is appended to every input: a codec that reads
+//! on after the input's last request parses it, which also shows where each
+//! took that request to end. As that request's body can swallow the probe,
+//! reading on is observed directly as well: a codec that wants more bytes
+//! once the input is spent was reading on; one that stops without asking
+//! chose to close.
 //!
 //! hyper is the lenient reference and roxy is meant to be strictly stricter,
 //! so the property is one-sided, request by request down the connection:
@@ -26,8 +29,8 @@ use std::fmt::Write as _;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::task::{Context, Poll};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::task::{Context, Poll, Wake, Waker, ready};
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
@@ -51,22 +54,49 @@ use roxy_http::{
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
 thread_local! {
-    /// Nothing in either codec waits on the wire, so one `block_on` runs an
-    /// input to completion and the runtime is reused.
+    /// roxy's reads carry timeouts, so it needs a runtime; nothing waits on
+    /// the wire, so one `block_on` runs an input to completion and the
+    /// runtime is reused.
     static RUNTIME: tokio::runtime::Runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
         .expect("tokio runtime");
 }
 
-/// The client's end of the connection: it has sent `input` and half-closed;
-/// whatever the server writes back is discarded.
-struct Wire(Bytes);
+/// The client's end of the connection: it has sent `data`, and whatever the
+/// server writes back is discarded. Once `data` is consumed a read is EOF (the
+/// client half-closed) if `ended` is set, else pending until it is. Nothing
+/// wakes a pending reader: the side that holds the wire open polls again.
+struct Wire {
+    data: Bytes,
+    ended: Arc<AtomicBool>,
+}
 
 impl Wire {
-    fn take(&mut self, room: usize) -> Bytes {
-        let n = self.0.len().min(room);
-        self.0.split_to(n)
+    /// A wire that is half-closed as soon as `data` is consumed.
+    fn ended(data: Bytes) -> Self {
+        Self {
+            data,
+            ended: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// A wire held open past `data` until the returned flag is set.
+    fn held(data: Bytes) -> (Self, Arc<AtomicBool>) {
+        let ended = Arc::new(AtomicBool::new(false));
+        let wire = Self {
+            data,
+            ended: ended.clone(),
+        };
+        (wire, ended)
+    }
+
+    fn read(&mut self, room: usize) -> Poll<Bytes> {
+        if self.data.is_empty() && !self.ended.load(Ordering::Relaxed) {
+            return Poll::Pending;
+        }
+        let n = self.data.len().min(room);
+        Poll::Ready(self.data.split_to(n))
     }
 }
 
@@ -76,7 +106,7 @@ impl AsyncRead for Wire {
         _: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let chunk = self.take(buf.remaining());
+        let chunk = ready!(self.read(buf.remaining()));
         buf.put_slice(&chunk);
         Poll::Ready(Ok(()))
     }
@@ -106,7 +136,7 @@ impl hyper::rt::Read for Wire {
         _: &mut Context<'_>,
         mut buf: ReadBufCursor<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let chunk = self.take(buf.remaining());
+        let chunk = ready!(self.read(buf.remaining()));
         buf.put_slice(&chunk);
         Poll::Ready(Ok(()))
     }
@@ -166,8 +196,8 @@ struct Side<E> {
 }
 
 enum RoxyEnd {
-    /// EOF between requests.
-    Eof,
+    /// Waiting for another request when the input ran out.
+    ReadingOn,
     /// Closed after a request: `Connection: close`, or HTTP/1.0.
     Closed(Version),
     /// A CONNECT, which hands the connection over to the tunnel.
@@ -176,8 +206,11 @@ enum RoxyEnd {
 }
 
 enum HyperEnd {
-    /// EOF, a close decision, or a CONNECT answered.
-    Done,
+    /// Waiting for another request when the input ran out.
+    ReadingOn,
+    /// Closed after a request: `Connection: close`, HTTP/1.0, or a CONNECT
+    /// answered.
+    Closed,
     Rejected(hyper::Error),
     /// The body of the request after the last accepted one.
     BodyRejected(hyper::Error),
@@ -343,13 +376,13 @@ fn hyper_msg(parts: &Parts, body: Collected<Bytes>, role: &Role) -> Msg {
 fn roxy_side(cfg: u8, role: &Role, wire: Bytes) -> Side<RoxyEnd> {
     let limits = Arc::new(roxy_fuzz::tight_limits());
     let flags = Arc::new(roxy_fuzz::flags(cfg));
-    let mut conn = ServerConn::new(Wire(wire), role.clone(), limits, flags);
+    let mut conn = ServerConn::new(Wire::ended(wire), role.clone(), limits, flags);
     let mut msgs = Vec::new();
     let end = RUNTIME.with(|rt| {
         rt.block_on(async {
             loop {
                 let mut req = match conn.next_request().await {
-                    Ok(None) => return RoxyEnd::Eof,
+                    Ok(None) => return RoxyEnd::ReadingOn,
                     Err(e) => return RoxyEnd::Rejected(e.reason),
                     Ok(Some(Incoming::Connect {
                         authority,
@@ -388,9 +421,46 @@ fn roxy_side(cfg: u8, role: &Role, wire: Bytes) -> Side<RoxyEnd> {
     Side { msgs, end }
 }
 
-/// Serves the connection with hyper, the same way. `half_close` keeps hyper
-/// from treating the client's half-close as a reason to drop a request it
-/// has read but not yet answered; no header timeout, so no timer is needed.
+/// Records whether the task was asked to poll again.
+struct Woken(AtomicBool);
+
+impl Wake for Woken {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Polls of a connection future before a spin is reported instead: hyper
+/// wakes itself every 16 messages and per body chunk, so even a megabyte of
+/// pipelined requests settles in a few thousand.
+const POLL_BUDGET: usize = 1 << 20;
+
+/// Polls `fut` until it completes, or returns `Pending` without having asked
+/// to be woken: nothing else here blocks, so it is waiting for the wire.
+fn poll_until_blocked<F: Future>(mut fut: Pin<&mut F>) -> Option<F::Output> {
+    let woken = Arc::new(Woken(AtomicBool::new(false)));
+    let waker = Waker::from(woken.clone());
+    let mut cx = Context::from_waker(&waker);
+    for _ in 0..POLL_BUDGET {
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => return Some(out),
+            Poll::Pending if woken.0.swap(false, Ordering::Relaxed) => {}
+            Poll::Pending => return None,
+        }
+    }
+    panic!("hyper's connection woke itself {POLL_BUDGET} times without settling");
+}
+
+/// Serves the connection with hyper, the same way. Its connection future
+/// resolves `Ok(())` for a close decision and for EOF alike, so the wire is
+/// held open until hyper blocks on it: blocking there means it read on, and
+/// the EOF then released lets it finish. `half_close` keeps hyper from
+/// treating that EOF as a reason to drop a request it has read but not yet
+/// answered; no header timeout, so no timer is needed.
 fn hyper_side(role: &Role, wire: Bytes) -> Side<HyperEnd> {
     let msgs = Rc::new(RefCell::new(Vec::new()));
     let body_error = Rc::new(RefCell::new(None));
@@ -409,15 +479,26 @@ fn hyper_side(role: &Role, wire: Bytes) -> Side<HyperEnd> {
             }
         }
     });
+    let (wire, ended) = Wire::held(wire);
     let conn = http1::Builder::new()
         .half_close(true)
         .header_read_timeout(None::<Duration>)
-        .serve_connection(Wire(wire), service);
-    let result = RUNTIME.with(|rt| rt.block_on(conn));
-    let end = match (result, body_error.borrow_mut().take()) {
-        (_, Some(e)) => HyperEnd::BodyRejected(e),
-        (Ok(()), None) => HyperEnd::Done,
-        (Err(e), None) => HyperEnd::Rejected(e),
+        .serve_connection(wire, service);
+    let mut conn = std::pin::pin!(conn);
+    let (result, read_on) = match poll_until_blocked(conn.as_mut()) {
+        Some(result) => (result, false),
+        None => {
+            ended.store(true, Ordering::Relaxed);
+            let result = poll_until_blocked(conn.as_mut())
+                .expect("hyper's connection settles once the wire has ended");
+            (result, true)
+        }
+    };
+    let end = match (result, body_error.borrow_mut().take(), read_on) {
+        (_, Some(e), _) => HyperEnd::BodyRejected(e),
+        (Err(e), None, _) => HyperEnd::Rejected(e),
+        (Ok(()), None, true) => HyperEnd::ReadingOn,
+        (Ok(()), None, false) => HyperEnd::Closed,
     };
     let msgs = std::mem::take(&mut *msgs.borrow_mut());
     Side { msgs, end }
@@ -474,8 +555,12 @@ fn compare(roxy: &Side<RoxyEnd>, hyper: &Side<HyperEnd>, wire: &[u8]) {
                         shown()
                     );
                 }
-                HyperEnd::Done => panic!(
-                    "hyper stopped reading before request #{i} and roxy read on:\n{r:#?}\n{}",
+                HyperEnd::Closed => panic!(
+                    "hyper closed the connection before request #{i} and roxy read on:\n{r:#?}\n{}",
+                    shown()
+                ),
+                HyperEnd::ReadingOn => panic!(
+                    "hyper found no request #{i} in the input and roxy accepted one:\n{r:#?}\n{}",
                     shown()
                 ),
             }
@@ -491,28 +576,50 @@ fn compare(roxy: &Side<RoxyEnd>, hyper: &Side<HyperEnd>, wire: &[u8]) {
         match roxy.end {
             RoxyEnd::Rejected(reason) => count(slot(reason)),
             RoxyEnd::Closed(Version::H1_0) => count(CLOSED),
-            RoxyEnd::Closed(_) | RoxyEnd::Eof | RoxyEnd::Connect => panic!(
+            RoxyEnd::Closed(_) | RoxyEnd::Connect => panic!(
                 "roxy ended the connection where hyper parsed request #{}:\n{}",
+                roxy.msgs.len(),
+                shown()
+            ),
+            RoxyEnd::ReadingOn => panic!(
+                "roxy found no request #{} in the input and hyper parsed one:\n{}",
                 roxy.msgs.len(),
                 shown()
             ),
         }
         return;
     }
-    // A rejection after the common prefix still records a read-on attempt.
-    // Ending instead is a disagreement, except for roxy's HTTP/1.0 policy.
+    // Reading on (and then rejecting what followed, if anything did) against
+    // ending the connection is a disagreement, except for roxy's HTTP/1.0
+    // policy; so is roxy finding nothing where hyper found bytes to reject.
     match (&roxy.end, &hyper.end) {
-        (RoxyEnd::Rejected(reason), HyperEnd::Done) => panic!(
-            "hyper stopped reading before request #{} and roxy read on ({} on what followed):\n{}",
+        (RoxyEnd::ReadingOn, HyperEnd::Closed) => panic!(
+            "hyper closed the connection before request #{} and roxy read on:\n{}",
+            roxy.msgs.len(),
+            shown()
+        ),
+        (RoxyEnd::Rejected(reason), HyperEnd::Closed) => panic!(
+            "hyper closed the connection before request #{} and roxy read on ({} on what followed):\n{}",
             roxy.msgs.len(),
             reason.as_str(),
             shown()
         ),
-        (RoxyEnd::Closed(Version::H1_0), HyperEnd::Rejected(_) | HyperEnd::BodyRejected(_)) => {
-            count(CLOSED)
-        }
+        (RoxyEnd::ReadingOn, HyperEnd::Rejected(e) | HyperEnd::BodyRejected(e)) => panic!(
+            "roxy found nothing after request #{} and hyper read on ({e} on what followed):\n{}",
+            roxy.msgs.len(),
+            shown()
+        ),
         (
-            RoxyEnd::Closed(_) | RoxyEnd::Eof | RoxyEnd::Connect,
+            RoxyEnd::Closed(Version::H1_0),
+            HyperEnd::ReadingOn | HyperEnd::Rejected(_) | HyperEnd::BodyRejected(_),
+        ) => count(CLOSED),
+        (RoxyEnd::Closed(_) | RoxyEnd::Connect, HyperEnd::ReadingOn) => panic!(
+            "roxy ended the connection before request #{} and hyper read on:\n{}",
+            roxy.msgs.len(),
+            shown()
+        ),
+        (
+            RoxyEnd::Closed(_) | RoxyEnd::Connect,
             HyperEnd::Rejected(e) | HyperEnd::BodyRejected(e),
         ) => panic!(
             "roxy ended the connection before request #{} and hyper read on ({e} on what followed):\n{}",
@@ -543,27 +650,34 @@ fuzz_target!(|data: &[u8]| {
 mod tests {
     use super::*;
 
-    fn wire(version: &str, connection: &str, next: &[u8]) -> Bytes {
-        let mut wire = BytesMut::from(
-            format!(
-                "GET / HTTP/{version}\r\nHost: example.com\r\nConnection: {connection}\r\n\r\n"
-            )
-            .as_bytes(),
-        );
+    const GET_11: &str = "GET / HTTP/1.1\r\nHost: example.com";
+    const GET_10: &str = "GET / HTTP/1.0\r\nHost: example.com";
+    const BAD_HEAD: &[u8] = b"not a request\r\n\r\n";
+    const BAD_BODY: &[u8] =
+        b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 99999\r\n\r\nshort";
+
+    /// A request whose body is exactly the probe, so nothing is left to
+    /// parse after it and only the close decision can tell the codecs apart.
+    fn post_swallowing_probe(version: &str) -> String {
+        format!(
+            "POST / HTTP/{version}\r\nHost: example.com\r\nContent-Length: {}",
+            probe(&Role::Origin).len()
+        )
+    }
+
+    fn wire(head: &str, connection: &str, next: &[u8]) -> Bytes {
+        let mut wire =
+            BytesMut::from(format!("{head}\r\nConnection: {connection}\r\n\r\n").as_bytes());
         wire.extend_from_slice(next);
         wire.extend_from_slice(probe(&Role::Origin));
         wire.freeze()
     }
 
-    const BAD_HEAD: &[u8] = b"not a request\r\n\r\n";
-    const BAD_BODY: &[u8] =
-        b"POST / HTTP/1.1\r\nHost: example.com\r\nContent-Length: 99999\r\n\r\nshort";
-
     // The first requests compare equal because Connection is consumed by
     // each codec; the ending must still expose their different decisions.
-    fn different_close_decisions(version: &str, next: &[u8]) {
-        let roxy_wire = wire(version, "close", next);
-        let hyper_wire = wire(version, "keep-alive", next);
+    fn different_close_decisions(head: &str, roxy_conn: &str, hyper_conn: &str, next: &[u8]) {
+        let roxy_wire = wire(head, roxy_conn, next);
+        let hyper_wire = wire(head, hyper_conn, next);
         let roxy = roxy_side(1, &Role::Origin, roxy_wire.clone());
         let hyper = hyper_side(&Role::Origin, hyper_wire);
         assert_eq!(roxy.msgs.len(), 1);
@@ -574,20 +688,33 @@ mod tests {
     #[test]
     #[should_panic(expected = "roxy ended the connection")]
     fn close_before_rejected_head_disagrees() {
-        different_close_decisions("1.1", BAD_HEAD);
+        different_close_decisions(GET_11, "close", "keep-alive", BAD_HEAD);
     }
 
     #[test]
     #[should_panic(expected = "roxy ended the connection")]
     fn close_before_rejected_body_disagrees() {
-        different_close_decisions("1.1", BAD_BODY);
+        different_close_decisions(GET_11, "close", "keep-alive", BAD_BODY);
     }
 
     #[test]
-    fn http10_close_before_rejection_is_counted() {
+    #[should_panic(expected = "hyper closed the connection before request #1 and roxy read on")]
+    fn read_on_after_swallowed_probe_disagrees() {
+        different_close_decisions(&post_swallowing_probe("1.1"), "keep-alive", "close", b"");
+    }
+
+    #[test]
+    #[should_panic(expected = "roxy ended the connection before request #1 and hyper read on")]
+    fn close_after_swallowed_probe_disagrees() {
+        different_close_decisions(&post_swallowing_probe("1.1"), "close", "keep-alive", b"");
+    }
+
+    #[test]
+    fn http10_close_is_counted() {
         let before = ROXY_ONLY[CLOSED].load(Ordering::Relaxed);
-        different_close_decisions("1.0", BAD_HEAD);
-        different_close_decisions("1.0", BAD_BODY);
-        assert_eq!(ROXY_ONLY[CLOSED].load(Ordering::Relaxed), before + 2);
+        different_close_decisions(GET_10, "close", "keep-alive", BAD_HEAD);
+        different_close_decisions(GET_10, "close", "keep-alive", BAD_BODY);
+        different_close_decisions(&post_swallowing_probe("1.0"), "close", "keep-alive", b"");
+        assert_eq!(ROXY_ONLY[CLOSED].load(Ordering::Relaxed), before + 3);
     }
 }
