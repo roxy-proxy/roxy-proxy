@@ -44,10 +44,18 @@ pub(crate) const fn is_pchar_literal(b: u8) -> bool {
     is_unreserved(b) || is_sub_delim(b) || matches!(b, b':' | b'@')
 }
 
-/// Visible ASCII outside `pchar` that roxy can percent-encode when sent raw.
-/// The path normaliser excludes the backtick; the query normaliser accepts it.
+/// Visible ASCII outside `pchar` that mainstream clients send raw (browsers
+/// leave them unencoded in a query; curl sends a URL as given). roxy
+/// percent-encodes these rather than rejecting the request.
 pub(crate) const fn is_url_encodable(b: u8) -> bool {
     matches!(b, b'[' | b']' | b'^' | b'`' | b'{' | b'|' | b'}')
+}
+
+/// The path subset. `http::Uri`, which parses an HTTP/2 `:path` before roxy
+/// sees it, takes every one of these raw except the backtick; HTTP/1.1
+/// refuses that one too, so a path is accepted on both listeners or neither.
+pub(crate) const fn is_path_encodable(b: u8) -> bool {
+    b != b'`' && is_url_encodable(b)
 }
 
 /// Field-value byte under roxy's rule: visible ASCII, SP, HTAB, and obs-text

@@ -11,7 +11,7 @@ come first. Each release's GitHub page lists every merged pull request.
 
 ### Breaking
 
-- HTTP/1 requests with raw backticks in the path are rejected with `invalid_path`; send `%60` instead. Raw backticks in queries are percent-encoded ([#582](https://github.com/roxy-proxy/roxy-proxy/pull/582)).
+- A raw backtick in an HTTP/1 request path is rejected with `invalid_path` instead of being percent-encoded; HTTP/2 already refused it. In a query it is still percent-encoded to `%60` ([#582](https://github.com/roxy-proxy/roxy-proxy/pull/582)).
 
 ### Fixed
 

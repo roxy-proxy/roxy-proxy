@@ -7,7 +7,9 @@ use std::borrow::Cow;
 use std::fmt;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use crate::chars::{hex_upper, hex_val, is_pchar_literal, is_unreserved, is_url_encodable};
+use crate::chars::{
+    hex_upper, hex_val, is_path_encodable, is_pchar_literal, is_unreserved, is_url_encodable,
+};
 use crate::model::{Authority, Host, ParseError, Reason, Scheme, reject};
 
 /// Longest DNS name accepted (RFC 1035).
@@ -194,7 +196,7 @@ pub fn normalize_path(raw: &[u8]) -> Result<Path, ParseError> {
     let decoded = canonicalize_encodings(
         raw,
         |b| b == b'/' || is_pchar_literal(b),
-        |b| b != b'`' && is_url_encodable(b),
+        is_path_encodable,
         Reason::InvalidPath,
         true,
     )?;
