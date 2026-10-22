@@ -1023,6 +1023,7 @@ mod service {
     use std::time::Duration;
 
     use bytes::Bytes;
+    use chrono::{TimeDelta, Utc};
 
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -1308,6 +1309,74 @@ mod service {
             kit.upstream.seen().is_empty(),
             "nothing reached the upstream"
         );
+    }
+
+    /// The lease is re-checked when the core admits the request a layer
+    /// forwards: a request a service held across `valid_until` is denied
+    /// `_expired`, as the same request sent after the instant would be, and
+    /// nothing reaches the upstream. The current lease applies even when
+    /// a reload replaced the snapshot the service started under.
+    #[tokio::test]
+    async fn a_request_held_by_a_service_across_the_lease_is_denied() {
+        for reload_policy in [false, true] {
+            let kit = kit_with(
+                RULES,
+                vec![addon("s", "patient", AddonMode::Enforce, |_| {})],
+                |b| b.metric_defs(BY_HOST),
+            )
+            .await;
+            kit.server
+                .handle()
+                .extend_valid_until(Utc::now() + TimeDelta::hours(1));
+            let mut c = kit.h1().await;
+            let (mut tx, body) = streaming_body();
+            let req = c.request("POST", "/x", &[]).body(body).unwrap();
+            let answer = c.start(req);
+            tx.send_data(Bytes::from_static(b"body")).await.unwrap();
+            // `patient` holds the request until its end, so the lease runs out
+            // while the service has the head and the body.
+            let open = &kit.upstream.service().until_opened(1).await[0];
+            kit.upstream
+                .service()
+                .until_received(stream_id(open), 4)
+                .await;
+            let until = Utc::now() - TimeDelta::seconds(1);
+            if reload_policy {
+                kit.reload_lease(RULES, Some(until));
+            } else {
+                kit.server.handle().extend_valid_until(until);
+            }
+            tx.finish().await.unwrap();
+            let a: Answer = tokio::time::timeout(Duration::from_secs(5), answer)
+                .await
+                .expect("the held request is answered")
+                .unwrap()
+                .unwrap();
+            assert_eq!(a.status, 403, "reload_policy={reload_policy}: {a:?}");
+            assert_eq!(a.headers["x-roxy-rule"], "_expired");
+            assert_eq!(a.json()["rule"], "_expired");
+            assert!(
+                kit.upstream.seen().is_empty(),
+                "nothing reached the upstream"
+            );
+            let ev = kit.request_event().await;
+            assert_eq!(ev["decision"], "deny", "{ev:#}");
+            assert_eq!(ev["terminal_rule"], "_expired", "{ev:#}");
+            assert_eq!(ev["reason"], "policy_expired", "{ev:#}");
+            assert_eq!(ev["stage"], "head", "{ev:#}");
+            assert_eq!(ev["rules"], serde_json::json!([]), "{ev:#}");
+            assert_eq!(strs(&ev["addons"]), ["s"], "{ev:#}");
+            assert_eq!(kit.events("policy_expired", 1).await.len(), 1);
+            let samples = kit.samples.lock().unwrap();
+            let admissions: Vec<_> = samples.iter().filter(|s| s.admission).collect();
+            assert_eq!(admissions.len(), 1, "{samples:?}");
+            assert!(admissions[0].denied, "{samples:?}");
+            assert_eq!(
+                samples.iter().filter(|s| s.denied).count(),
+                1,
+                "{samples:?}"
+            );
+        }
     }
 
     /// A service that quarantines on the response head, after `next`:

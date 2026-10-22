@@ -6,6 +6,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use chrono::{TimeDelta, Utc};
 use futures_util::{SinkExt as _, StreamExt as _};
 use tokio_tungstenite::tungstenite::Message;
 
@@ -202,7 +203,8 @@ async fn a_client_rejecting_the_ca_is_not_a_probe() {
 }
 
 /// The quarantine is checked above the addon stack, like the lease: no
-/// layer sees a request while it is in force.
+/// layer sees a request while it is in force. It takes precedence over
+/// an expired lease, without logging a policy expiry.
 #[tokio::test]
 async fn a_quarantine_refuses_before_the_addons_run() {
     let kit = Kit::builder()
@@ -212,6 +214,9 @@ async fn a_quarantine_refuses_before_the_addons_run() {
         .await;
     let a = kit.h1().await.call("GET", "/exfil", &[], b"").await;
     assert_eq!(a.status, 403, "{a:?}");
+    kit.server
+        .handle()
+        .extend_valid_until(Utc::now() - TimeDelta::seconds(1));
     let a = kit
         .h1()
         .await
@@ -222,6 +227,15 @@ async fn a_quarantine_refuses_before_the_addons_run() {
     let ev = kit.events("request", 2).await.remove(1);
     assert_eq!(ev["addons"], serde_json::json!([]), "{ev:#}");
     assert_eq!(ev["terminal_rule"], "_quarantined", "{ev:#}");
+    assert_eq!(ev["reason"], "quarantined", "{ev:#}");
+    assert!(
+        kit.sink
+            .events()
+            .iter()
+            .all(|e| e["event"] != "policy_expired"),
+        "{:#?}",
+        kit.sink.events()
+    );
 }
 
 async fn read_to_close(ws: &mut Ws) -> Option<u16> {

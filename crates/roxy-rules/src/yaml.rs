@@ -188,6 +188,6 @@ mod tests {
         }
         let e = from_str::<serde::de::IgnoredAny>(&yaml).expect_err("alias bomb");
         let e = e.to_string();
-        assert!(e.contains("budget breached"), "{e}");
+        assert!(e.contains("too large or too complex"), "{e}");
     }
 }

@@ -5,6 +5,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::json::JsonFault;
 use crate::protocol::EnrolResponse;
 
 /// The longest token a server may issue.
@@ -13,7 +14,7 @@ pub const MAX_TOKEN_BYTES: usize = 512;
 #[derive(Debug, thiserror::Error)]
 pub enum TokenError {
     #[error("the node token record does not parse: {0}")]
-    Invalid(#[from] serde_json::Error),
+    Invalid(JsonFault),
     #[error(
         "the node token is not 1 to {MAX_TOKEN_BYTES} bytes of bearer token text (A-Z a-z 0-9 - . _ ~ + / and trailing =)"
     )]
@@ -51,7 +52,8 @@ impl NodeToken {
 
     /// Parses a record written by [`NodeToken::record`].
     pub fn parse(record: &str) -> Result<Self, TokenError> {
-        let parsed: Self = serde_json::from_str(record)?;
+        let parsed: Self =
+            serde_json::from_str(record).map_err(|e| TokenError::Invalid(e.into()))?;
         check_shape(&parsed.token)?;
         Ok(parsed)
     }
@@ -80,6 +82,8 @@ fn check_shape(token: &str) -> Result<(), TokenError> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::error::Category;
+
     use super::*;
 
     fn response(token: &str) -> EnrolResponse {
@@ -103,6 +107,59 @@ mod tests {
         let text = format!("{back:?}");
         assert!(!text.contains("tok-secret"), "{text}");
         assert!(text.contains("n1"));
+    }
+
+    /// serde's message quotes the value it choked on, which in a token
+    /// record may be the token itself.
+    #[test]
+    fn a_record_that_does_not_parse_is_not_echoed() {
+        for (record, category, diagnostic) in [
+            (
+                "\n\"SHOULD\\u002dNOT\\u002dLEAK\"",
+                Category::Data,
+                "missing or unexpected value at line 2 column 27",
+            ),
+            (
+                r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK","not_after":918273}"#,
+                Category::Data,
+                "missing or unexpected value at line 1 column 60",
+            ),
+            (
+                r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK","not_after":"SHOULD-NOT-LEAK"}"#,
+                Category::Data,
+                "missing or unexpected value at line 1 column 71",
+            ),
+            (
+                r#"{
+"node_id":"n1","token":"SHOULD-NOT-LEAK","not_after":"#,
+                Category::Eof,
+                "unexpected end of input at line 2 column 53",
+            ),
+            (
+                r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK",,}"#,
+                Category::Syntax,
+                "syntax error at line 1 column 43",
+            ),
+        ] {
+            let err = NodeToken::parse(record).unwrap_err();
+            let text = err.to_string();
+            assert_eq!(
+                text,
+                format!("the node token record does not parse: {diagnostic}")
+            );
+            let mut cause: Option<&dyn std::error::Error> = Some(&err);
+            while let Some(error) = cause {
+                for text in [error.to_string(), format!("{error:?}")] {
+                    assert!(!text.contains("SHOULD-NOT-LEAK"), "{text}");
+                    assert!(!text.contains("918273"), "{text}");
+                }
+                cause = error.source();
+            }
+            assert!(
+                matches!(err, TokenError::Invalid(fault) if fault.category == category),
+                "{record}: {text}"
+            );
+        }
     }
 
     #[test]

@@ -95,14 +95,16 @@ connections only ([limits](/reference/limits#limits)).
 
 A top-level `valid_until: <RFC 3339>` makes the loaded policy a lease.
 Until that instant the policy applies as written. From it, every request
-is denied with `terminal_rule: _expired` and reason `policy_expired`,
-before the rules and the addons run, and an open WebSocket relay stops at
-its next chunk or message. The check is a wall-clock comparison on each
-exchange against the host's clock, using the loaded policy's instant
-whichever policy the exchange began under: a reload that moves it later
-keeps open relays going, and one that moves it earlier stops them at their
-next chunk or message. The first exchange that finds the policy expired
-logs one `policy_expired` event; later ones are ordinary `_expired` denies.
+is denied with `terminal_rule: _expired` and reason `policy_expired`, and
+an open WebSocket relay stops at its next chunk or message. The lease is
+checked before the addons run and again before the rules, so a request an
+addon holds across the instant is denied when the addon forwards it, as a
+request sent after the instant is. Each check is a wall-clock comparison
+against the host's clock, using the loaded policy's instant whichever
+policy the exchange began under: a reload that moves it later keeps open
+relays going, and one that moves it earlier stops them at their next chunk
+or message. The first exchange that finds the policy expired logs one
+`policy_expired` event; later ones are ordinary `_expired` denies.
 
 An expired policy is a policy, not a fault. The listeners stay up,
 `/healthz` keeps answering `200` with `x-roxy-policy: expired` (`valid`
