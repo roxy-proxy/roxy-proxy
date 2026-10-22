@@ -11,10 +11,10 @@
 //! so the property is one-sided, request by request down the connection:
 //! - roxy accepts a request hyper rejects: a roxy bug;
 //! - both accept: method, request target (hyper's raw target through roxy's
-//!   `url` normalisation), the header list without the framing and
-//!   hop-by-hop fields (names lower-case, values OWS-trimmed, sorted by
-//!   name), the body bytes and the trailers agree, and both read on to the
-//!   next request or neither does;
+//!   `url` normalisation), the header list without the fields roxy consumes
+//!   (hop-by-hop, framing, `Host`, `Expect`; names lower-case, values
+//!   OWS-trimmed, sorted by name), the body bytes and the trailers agree,
+//!   and both read on to the next request or neither does;
 //! - hyper accepts and roxy rejects, or closes an HTTP/1.0 connection hyper
 //!   keeps alive: fine. The reason codes are counted and printed now and
 //!   then, never asserted on.
@@ -204,14 +204,10 @@ fn nominated(headers: &HeaderMap) -> Vec<String> {
         .collect()
 }
 
-/// The end-to-end fields as roxy keeps them: the reserved names (framing,
-/// routing, hop-by-hop) and the `Connection`-nominated ones dropped.
-fn fields<'a>(
-    iter: impl Iterator<Item = (&'a HeaderName, &'a HeaderValue)>,
-    nominated: &[String],
-) -> Fields {
+/// Every field of `iter` in the compared form. roxy's lists go through
+/// this as they are, so a reserved name roxy kept shows up as a mismatch.
+fn fields<'a>(iter: impl Iterator<Item = (&'a HeaderName, &'a HeaderValue)>) -> Fields {
     let mut out: Fields = iter
-        .filter(|(n, _)| !is_reserved(n.as_str()) && !nominated.iter().any(|t| t == n.as_str()))
         .map(|(n, v)| {
             let text = trim_ows(v.as_bytes())
                 .iter()
@@ -222,6 +218,18 @@ fn fields<'a>(
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
     out
+}
+
+/// hyper's header list as roxy would keep it: without the reserved names
+/// (hop-by-hop, framing, `host`, `expect`) and the fields `Connection`
+/// nominates.
+fn end_to_end(headers: &HeaderMap) -> Fields {
+    let nominated = nominated(headers);
+    fields(
+        headers.iter().filter(|(n, _)| {
+            !is_reserved(n.as_str()) && !nominated.iter().any(|t| t == n.as_str())
+        }),
+    )
 }
 
 fn url(scheme: Scheme, authority: &Authority, path: &Path, query: Option<&Query>) -> String {
@@ -299,23 +307,23 @@ fn roxy_msg(req: &CanonicalRequest, body: Buffered) -> Msg {
     Msg {
         method: req.method.as_str().to_owned(),
         target: req.url(),
-        headers: fields(req.headers.iter(), &[]),
+        headers: fields(req.headers.iter()),
         trailers: body
             .trailers
             .as_ref()
-            .map_or_else(Vec::new, |t| fields(t.iter(), &[])),
+            .map_or_else(Vec::new, |t| fields(t.iter())),
         body: body.data.to_vec(),
     }
 }
 
+/// Trailers are compared whole: roxy keeps every trailer field or refuses
+/// the request, so there is nothing to drop from hyper's.
 fn hyper_msg(parts: &Parts, body: Collected<Bytes>, role: &Role) -> Msg {
     Msg {
         method: parts.method.as_str().to_owned(),
         target: hyper_target(parts, role),
-        headers: fields(parts.headers.iter(), &nominated(&parts.headers)),
-        trailers: body
-            .trailers()
-            .map_or_else(Vec::new, |t| fields(t.iter(), &[])),
+        headers: end_to_end(&parts.headers),
+        trailers: body.trailers().map_or_else(Vec::new, |t| fields(t.iter())),
         body: body.to_bytes().to_vec(),
     }
 }
@@ -339,7 +347,7 @@ fn roxy_side(cfg: u8, role: &Role, wire: Bytes) -> Side<RoxyEnd> {
                         msgs.push(Msg {
                             method: "CONNECT".to_owned(),
                             target: authority.to_string(),
-                            headers: fields(headers.iter(), &[]),
+                            headers: fields(headers.iter()),
                             trailers: Vec::new(),
                             body: Vec::new(),
                         });
@@ -403,12 +411,16 @@ fn hyper_side(role: &Role, wire: Bytes) -> Side<HyperEnd> {
 }
 
 /// Why roxy refused what hyper accepted, by reason code, then roxy closing
-/// an HTTP/1.0 connection hyper kept alive, then the backtick leniency.
+/// a connection hyper kept alive (HTTP/1.0 with `Connection: keep-alive`),
+/// then the backtick leniency.
 static ROXY_ONLY: [AtomicU64; Reason::ALL.len() + 2] =
     [const { AtomicU64::new(0) }; Reason::ALL.len() + 2];
 const CLOSED: usize = Reason::ALL.len();
 const RAW_BACKTICK: usize = Reason::ALL.len() + 1;
 static EXECS: AtomicU64 = AtomicU64::new(0);
+/// Executions between reports: a few per minute at the target's speed, so
+/// the 60-second CI run shows the counters too.
+const REPORT_EVERY: u64 = 1 << 16;
 
 fn count(slot: usize) {
     ROXY_ONLY[slot].fetch_add(1, Ordering::Relaxed);
@@ -421,9 +433,9 @@ fn slot(reason: Reason) -> usize {
         .expect("every reason is in Reason::ALL")
 }
 
-/// Prints the counters once every 2^18 executions.
+/// Prints the counters once every `REPORT_EVERY` executions.
 fn report() {
-    if EXECS.fetch_add(1, Ordering::Relaxed) % (1 << 18) != (1 << 18) - 1 {
+    if EXECS.fetch_add(1, Ordering::Relaxed) % REPORT_EVERY != REPORT_EVERY - 1 {
         return;
     }
     let mut line = String::from("h1_hyper: hyper accepted, roxy did not:");
@@ -441,8 +453,8 @@ fn report() {
     eprintln!("{line}");
 }
 
-/// hyper's `Parse::Uri`: the only refusal a raw backtick in the path can
-/// earn, since every other target byte hyper refuses roxy refuses too.
+/// hyper's `Parse::Uri`. On a request roxy accepted it can only mean the
+/// raw backtick: every other target byte hyper refuses, roxy refuses too.
 fn refused_uri(e: &hyper::Error) -> bool {
     e.is_parse() && e.to_string() == "invalid URI"
 }
@@ -464,8 +476,7 @@ fn compare(roxy: &Side<RoxyEnd>, hyper: &Side<HyperEnd>, wire: &[u8]) {
                     );
                 }
                 HyperEnd::Done => panic!(
-                    "hyper stopped reading after request #{} and roxy read on:\n{r:#?}\n{}",
-                    i.saturating_sub(1),
+                    "hyper stopped reading before request #{i} and roxy read on:\n{r:#?}\n{}",
                     shown()
                 ),
             }
