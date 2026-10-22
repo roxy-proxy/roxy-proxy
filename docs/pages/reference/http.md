@@ -291,10 +291,10 @@ the others refuse for the same reason.
   `transfer-encoding`, `upgrade`, `proxy-connection`) reset the stream
   (RFC 9113 §8.2.2). `te` is accepted only as `trailers`.
 - `:path` goes through the same normaliser and `limits.max_url_bytes` cap
-  once the `h2` crate has accepted it: a raw space, backtick, `<` or `>` in
-  `:path` resets the stream before roxy sees it, with no `parse_error`
-  event. `:authority` must equal the CONNECT authority; a `host` header, if
-  present, must equal `:authority`.
+  once the `h2` crate has accepted it: a raw space, `<` or `>` in `:path`,
+  or a raw backtick in its path component, resets the stream before roxy
+  sees it, with no `parse_error` event. `:authority` must equal the CONNECT
+  authority; a `host` header, if present, must equal `:authority`.
 - `limits.h2_max_concurrent_streams` and `limits.h2_max_header_list_bytes`
   cap streams per connection and header bytes per stream.
   CONTINUATION-flood and rapid-reset defences come from the `h2` crate.
@@ -306,11 +306,9 @@ the others refuse for the same reason.
 Applied to the request target, for matching and forwarding alike.
 
 1. The path starts with `/` and contains `pchar` and `/`, with well-formed
-   percent-encodings. `[ ] { } | ^` and `` ` `` are percent-encoded rather
-   than rejected (`/a|b` becomes `/a%7Cb`). Space, control bytes, `"`,
-   `<`, `>`, `\` and non-ASCII are rejected. A raw backtick in the path is
-   the one request-target byte roxy accepts and hyper's HTTP/1.1 parser
-   refuses; everywhere else roxy is the stricter of the two.
+   percent-encodings. `[ ] { } | ^` are percent-encoded rather than
+   rejected (`/a|b` becomes `/a%7Cb`). Space, control bytes, `"`,
+   `<`, `>`, `\`, a raw backtick and non-ASCII are rejected.
 2. Percent-encoded unreserved characters (`A–Z a–z 0–9 - . _ ~`) are
    decoded; other encodings stay (`%2F` stays `%2F`).
 3. Hex digits in the remaining encodings are upper-cased.

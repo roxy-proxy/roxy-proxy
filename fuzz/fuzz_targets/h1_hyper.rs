@@ -18,9 +18,6 @@
 //! - hyper accepts and roxy rejects, or closes an HTTP/1.0 connection hyper
 //!   keeps alive: fine. The reason codes are counted and printed now and
 //!   then, never asserted on.
-//!
-//! The one roxy leniency the property does not claim: a raw backtick in the
-//! path, which roxy percent-encodes and hyper's URI parser refuses.
 #![no_main]
 
 use std::cell::RefCell;
@@ -49,7 +46,7 @@ use roxy_http::url::{
 };
 use roxy_http::{
     Authority, Buffered, CanonicalRequest, CanonicalResponse, DriveError, Path, Query, Reason,
-    Scheme, is_reserved,
+    Scheme, Version, is_reserved,
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -169,7 +166,7 @@ enum RoxyEnd {
     /// EOF between requests.
     Eof,
     /// Closed after a request: `Connection: close`, or HTTP/1.0.
-    Closed,
+    Closed(Version),
     /// A CONNECT, which hands the connection over to the tunnel.
     Connect,
     Rejected(Reason),
@@ -367,7 +364,7 @@ fn roxy_side(cfg: u8, role: &Role, wire: Bytes) -> Side<RoxyEnd> {
                     .await
                     .unwrap_or_else(|e| panic!("write to the in-memory wire failed: {e}"));
                 if conn.is_closed() {
-                    return RoxyEnd::Closed;
+                    return RoxyEnd::Closed(req.meta.version);
                 }
             }
         })
@@ -411,12 +408,10 @@ fn hyper_side(role: &Role, wire: Bytes) -> Side<HyperEnd> {
 }
 
 /// Why roxy refused what hyper accepted, by reason code, then roxy closing
-/// a connection hyper kept alive (HTTP/1.0 with `Connection: keep-alive`),
-/// then the backtick leniency.
-static ROXY_ONLY: [AtomicU64; Reason::ALL.len() + 2] =
-    [const { AtomicU64::new(0) }; Reason::ALL.len() + 2];
+/// a connection hyper kept alive (HTTP/1.0 with `Connection: keep-alive`).
+static ROXY_ONLY: [AtomicU64; Reason::ALL.len() + 1] =
+    [const { AtomicU64::new(0) }; Reason::ALL.len() + 1];
 const CLOSED: usize = Reason::ALL.len();
-const RAW_BACKTICK: usize = Reason::ALL.len() + 1;
 static EXECS: AtomicU64 = AtomicU64::new(0);
 /// Executions between reports: a few per minute at the target's speed, so
 /// the 60-second CI run shows the counters too.
@@ -444,7 +439,6 @@ fn report() {
         if n > 0 {
             let what = match i {
                 CLOSED => "closed",
-                RAW_BACKTICK => "raw_backtick",
                 _ => Reason::ALL[i].as_str(),
             };
             let _ = write!(line, " {what}={n}");
@@ -453,23 +447,12 @@ fn report() {
     eprintln!("{line}");
 }
 
-/// hyper's `Parse::Uri`. On a request roxy accepted it can only mean the
-/// raw backtick: every other target byte hyper refuses, roxy refuses too.
-fn refused_uri(e: &hyper::Error) -> bool {
-    e.is_parse() && e.to_string() == "invalid URI"
-}
-
 fn compare(roxy: &Side<RoxyEnd>, hyper: &Side<HyperEnd>, wire: &[u8]) {
     let shown = || String::from_utf8_lossy(wire);
     for (i, r) in roxy.msgs.iter().enumerate() {
         let Some(h) = hyper.msgs.get(i) else {
             match &hyper.end {
                 HyperEnd::Rejected(e) | HyperEnd::BodyRejected(e) => {
-                    let path = r.target.split('?').next().unwrap_or_default();
-                    if refused_uri(e) && path.contains("%60") {
-                        count(RAW_BACKTICK);
-                        return;
-                    }
                     panic!(
                         "roxy accepted request #{i}, hyper rejected it ({e}):\n{r:#?}\n{}",
                         shown()
@@ -491,8 +474,8 @@ fn compare(roxy: &Side<RoxyEnd>, hyper: &Side<HyperEnd>, wire: &[u8]) {
     if hyper.msgs.len() > roxy.msgs.len() {
         match roxy.end {
             RoxyEnd::Rejected(reason) => count(slot(reason)),
-            RoxyEnd::Closed => count(CLOSED),
-            RoxyEnd::Eof | RoxyEnd::Connect => panic!(
+            RoxyEnd::Closed(Version::H1_0) => count(CLOSED),
+            RoxyEnd::Closed(_) | RoxyEnd::Eof | RoxyEnd::Connect => panic!(
                 "roxy ended the connection where hyper parsed request #{}:\n{}",
                 roxy.msgs.len(),
                 shown()

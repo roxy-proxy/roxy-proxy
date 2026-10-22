@@ -44,10 +44,8 @@ pub(crate) const fn is_pchar_literal(b: u8) -> bool {
     is_unreserved(b) || is_sub_delim(b) || matches!(b, b':' | b'@')
 }
 
-/// Visible ASCII outside `pchar` that mainstream clients send raw in paths
-/// and queries (the WHATWG URL serialiser leaves them unencoded; Go and curl
-/// send them verbatim). roxy percent-encodes these rather than rejecting the
-/// request.
+/// Visible ASCII outside `pchar` that roxy can percent-encode when sent raw.
+/// The path normaliser excludes the backtick; the query normaliser accepts it.
 pub(crate) const fn is_url_encodable(b: u8) -> bool {
     matches!(b, b'[' | b']' | b'^' | b'`' | b'{' | b'|' | b'}')
 }

@@ -9,6 +9,10 @@ come first. Each release's GitHub page lists every merged pull request.
 <details>
 <summary>Details</summary>
 
+### Breaking
+
+- HTTP/1 requests with raw backticks in the path are rejected with `invalid_path`; send `%60` instead. Raw backticks in queries are percent-encoded ([#582](https://github.com/roxy-proxy/roxy-proxy/pull/582)).
+
 ### Fixed
 
 - A request held across the policy's `valid_until`, by an addon or while its body is buffered for inspection, is denied `_expired` when it reaches the rules, as a request sent after the instant is ([#568](https://github.com/roxy-proxy/roxy-proxy/issues/568)).
