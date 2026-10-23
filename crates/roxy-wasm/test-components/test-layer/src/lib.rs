@@ -346,7 +346,15 @@ fn copy_ready(
         };
         let n = capacity.min(bytes.len());
         if n > 0 {
-            output.write(&bytes[..n]).expect("write");
+            // The reader can go between `check_write` and the write, as
+            // when the stack below refuses and drops the body.
+            match output.write(&bytes[..n]) {
+                Ok(()) => {}
+                Err(StreamError::Closed) => return false,
+                Err(StreamError::LastOperationFailed(e)) => {
+                    panic!("body write failed: {}", e.to_debug_string())
+                }
+            }
             bytes.drain(..n);
         }
     }
