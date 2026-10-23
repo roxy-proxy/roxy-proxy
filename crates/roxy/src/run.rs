@@ -153,6 +153,7 @@ pub fn build_capture(startup: &Startup) -> anyhow::Result<Option<Arc<CaptureLog>
     let opts = roxy_proxy::CaptureOptions {
         max_body_bytes: startup.max_capture_body_bytes.as_u64(),
         all: c.all,
+        format: c.format,
         writer: roxy_proxy::logging::WriterOptions {
             high_water: usize::try_from(c.high_water.as_u64()).unwrap_or(usize::MAX),
             ..roxy_proxy::logging::WriterOptions::default()
@@ -165,7 +166,12 @@ pub fn build_capture(startup: &Startup) -> anyhow::Result<Option<Arc<CaptureLog>
     };
     let log = CaptureLog::open(dir, opts)
         .with_context(|| format!("opening the capture log in {}", dir.display()))?;
-    tracing::info!(path = %log.path().display(), all = c.all, "capturing traffic");
+    tracing::info!(
+        path = %log.path().display(),
+        format = c.format.as_str(),
+        all = c.all,
+        "capturing traffic"
+    );
     Ok(Some(Arc::new(log)))
 }
 

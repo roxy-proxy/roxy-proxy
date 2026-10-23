@@ -797,10 +797,13 @@ impl Default for FlowLog {
 pub struct CaptureLog {
     /// Capture every forwarded exchange, both directions.
     pub all: bool,
+    /// How records are laid out: `rxc` (`capture.rxc`) or `jsonl`
+    /// (`capture.jsonl`).
+    pub format: roxy_proxy::CaptureFormat,
     /// Unwritten capture bytes at which traffic is held back.
     #[serde(deserialize_with = "units::size")]
     pub high_water: ByteSize,
-    /// Rotate `capture.rxc` once it reaches this size; absent = never.
+    /// Rotate the capture file once it reaches this size; absent = never.
     #[serde(deserialize_with = "units::opt_size")]
     pub max_file_bytes: Option<ByteSize>,
     /// Keep at most this many rotated files; absent = keep all.
@@ -813,6 +816,7 @@ impl Default for CaptureLog {
     fn default() -> Self {
         Self {
             all: false,
+            format: roxy_proxy::CaptureFormat::default(),
             // Captured bodies are bulkier than events: a larger backlog
             // before traffic is held.
             high_water: ByteSize::b(64 << 20),

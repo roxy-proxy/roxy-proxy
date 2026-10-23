@@ -33,6 +33,42 @@ fn kinds(recs: &[&(Value, Vec<u8>)]) -> Vec<String> {
         .collect()
 }
 
+/// A `jsonl` capture carries the same exchange as `rxc`: an upload whose
+/// bytes include newlines comes back byte for byte from the base64 lines.
+#[tokio::test]
+async fn a_jsonl_capture_records_the_same_exchange() {
+    let kit = Kit::builder()
+        .capture_all()
+        .capture_format(crate::capture::CaptureFormat::Jsonl)
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+    let sent: Vec<u8> = (0..=255u8).cycle().take(64 * 1024).collect();
+    let req = c
+        .request("POST", "/echo", &[])
+        .body(roxy_http::Body::from_bytes(Bytes::from(sent.clone())))
+        .unwrap();
+    let a = c.start(req).await.unwrap().unwrap();
+    assert_eq!(a.status, 200, "{a:?}");
+    let ev = kit.request_event().await;
+    let flow = ev["flow"].as_str().unwrap();
+    let raw = std::fs::read(kit.capture.as_ref().unwrap().path()).unwrap();
+    assert!(
+        raw.split(|&b| b == b'\n')
+            .filter(|l| !l.is_empty())
+            .all(|l| serde_json::from_slice::<Value>(l).is_ok()),
+        "every line is one record"
+    );
+    let records = kit.captured();
+    let req = capture_of(&records, flow, "request");
+    let head: Value = serde_json::from_slice(&req[0].1).unwrap();
+    assert_eq!(head["method"], "POST");
+    assert_eq!(capture_body(&req), sent);
+    assert_eq!(req.last().unwrap().0["bytes"], sent.len());
+    let res = capture_of(&records, flow, "response");
+    assert_eq!(capture_body(&res), a.body.unwrap().to_vec());
+}
+
 /// `capture.all` tees every forwarded exchange: heads as forwarded and
 /// bodies byte for byte, here a chunked h1 upload and its response.
 #[tokio::test]
