@@ -152,7 +152,8 @@ json|pretty` and `--log-level` (or `RUST_LOG`).
 ## Capture
 
 roxy tees the heads and bodies of exchanges, exactly as forwarded, to
-`<capture_dir>/capture.rxc`: those an admission rule selects with `capture:
+`<capture_dir>/capture.rxc` (or `capture.jsonl`, see
+[Capture format](#capture-format)): those an admission rule selects with `capture:
 request | response | both`, or every forwarded exchange with
 `log.capture.all: true`. Capture is decided at admission and covers
 the exchange from its first byte; the taps sit after the in-flight rules
@@ -170,6 +171,7 @@ capture_dir: /var/lib/roxy/capture   # absent = capture disabled; restart to cha
 log:
   capture:
     all: false
+    format: rxc                      # rxc | jsonl; restart to change
     high_water: 64mb
     max_file_bytes: 1gb
     max_files: 20
@@ -183,7 +185,20 @@ settings given without it.
 
 ### Capture format
 
-A sequence of records, each one JSON header line, then `len` payload bytes,
+`log.capture.format` picks one of two layouts for the same records:
+
+| format | file | layout |
+|---|---|---|
+| `rxc` (default) | `capture.rxc` | a JSON header line, then `len` raw payload bytes, then `\n` |
+| `jsonl` | `capture.jsonl` | one JSON object per line, the payload inline |
+
+Rotated files are `<file>.<UTC>-<seq>` (plus `.gz` with `compress`), so the
+name tells a reader the format. `rxc` is the cheaper of the two to write
+and read. Use `jsonl` to ship captures with a line-oriented tool such as
+Vector or Fluent Bit: such a tool splits a file on newlines, which corrupts
+`rxc` payload bytes. Base64 makes `jsonl` bodies about a third larger.
+
+In `rxc`, each record is one JSON header line, then `len` payload bytes,
 then `\n`:
 
 ```text
@@ -200,3 +215,20 @@ hello
 | `dir` | `request` (client to upstream) or `response` |
 | `kind` | `head` (the canonical head as JSON, as forwarded), `data` (forwarded bytes), `truncated` (`limits.max_capture_body_bytes` reached for this direction; nothing more is captured; carries `cap`), or `end` (carries the total forwarded `bytes`, and `aborted: true` if the direction did not complete) |
 | `seq` | counts records per flow and direction |
+
+In `jsonl`, the same exchange is:
+
+```text
+{"flow":"01J9…","dir":"request","kind":"head","seq":0,"head":{"headers":[["content-type","application/json"]],"method":"POST","url":"https://api.example.com/v1/x"}}
+{"flow":"01J9…","dir":"request","kind":"data","seq":1,"data":"aGVsbG8="}
+{"flow":"01J9…","dir":"request","kind":"end","seq":2,"bytes":5}
+```
+
+The fields are the same apart from `len`, which `jsonl` does not have. A
+`head` record carries the head as a nested object under `head`, and a
+`data` record carries its bytes base64-encoded (standard alphabet, padded)
+under `data`. A `data` record holds at most 48 KiB of body, so a larger
+forwarded chunk spans several records with consecutive `seq`. A data line
+is therefore under 64 KiB plus about 100 bytes of fields. A head line is
+bounded by `limits.max_header_bytes`, plus JSON escaping. Set a shipper's
+line limit above both.
