@@ -608,7 +608,10 @@ async fn layers_carry_a_websocket_in_their_bodies() {
     }
 }
 
-#[tokio::test]
+/// The upstream closing ends the relay. The layers see the client's bytes
+/// end as they do when the client closes, so they end their own bodies and
+/// the client gets EOF before the drain deadline, not at it.
+#[tokio::test(start_paused = true)]
 async fn a_close_from_the_upstream_ends_a_websocket_through_layers() {
     let kit = stack(&named(&["a", "b"])).await;
     let (status, io) = kit
@@ -620,17 +623,21 @@ async fn a_close_from_the_upstream_ends_a_websocket_through_layers() {
     // The upstream has closed: the client sees EOF through both layers,
     // without closing first.
     let mut rest = Vec::new();
-    tokio::time::timeout(
+    let (read, took) = super::timed(tokio::time::timeout(
         std::time::Duration::from_secs(10),
         io.read_to_end(&mut rest),
-    )
-    .await
-    .expect("EOF in time")
-    .unwrap();
+    ))
+    .await;
+    read.expect("EOF in time").unwrap();
     assert!(rest.is_empty(), "{rest:?}");
+    assert!(
+        took < crate::exchange::CLOSE_TIMEOUT,
+        "the layers ended on their own, not at the drain deadline: {took:?}"
+    );
     drop(io);
     let ev = kit.request_event().await;
     assert_eq!(strs(&ev["addons"]), ["a", "b"], "{ev:#}");
+    no_layer_error(&kit);
 }
 
 /// The relay's end closes the client even when a layer keeps its bodies

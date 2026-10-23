@@ -397,6 +397,11 @@ impl Chain {
         self.tasks.wait().await;
     }
 
+    /// Every lane has been consumed or abandoned; drivers may still run.
+    pub(crate) async fn lanes_over(&self) {
+        self.over.cancelled().await;
+    }
+
     /// Track work that can still change the exchange or its record. The
     /// initial drivers are registered before publishing the first head;
     /// any child work is registered before its parent finishes.
