@@ -174,7 +174,8 @@ HTTP/1.1.
 ## Canonical request
 
 The client-facing HTTP/1.1 codec is roxy's own (on `httparse` for
-tokenising): ambiguities RFC 9112 lets a server resolve are rejected.
+tokenising): ambiguities RFC 9112 lets a server resolve are rejected
+([why roxy parses HTTP/1.1 itself](/reference/architecture#why-roxy-parses-http11-itself)).
 
 ```rust
 pub struct CanonicalRequest {
