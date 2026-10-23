@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use hyper_util::rt::TokioIo;
-use roxy_http::CanonicalResponse;
 use roxy_http::h1::ServerConn;
 use roxy_http::ws::frame::{self, Decoder, FrameError, Opcode, Peer, close};
 use roxy_http::ws::{WsKey, validate_no_extensions, validate_upgrade_response};
+use roxy_http::{CanonicalResponse, Limits};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_util::sync::CancellationToken;
 
@@ -163,10 +163,9 @@ pub(crate) async fn relay_websocket(
     let mut taps = std::mem::take(&mut cx.taps);
     let result = if cx.snap.policy.reads_ws() {
         relay_messages(
-            client,
+            (client, leftover),
             upstream,
-            leftover,
-            (idle, cx.snap.limits.max_ws_message_bytes),
+            &cx.snap.limits,
             &in_flight,
             taps,
             until,
@@ -626,10 +625,9 @@ struct Relayed {
 /// message breaks the protocol (both sides get its close code) or a rule
 /// stops the exchange (both sides get `1008`).
 async fn relay_messages(
-    client: impl Io,
+    (client, leftover): (impl Io, Vec<u8>),
     upstream: impl Io,
-    leftover: Vec<u8>,
-    (idle, max): (Duration, u64),
+    limits: &Limits,
     in_flight: &InFlight,
     PerDir {
         request: up_tap,
@@ -638,6 +636,7 @@ async fn relay_messages(
     until: Until,
     cancelled: &CancellationToken,
 ) -> Relayed {
+    let (idle, max) = (limits.idle_timeout, limits.max_ws_message_bytes);
     let base = Instant::now();
     let last = AtomicU64::new(0);
     let c2s = AtomicU64::new(0);
@@ -685,7 +684,7 @@ async fn relay_messages(
                 () = cancelled.cancelled() => break End::Broken,
                 () = in_flight.cancelled() => break End::Stopped,
             };
-            let over = (a_done && b_done) || (b_done && until == Until::UpstreamCloses);
+            let over = b_done && (a_done || until == Until::UpstreamCloses);
             match e {
                 End::Eof if !over => {}
                 e @ (End::Eof | End::Broken | End::Stopped | End::Idle | End::Protocol(_)) => {
