@@ -6,6 +6,7 @@
 //! stage owns the upstream relay. The transport connects the client socket
 //! to the first lane pair after writing `101`.
 
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +17,7 @@ use roxy_http::ws::WsKey;
 use roxy_http::{Body, BodyError, BodySender, CanonicalResponse};
 use roxy_wasm::LayerRequest;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio_util::sync::CancellationToken;
 
 use super::StackFlow;
 use super::chain::Chain;
@@ -53,7 +55,7 @@ pub(super) fn relay_io(st: &StackFlow, mut stream: Body, res: &mut CanonicalResp
     });
     let (tx, body) = Body::channel(u64::MAX, None);
     st.chain().spawn(async move {
-        reader_into(Vec::new(), &mut from_relay_r, tx).await;
+        reader_into(Vec::new(), &mut from_relay_r, tx, std::future::pending()).await;
     });
     res.body = body;
     Box::new(tokio::io::join(to_relay_r, from_relay_w))
@@ -123,15 +125,19 @@ impl WsClient {
         });
         let to_client = gated(self.to_client, self.sink);
         let chain = self.chain.clone();
+        let ended = CancellationToken::new();
+        let until = ended.clone().cancelled_owned();
         let client = SplicedClient {
             reader: self.chain.spawn(async move {
-                reader_into(leftover, &mut cr, self.client_tx).await;
+                reader_into(leftover, &mut cr, self.client_tx, until).await;
                 // A layer can stop consuming its request while holding
                 // its response open. Keep observing the actual transport
                 // after that directional stop, until the relay closes it.
                 let _ = tokio::io::copy(&mut cr, &mut tokio::io::sink()).await;
             }),
             writer: self.chain.spawn(body_to_writer(to_client, cw, chain)),
+            ended,
+            chain: self.chain,
         };
         let _ = self.start.send(client);
     }
@@ -195,20 +201,26 @@ impl AsyncWrite for ClientSocket {
 pub(crate) struct SplicedClient {
     reader: tokio::task::JoinHandle<()>,
     writer: tokio::task::JoinHandle<Option<BodyError>>,
+    /// Cancelled when the relay has ended: the client's bytes end for the
+    /// layers, as they do when the client closes.
+    ended: CancellationToken,
+    chain: Arc<Chain>,
 }
 
 impl SplicedClient {
-    /// Closes the client once the relay has ended: what the layers still
-    /// pass on toward it gets up to `drain` to arrive, then the socket is
-    /// dropped.
+    /// Closes the client once the relay has ended. The client's request
+    /// body ends for the layers, as it does when the client closes; what
+    /// they still pass on toward the client gets up to `drain` to arrive,
+    /// and the lanes that long to end on their own, before the socket is
+    /// dropped and whatever a layer still holds is torn down.
     pub(crate) async fn close(mut self, drain: std::time::Duration) -> Option<BodyError> {
+        let deadline = tokio::time::Instant::now() + drain;
+        self.ended.cancel();
         // Return a failed response body to the core for final attribution.
         // Socket failure has already reported client loss to the chain.
-        tokio::time::timeout(drain, &mut self.writer)
-            .await
-            .ok()
-            .and_then(Result::ok)
-            .flatten()
+        let drained = tokio::time::timeout_at(deadline, &mut self.writer).await;
+        let _ = tokio::time::timeout_at(deadline, self.chain.lanes_over()).await;
+        drained.ok().and_then(Result::ok).flatten()
     }
 }
 
@@ -296,15 +308,26 @@ async fn copy_body(
 }
 
 /// Sends `first`, then what `r` yields, into `tx`; ends the body with the
-/// reader.
-async fn reader_into(first: Vec<u8>, r: &mut (impl AsyncRead + Unpin), mut tx: BodySender) {
+/// reader, or cleanly when `until` resolves first.
+async fn reader_into(
+    first: Vec<u8>,
+    r: &mut (impl AsyncRead + Unpin),
+    mut tx: BodySender,
+    until: impl Future<Output = ()>,
+) {
     use tokio::io::AsyncReadExt as _;
     if !first.is_empty() && tx.send_data(Bytes::from(first)).await.is_err() {
         return;
     }
     let mut buf = vec![0u8; 16 * 1024];
+    tokio::pin!(until);
     loop {
-        match r.read(&mut buf).await {
+        let read = tokio::select! {
+            biased;
+            () = &mut until => Ok(0),
+            read = r.read(&mut buf) => read,
+        };
+        match read {
             Ok(0) => {
                 let _ = tx.finish().await;
                 return;

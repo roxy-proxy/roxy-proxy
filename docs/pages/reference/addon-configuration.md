@@ -354,9 +354,10 @@ its handler lives on relaying the direction it is in.
   an interactive protocol.
 - The layer's head deadline does not limit the relayed bodies. The relay
   ends when the upstream closes or on the relay's idle timeout, whatever
-  the layers still hold of their bodies. roxy then closes the client's
-  connection whether or not the layers have ended their bodies; bytes
-  already on their way get a second to arrive.
+  the layers still hold of their bodies. The request body then ends for
+  the layers, as it does when the client closes, and bytes already on
+  their way to the client get a second to arrive; roxy then closes the
+  client's connection whether or not the layers have ended their bodies.
 
 ### Failure
 
