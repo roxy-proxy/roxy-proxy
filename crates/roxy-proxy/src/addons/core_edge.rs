@@ -166,7 +166,18 @@ async fn relay_upgrade(
         crate::exchange::close_upstream_ws(upstream).await;
         return;
     };
-    crate::exchange::relay_websocket(lease.cx(), relay_io, upstream, Vec::new(), &torn_down).await;
+    // The relay ends with the upstream: the layers may carry the client's
+    // bytes for as long as the client sends, and the client sends until
+    // the relay's end closes its socket.
+    crate::exchange::relay_websocket(
+        lease.cx(),
+        relay_io,
+        upstream,
+        Vec::new(),
+        crate::exchange::Until::UpstreamCloses,
+        &torn_down,
+    )
+    .await;
     // Let a close frame traverse the response lanes before cancelling
     // layers that keep their bodies open after the relay ends.
     if let Some(error) = client.close(crate::exchange::CLOSE_TIMEOUT).await {

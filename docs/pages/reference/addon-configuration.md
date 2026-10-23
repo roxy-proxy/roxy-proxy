@@ -352,10 +352,11 @@ its handler lives on relaying the direction it is in.
   the client closes, while the response streams all along (the
   `roxy-addon` SDK does this). Holding bytes back until more arrive stalls
   an interactive protocol.
-- The layer's head deadline does not limit the relayed bodies; the relay's
-  idle timeout still applies. When the relay ends, roxy closes the
-  client's connection whether or not the layers have ended their bodies;
-  bytes already on their way get a second to arrive.
+- The layer's head deadline does not limit the relayed bodies. The relay
+  ends when the upstream closes or on the relay's idle timeout, whatever
+  the layers still hold of their bodies. roxy then closes the client's
+  connection whether or not the layers have ended their bodies; bytes
+  already on their way get a second to arrive.
 
 ### Failure
 

@@ -633,24 +633,20 @@ async fn a_close_from_the_upstream_ends_a_websocket_through_layers() {
 }
 
 /// The relay's end closes the client even when a layer keeps its bodies
-/// open (`x-hold`): the socket is roxy's, not the layer's.
+/// open (`x-hold`): the socket is roxy's, not the layer's, and the
+/// upstream's close ends the relay without waiting for what the layers
+/// hold.
 #[tokio::test]
 async fn the_relay_ending_closes_the_client_whatever_the_layer_holds() {
-    let mut b = Kit::builder()
-        .rules(RULES)
-        .limits(|l| l.idle_timeout = std::time::Duration::from_millis(300));
-    for l in named(&["a", "b"]) {
-        b = b.addon(l);
-    }
-    let kit = b.start().await;
+    let kit = stack(&named(&["a", "b"])).await;
     let (status, io) = kit
         .websocket("/ws", &[("x-echo", "once"), ("x-hold", "1")])
         .await;
     assert_eq!(status, 101);
     let mut io = io.unwrap();
     assert_eq!(echo(&mut io, b"hello").await, b"hello");
-    // The upstream has closed and the relay ends on its idle timeout; the
-    // layers still hold their bodies, but the client sees EOF.
+    // The upstream has closed, which ends the relay; the layers still hold
+    // their bodies, but the client sees EOF.
     let mut rest = Vec::new();
     tokio::time::timeout(std::time::Duration::from_secs(5), io.read_to_end(&mut rest))
         .await
