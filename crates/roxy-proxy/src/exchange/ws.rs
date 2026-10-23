@@ -60,6 +60,21 @@ pub(crate) fn prepare_websocket(
     Ok(())
 }
 
+/// Whose close ends the relay, besides an idle timeout, an in-flight stop
+/// and a failure.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Until {
+    /// Both sides have closed: a client that has read the upstream's EOF
+    /// can still have bytes on their way to the upstream.
+    BothClose,
+    /// The upstream has closed. The client side is the layer stack's
+    /// bodies: a layer carries the client's bytes for as long as the
+    /// client sends, and the client sends until its socket closes, which
+    /// only the relay's end does, so waiting for that side would be
+    /// waiting for the idle timeout.
+    UpstreamCloses,
+}
+
 /// The direct path when no addons are configured.
 pub(super) async fn splice_websocket(
     conn: ServerConn<ClientIo>,
@@ -86,6 +101,7 @@ pub(super) async fn splice_websocket(
         Box::new(client),
         upgraded,
         leftover.to_vec(),
+        Until::BothClose,
         &CancellationToken::new(),
     )
     .await;
@@ -127,6 +143,7 @@ pub(crate) async fn relay_websocket(
     client: crate::io::BoxIo,
     upgraded: hyper::upgrade::Upgraded,
     leftover: Vec<u8>,
+    until: Until,
     cancelled: &CancellationToken,
 ) {
     cx.record.response_status = Some(101);
@@ -152,6 +169,7 @@ pub(crate) async fn relay_websocket(
             (idle, cx.snap.limits.max_ws_message_bytes),
             &in_flight,
             taps,
+            until,
             cancelled,
         )
         .await
@@ -175,7 +193,7 @@ pub(crate) async fn relay_websocket(
         match extra {
             Some(extra) => {
                 let (c2s, s2c, closed) =
-                    splice(client, upstream, idle, &in_flight, taps, cancelled).await;
+                    splice(client, upstream, idle, &in_flight, taps, until, cancelled).await;
                 Relayed {
                     c2s: c2s + extra,
                     s2c,
@@ -263,19 +281,20 @@ async fn pump<R, W>(
     let _ = w.shutdown().await;
 }
 
-/// Copies bytes both ways until either side closes, nothing moves for
-/// `idle` (then both sides get a `1001` close frame: after that long a
-/// silence no frame is half-written), or an in-flight rule stops the
-/// exchange (then both sides are dropped, i.e. closed: the relay is
-/// byte-level, so a close frame could land inside a half-written frame).
-/// Returns (client→server, server→client) byte counts and the close roxy
-/// sent, if any.
+/// Copies bytes both ways until the sides close (both, or the upstream:
+/// `until`), nothing moves for `idle` (then both sides get a `1001` close
+/// frame: after that long a silence no frame is half-written), or an
+/// in-flight rule stops the exchange (then both sides are dropped, i.e.
+/// closed: the relay is byte-level, so a close frame could land inside a
+/// half-written frame). Returns (client→server, server→client) byte
+/// counts and the close roxy sent, if any.
 async fn splice(
     client: impl Io,
     upstream: impl Io,
     idle: Duration,
     in_flight: &InFlight,
     taps: PerDir<Option<Tap>>,
+    until: Until,
     cancelled: &CancellationToken,
 ) -> (u64, u64, Option<FrameError>) {
     use std::sync::atomic::AtomicU64;
@@ -315,7 +334,7 @@ async fn splice(
     );
     let closed = tokio::select! {
         () = cancelled.cancelled() => None,
-        () = async { tokio::join!(a, b); } => None,
+        () = both_ways(a, b, until) => None,
         () = idle_watchdog(&last, base, idle) => {
             let mut to_up = FrameOut::new(&mut uw, Some(Masks::new()));
             let mut to_client = FrameOut::new(&mut cw, None);
@@ -332,6 +351,30 @@ async fn splice(
         s2c.load(Ordering::Relaxed),
         closed,
     )
+}
+
+/// Runs the two directions of a byte splice until the relay is over: both
+/// have ended, or the upstream's has and the relay ends with the upstream.
+async fn both_ways(
+    to_upstream: impl std::future::Future<Output = ()>,
+    to_client: impl std::future::Future<Output = ()>,
+    until: Until,
+) {
+    match until {
+        Until::BothClose => {
+            tokio::join!(to_upstream, to_client);
+        }
+        Until::UpstreamCloses => {
+            tokio::pin!(to_upstream, to_client);
+            let client_side_first = tokio::select! {
+                () = &mut to_upstream => true,
+                () = &mut to_client => false,
+            };
+            if client_side_first {
+                to_client.await;
+            }
+        }
+    }
 }
 
 /// The close both sides get when nothing has moved for `limits.idle_timeout`.
@@ -578,10 +621,10 @@ struct Relayed {
 /// The message relay: each direction is
 /// decoded into whole messages, each message is checked by the rules
 /// reading `ws.*` and then re-encoded as one frame, masked with roxy's own
-/// key toward the upstream. Runs until both sides close, nothing moves for
-/// `idle` (both sides get `1001`), a message breaks the protocol (both
-/// sides get its close code) or a rule stops the exchange (both sides get
-/// `1008`).
+/// key toward the upstream. Runs until the sides close (both, or the
+/// upstream: `until`), nothing moves for `idle` (both sides get `1001`), a
+/// message breaks the protocol (both sides get its close code) or a rule
+/// stops the exchange (both sides get `1008`).
 async fn relay_messages(
     client: impl Io,
     upstream: impl Io,
@@ -592,6 +635,7 @@ async fn relay_messages(
         request: up_tap,
         response: down_tap,
     }: PerDir<Option<Tap>>,
+    until: Until,
     cancelled: &CancellationToken,
 ) -> Relayed {
     let base = Instant::now();
@@ -641,8 +685,9 @@ async fn relay_messages(
                 () = cancelled.cancelled() => break End::Broken,
                 () = in_flight.cancelled() => break End::Stopped,
             };
+            let over = (a_done && b_done) || (b_done && until == Until::UpstreamCloses);
             match e {
-                End::Eof if !(a_done && b_done) => {}
+                End::Eof if !over => {}
                 e @ (End::Eof | End::Broken | End::Stopped | End::Idle | End::Protocol(_)) => {
                     break e;
                 }
