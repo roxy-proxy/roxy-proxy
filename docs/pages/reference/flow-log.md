@@ -153,7 +153,7 @@ json|pretty` and `--log-level` (or `RUST_LOG`).
 
 roxy tees the heads and bodies of exchanges, exactly as forwarded, to
 `<capture_dir>/capture.rxc` (or `capture.jsonl`, see
-[Capture format](#capture-format)): those an admission rule selects with `capture:
+[Capture format](/reference/flow-log#capture-format)): those an admission rule selects with `capture:
 request | response | both`, or every forwarded exchange with
 `log.capture.all: true`. Capture is decided at admission and covers
 the exchange from its first byte; the taps sit after the in-flight rules
