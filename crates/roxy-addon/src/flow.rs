@@ -1,7 +1,9 @@
 //! The current flow and roxy's host services.
 //!
 //! Each function names the capability it needs. Calling one the layer was
-//! not granted in roxy's config traps, failing the exchange closed.
+//! not granted in roxy's config traps, failing the layer (`layer_error`,
+//! kind `capability:<name>`): from an enforce layer the exchange fails
+//! closed with it; from an observer the exchange goes on.
 
 use std::time::Duration;
 
@@ -25,7 +27,8 @@ pub fn principal_key() -> String {
 
 /// Tags the flow: the rules' `tag[..]` and the layers' `when` that run
 /// after this call read it, as do `current` and the flow log. Enforce
-/// layers only: from an observer the call fails the exchange.
+/// layers only: from an observer the call fails the layer (`layer_error`,
+/// kind `host`) and the exchange goes on.
 pub fn add_tag(tag: &str) {
     raw::add_tag(tag);
 }
@@ -58,7 +61,8 @@ pub fn state_get(key: &str) -> Option<String> {
 /// store's default. A rule matches the value as written, so `yes` for
 /// `state["k"] == "yes"`. Fails when the key or value is too long. A full
 /// store fails the exchange, as it does a rule's `set_state`; nothing is
-/// evicted. Only an enforce layer may write.
+/// evicted. Only an enforce layer may write: from an observer the call
+/// fails the layer (`layer_error`, kind `host`) and the exchange goes on.
 pub fn state_put(key: &str, value: &str, ttl: Option<Duration>) -> Result<(), String> {
     raw::state_put(key, value, ttl_ms(ttl))
 }
@@ -75,6 +79,8 @@ pub fn metric_get(id: &str) -> Option<i64> {
 /// exchange from here on, this one included, is refused until an operator
 /// or the control plane lifts it. For what a layer is sure must stop the
 /// workload, not for one bad request, which `respond` refuses on its own.
+/// Only an enforce layer may: from an observer the call fails the layer
+/// (`layer_error`, kind `host`) and the exchange goes on.
 pub fn quarantine() {
     raw::quarantine();
 }

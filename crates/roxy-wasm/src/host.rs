@@ -74,10 +74,12 @@ pub enum LogLevel {
     Error,
 }
 
-/// A host service failed in a way that must fail the exchange closed (a
+/// A host service failed in a way that must fail the layer closed (a
 /// policy input is unavailable, the request passed to `next` does not
 /// validate, the flow log cannot accept a record, ...). The guest traps
-/// and the exchange ends with [`crate::LayerError::Host`].
+/// and the layer fails with [`crate::LayerError::Host`]: from an enforce
+/// layer the exchange fails with it; from an observer the exchange goes
+/// on.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
 pub struct HostError(pub String);
@@ -89,7 +91,9 @@ impl HostError {
     }
 }
 
-/// Why `flow.add-tag` was refused. Either fails the exchange closed.
+/// Why `flow.add-tag` was refused. Either fails the layer closed: from an
+/// enforce layer the exchange fails with it; from an observer
+/// (`layer_error`, kind `host`) the exchange goes on.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum TagError {
     /// The flow holds as many tags, or as many bytes of them, as the host
@@ -191,10 +195,11 @@ pub trait LayerHost: Send + Sync + 'static {
     /// Tag the flow: for the rules' `tag[..]` and the layers' `when` that
     /// run after this call, for `flow_info`, and for the flow log. Needs no
     /// capability, but only an enforcing layer may tag: `Err` from an
-    /// observer fails its exchange closed, as a call without its capability
-    /// would. The host caps a flow's tags, in number and in bytes, the
-    /// rules' tags counted; [`TagError::Full`] fails the exchange with
-    /// [`crate::Budget::Tags`].
+    /// observer fails the layer (`layer_error`, kind `host`) and the
+    /// exchange goes on, as a call without its capability does; only an
+    /// enforce layer's refusal fails the exchange. The host caps a flow's
+    /// tags, in number and in bytes, the rules' tags counted;
+    /// [`TagError::Full`] fails the exchange with [`crate::Budget::Tags`].
     fn add_tag(&self, tag: String) -> Result<(), TagError>;
 
     /// Write to the operational log (capability `log`).
@@ -210,7 +215,9 @@ pub trait LayerHost: Send + Sync + 'static {
 
     /// Write the state store (capability `state`). `Ok(Err(msg))` is a
     /// refusal of what the guest passed (key or value too long); `Err`
-    /// fails the exchange closed (a full store, an observer writing).
+    /// fails the layer closed: a full store fails the exchange, and an
+    /// observer writing fails the layer (`layer_error`, kind `host`) while
+    /// the exchange goes on.
     async fn state_put(
         &self,
         key: String,
@@ -222,7 +229,9 @@ pub trait LayerHost: Send + Sync + 'static {
     async fn metric_get(&self, id: String, key: Vec<String>) -> Result<Option<i64>, HostError>;
 
     /// Put the proxy into quarantine (capability `quarantine`). `Err`
-    /// fails the exchange closed (an observer calling it).
+    /// fails the layer closed: an observer calling it fails the layer
+    /// (`layer_error`, kind `host`) and the exchange goes on; only an
+    /// enforce layer's refusal fails the exchange.
     fn quarantine(&self) -> Result<(), HostError>;
 
     /// The exchange failed with `err`. Called once, before the failure can
