@@ -3364,17 +3364,15 @@ async fn a_head_only_layer_stays_out_of_a_websockets_bytes() {
 /// A layer subscribed to one body of an upgrade is in that direction's
 /// byte path and out of the other's: the bytes it is not subscribed to
 /// flow past it while its handler lives on with the socket, relaying the
-/// body it is subscribed to (`x-keep-request`, as the SDK does). The
-/// upper-casing tells the directions apart at the upstream: it sees
-/// upper case only when the layer is on the request side.
+/// body it is subscribed to, as the SDK does. The upper-casing tells the
+/// directions apart at the upstream: it sees upper case only when the
+/// layer is on the request side.
 #[tokio::test]
 async fn a_layer_subscribed_to_one_body_is_in_one_direction_of_a_websocket() {
     use crate::addons::Part;
     for (request, response) in [(Part::Full, Part::Head), (Part::Head, Part::Full)] {
         let kit = stack(&[AddonDef::test_layer("t").subscribe(request, response)]).await;
-        let (status, io) = kit
-            .websocket("/ws", &[("x-upper", "1"), ("x-keep-request", "1")])
-            .await;
+        let (status, io) = kit.websocket("/ws", &[("x-upper", "1")]).await;
         assert_eq!(status, 101, "{request:?}/{response:?}");
         let mut io = io.unwrap();
         for msg in [&b"hello"[..], b"again"] {
