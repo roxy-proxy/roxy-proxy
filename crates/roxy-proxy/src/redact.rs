@@ -155,15 +155,17 @@ impl Alarm {
 }
 
 /// A response body with secrets scrubbed from its data, its trailers, or
-/// both, as it streams. A secret can straddle two frames, so the last
-/// `longest secret - 1` bytes seen are held back until the next frame or
-/// the end shows whether they begin one. Nothing else is buffered.
+/// both, as it streams. A secret can straddle two frames, so bytes that
+/// end a frame and begin a secret (at most `longest secret - 1`) are held
+/// back until the next frame or the end shows whether the rest follows.
+/// Nothing else is buffered, so a stream of events is not delayed by them
+/// unless an event ends in what could start a secret.
 struct RedactedBody {
     inner: Body,
     secrets: Arc<Secrets>,
     /// `bodies` scrubs the data, `headers` the trailers.
     switches: ResponseRedaction,
-    /// How many unmatched bytes to hold back.
+    /// The most bytes ever held back: `longest secret - 1`.
     keep: usize,
     /// Bytes not yet released: a secret could begin in them.
     held: Vec<u8>,
@@ -216,7 +218,9 @@ impl RedactedBody {
         let mut cut = if end {
             buf.len()
         } else {
-            buf.len().saturating_sub(self.keep).max(from)
+            // A secret begun in `behind` may still be arriving: its rest
+            // waits too, to be dropped as a continuation.
+            (buf.len() - self.secrets.redactor().partial_suffix(&buf)).max(from)
         };
         if let Some(&(_, e)) = ranges.iter().find(|&&(s, e)| s < cut && e > cut) {
             cut = e;
@@ -408,6 +412,30 @@ mod tests {
         for chunk in [1, 7, input.len()] {
             assert_eq!(redact(&["sk-live-123"], input, chunk).await, input);
         }
+    }
+
+    /// A frame is held back only as far as its end could begin a secret,
+    /// so a stream of events is not delayed waiting for the next.
+    #[tokio::test]
+    async fn only_a_possible_secret_start_is_held_back() {
+        let (mut tx, body) = Body::channel(u64::MAX, None);
+        let mut body = RedactedBody::wrap(body, secrets(&["sk-live-123"]), ALL, quiet());
+        tx.send_data(Bytes::from_static(b"data: one\n\n"))
+            .await
+            .unwrap();
+        let f = body.frame().await.unwrap().unwrap();
+        assert_eq!(f.into_data().unwrap(), &b"data: one\n\n"[..]);
+        tx.send_data(Bytes::from_static(b"data: sk-li"))
+            .await
+            .unwrap();
+        let f = body.frame().await.unwrap().unwrap();
+        assert_eq!(f.into_data().unwrap(), &b"data: "[..]);
+        tx.send_data(Bytes::from_static(b"ve-123\n\n"))
+            .await
+            .unwrap();
+        tx.finish().await.unwrap();
+        let rest = body.collect().await.unwrap().to_bytes();
+        assert_eq!(rest, &b"[REDACTED]\n\n"[..]);
     }
 
     #[tokio::test]

@@ -55,10 +55,10 @@ http:
   by default.
 - **Headers:** every field value of the response head, a `101`'s
   included, and every trailer value. Names are left as they are.
-- **Bodies:** scrubbed as they stream. roxy holds back the last `longest
-  secret - 1` bytes of each chunk until the next shows whether a secret
-  straddles them; nothing else is buffered. The scrubbed body has no
-  declared length.
+- **Bodies:** scrubbed as they stream. A chunk that ends in what could be
+  the start of a secret has those bytes (at most `longest secret - 1`)
+  held back until the next chunk shows whether the rest follows; nothing
+  else is buffered or delayed. The scrubbed body has no declared length.
 - **Content codings:** with `bodies` on, an injecting request goes out
   without `accept-encoding`, so the upstream answers uncompressed. A
   response that is encoded anyway is decoded
@@ -71,7 +71,8 @@ http:
   part.
 - **Downstream of the upstream:** the scrubbing happens in the core, after
   the response rules. The in-flight rules on the response body, the
-  capture log, the addon layers and the client all see the scrubbed
+  capture log, the addon layers (given the decoded body whatever
+  `http.decode_for_addons` says) and the client all see the scrubbed
   response. The response rules, and `response.body.text`, see it as the
   upstream sent it.
 - **`quarantine: true`** quarantines the process when a scrubbed part held

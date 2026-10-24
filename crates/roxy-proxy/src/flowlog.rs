@@ -876,6 +876,22 @@ impl Redactor {
         merged
     }
 
+    /// The length of the longest suffix of `b` that is a proper prefix of
+    /// a registered secret: bytes that may begin a secret whose rest has
+    /// not arrived yet.
+    pub(crate) fn partial_suffix(&self, b: &[u8]) -> usize {
+        self.secrets
+            .iter()
+            .filter_map(|secret| {
+                let secret = secret.as_bytes();
+                (1..secret.len().min(b.len() + 1))
+                    .rev()
+                    .find(|&k| b.ends_with(&secret[..k]))
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The length of the longest registered secret; 0 with none.
     pub(crate) fn longest_secret(&self) -> usize {
         self.secrets.iter().map(String::len).max().unwrap_or(0)
