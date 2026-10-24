@@ -298,7 +298,7 @@ In the flow log:
 |---|---|
 | `addons` | the layers that ran, in stack order; a layer its `when` or `sample` skipped is not in it |
 | `rules`, `decision`, `terminal_rule` | the rules' decision on the request that left the stack; `req` is what the client sent. Metric keys (for the rules' samples and `metric-get`) also come from the request that left. A layer whose `next` returned the rules' `403` and then answered `200` itself is logged `decision: deny`, `res.status: 200` |
-| `decision: answered`, `terminal_rule: layer:<name>` | a layer answered itself, whatever its status: the layer nearest the client whose response lane upstream had no head when its own answer's head landed, decided then. A forward it kept reading the response of runs to its end, and the record keeps what the rules decided of it; one it stopped reading the response of is cancelled upstream, with `reason: upstream_aborted`; a forward it cut itself gets `reason: forward_aborted`. If a layer fails before publishing its answer, the generated refusal is the decision, `deny`, whatever a downstream layer makes of it. If it fails after its answer reaches the client, the answer remains recorded and its body is cut |
+| `decision: answered`, `terminal_rule: layer:<name>` | a layer answered itself, whatever its status: the layer nearest the client that put its answer's head on its lane before taking the head of the response from upstream, decided then. A forward it kept reading the response of runs to its end, and the record keeps what the rules decided of it; one it stopped reading the response of is cancelled upstream, and one it cut itself is cut there, both with `reason: layer_aborted`. If a layer fails before publishing its answer, the generated refusal is the decision, `deny`, whatever a downstream layer makes of it. If it fails after its answer reaches the client, the answer remains recorded and its body is cut |
 | `503`, `terminal_rule: layer:<name>`, `reason: layer_error` | a layer failed before the response head; the connection is closed and a `layer_error` event follows with `kind` one of `trap`, `budget:<limit>`, `capability:<name>`, `invalid_request`, `invalid_response`, `no_response`, `unsubscribed:<direction>`, ... After the head, the body is cut (HTTP/1.1 breaks the connection, HTTP/2 resets the stream) and `layer_error` follows. Which layer, if any, is one rule ([who is blamed](/design/addon-model#who-is-blamed)) |
 
 If a layer fails while handling a denial the core already made, its generated
@@ -383,8 +383,7 @@ its handler lives on relaying the direction it is in.
   statuses commit at the head, but their internal bodies must still finish
   within the body idle timeout. A streamed body is complete only through
   `finish`: dropped unfinished, it is cut where it
-  stopped, the layer's own doing (`reason: forward_aborted` or
-  `answer_aborted`), not a failure.
+  stopped, the layer's own doing (`reason: layer_aborted`), not a failure.
 * **A cut forward gets no response.** A request body passed to `next` that
   the guest drops without `finish` is cut at the upstream, and nothing
   comes back for it: `next` fails for the guest (`error.internal`), which
