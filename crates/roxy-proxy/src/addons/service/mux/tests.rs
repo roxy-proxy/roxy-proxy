@@ -542,7 +542,7 @@ async fn short_body_after_both_ends_is_a_protocol_fault() {
     assert!(body.collect_up_to(u64::MAX).await.is_err());
     tokio::task::yield_now().await;
     assert_eq!(service_fault(&stream).kind(), "service:protocol");
-    assert_eq!(stream.st.chain().abort_reason(), None);
+    assert!(!stream.st.cause().aborted);
 }
 
 #[tokio::test]
@@ -672,7 +672,7 @@ async fn a_lane_the_service_cuts_is_its_abort_not_its_fault() {
     assert!(req.collect_up_to(u64::MAX).await.is_err());
     assert!(!lock(&stream.state).ended(), "the answer is still owed");
     assert!(stream.st.attribution.fault().is_none(), "no fault");
-    assert_eq!(stream.st.chain().abort_reason(), Some("forward_aborted"));
+    assert!(stream.st.cause().aborted);
 }
 
 /// Trailers come once, after the body's bytes and before its end, and

@@ -6,7 +6,8 @@
 use roxy_http::{BodyError, Reason};
 
 use super::WriteFailure;
-use crate::addons::{Cancellation as StackCancellation, StackFlow};
+use crate::addons::StackFlow;
+use crate::addons::attribution::{Cause, Fault, LAYER_ABORTED};
 
 #[derive(Default)]
 pub(crate) struct Completion {
@@ -67,67 +68,62 @@ impl Completion {
     /// A written and a discarded response consult the same recorded fault.
     /// A fault recovered by a layer does not taint a successful response.
     pub(crate) fn response_reason(&self, stack: Option<&StackFlow>) -> Option<String> {
-        let failure = self.response.as_ref()?;
-        if matches!(failure, ResponseFailure::Body | ResponseFailure::Write)
-            && let Some(reason) = stack.and_then(StackFlow::fault_reason)
-        {
-            return Some(reason);
-        }
-        Some(
-            match failure {
-                ResponseFailure::Body => "response_body_failed",
-                ResponseFailure::Write => "response_write_failed",
-                ResponseFailure::Timeout => "response_body_timeout",
-                ResponseFailure::ClientGone => "client_gone",
-                ResponseFailure::ClientStalled => "client_stalled",
-                ResponseFailure::Request(reason) => reason.as_str(),
-            }
-            .to_owned(),
-        )
+        self.reason_from(stack.map(StackFlow::cause).as_ref(), true)
     }
 
-    /// Known body faults, deliberate lane aborts, observed cancellation,
-    /// response failures, upload deadlines, then provisional abandonment.
-    /// This ordering is independent of which adapter finished first.
+    /// The record's reason, once the exchange is over.
     pub(crate) fn reason(&self, stack: Option<&StackFlow>) -> Option<String> {
-        if matches!(
+        self.reason_from(stack.map(StackFlow::cause).as_ref(), false)
+    }
+
+    /// In order: a fault that cut the response, a layer's abort, observed
+    /// cancellation, the response's own failure, an upload deadline, then
+    /// upstream work nothing waited for. The order is independent of which
+    /// adapter finished first. `response_only` stops after the response's
+    /// failure.
+    fn reason_from(&self, stack: Option<&Cause>, response_only: bool) -> Option<String> {
+        let cut = matches!(
             self.response,
             Some(ResponseFailure::Body | ResponseFailure::Write)
-        ) && let Some(reason) = stack.and_then(StackFlow::fault_reason)
-        {
-            return Some(reason);
+        );
+        let fault = stack.and_then(|c| c.fault.as_ref()).filter(|_| cut);
+        let response = self.response.as_ref().map(|failure| match failure {
+            ResponseFailure::Body => "response_body_failed",
+            ResponseFailure::Write => "response_write_failed",
+            ResponseFailure::Timeout => "response_body_timeout",
+            ResponseFailure::ClientGone => "client_gone",
+            ResponseFailure::ClientStalled => "client_stalled",
+            ResponseFailure::Request(reason) => reason.as_str(),
+        });
+        if response_only {
+            return fault
+                .map(|f| f.reason().to_owned())
+                .or(response.map(str::to_owned));
         }
-        if let Some(reason) = stack.and_then(StackFlow::abort_reason) {
-            return Some(reason.to_owned());
-        }
-        if let Some(cancellation) = &self.cancellation {
-            return Some(
-                match cancellation {
-                    Cancellation::ClientGone => "client_gone",
-                    Cancellation::ClientStalled => "client_stalled",
-                    Cancellation::Request(reason) => reason.as_str(),
-                    Cancellation::Stopped => "in_flight_stopped",
-                    Cancellation::ResponseTimeout => "response_body_timeout",
-                    Cancellation::Stream => "h2_stream_error",
-                }
-                .to_owned(),
-            );
-        }
+        let aborted = stack.is_some_and(|c| c.aborted);
+        let cancelled = self.cancellation.as_ref().map(|c| match c {
+            Cancellation::ClientGone => "client_gone",
+            Cancellation::ClientStalled => "client_stalled",
+            Cancellation::Request(reason) => reason.as_str(),
+            Cancellation::Stopped => "in_flight_stopped",
+            Cancellation::ResponseTimeout => "response_body_timeout",
+            Cancellation::Stream => "h2_stream_error",
+        });
         // A flow-control timeout tears down with CLIENT_GONE too, but has
         // the more specific transport reason.
-        if matches!(self.response, Some(ResponseFailure::ClientStalled)) {
-            return self.response_reason(stack);
-        }
-        let cancellation = stack.and_then(StackFlow::cancellation);
-        if cancellation == Some(StackCancellation::ClientGone) {
-            return Some("client_gone".to_owned());
-        }
-        self.response_reason(stack)
-            .or_else(|| {
-                self.upload_timed_out
-                    .then(|| "upstream_body_timeout".to_owned())
-            })
-            .or_else(|| cancellation.map(|why| why.reason().to_owned()))
+        let stalled = matches!(self.response, Some(ResponseFailure::ClientStalled));
+        let client_gone = stack.is_some_and(|c| c.client_gone) && !stalled;
+        fault
+            .map(Fault::reason)
+            .or(aborted.then_some(LAYER_ABORTED))
+            .or(cancelled)
+            .or(client_gone.then_some("client_gone"))
+            .or(response)
+            .or(self.upload_timed_out.then_some("upstream_body_timeout"))
+            .or(stack
+                .is_some_and(|c| c.upstream_abandoned)
+                .then_some(LAYER_ABORTED))
+            .map(str::to_owned)
     }
 }
 

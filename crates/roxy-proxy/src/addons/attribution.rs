@@ -6,8 +6,13 @@
 //! where it enters the stack (before its error reaches a reader), the transport handler
 //! as it gives the exchange up (before the stack sees the drop). So the
 //! first fault recorded is the cause and every later one a consequence,
-//! and nothing weighs one against another: the recorder keeps the first
-//! and logs it, once, when it is a layer's.
+//! and nothing weighs one against another: the log keeps the first and
+//! logs it, once, when it is a layer's.
+//!
+//! The same goes for a cut: a lane an enforcing layer cuts is the layer's
+//! abort only when no fault and no client loss came before it, since a
+//! cut passing through a layer is how an earlier failure reaches the next
+//! stage.
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -52,9 +57,39 @@ impl Fault {
     }
 }
 
+/// What happened to the exchange that its record is made from.
+#[derive(Debug, Clone)]
+enum Event {
+    Fault(Fault),
+    /// An enforcing layer cut a lane it produces, with nothing earlier to
+    /// explain it.
+    Aborted,
+    /// The client edge saw the client go.
+    ClientGone,
+    /// The upstream work was cancelled because nothing waited for it.
+    UpstreamAbandoned,
+}
+
+/// The stack's part of the flow's record, derived from the log once the
+/// exchange is over.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Cause {
+    /// The first fault recorded.
+    pub(crate) fault: Option<Fault>,
+    /// A layer aborted a lane of its own accord.
+    pub(crate) aborted: bool,
+    pub(crate) client_gone: bool,
+    pub(crate) upstream_abandoned: bool,
+}
+
+/// The flow log's code for a layer's abort, and for upstream work it
+/// stopped waiting for.
+pub(crate) const LAYER_ABORTED: &str = "layer_aborted";
+
 #[derive(Default)]
 struct State {
-    fault: Option<Fault>,
+    /// In the order it happened.
+    events: Vec<Event>,
     /// The response head is on its way to the client: a layer's fault from
     /// now on is logged as it is recorded, since no answer carries it.
     head_out: bool,
@@ -78,7 +113,7 @@ impl Attribution {
     /// Records `fault` unless one stands already.
     pub(crate) fn record(&self, fault: Fault) {
         let mut s = super::lock(&self.state);
-        if s.fault.is_some() {
+        if s.fault().is_some() {
             return;
         }
         if s.head_out
@@ -87,7 +122,56 @@ impl Attribution {
             emit_stack_error(&self.meta, name, err, AddonMode::Enforce);
             s.logged = true;
         }
-        s.fault = Some(fault);
+        s.events.push(Event::Fault(fault));
+    }
+
+    /// An enforcing layer cut a lane it produces. Logged only when nothing
+    /// before it explains the cut.
+    pub(crate) fn aborted(&self) {
+        let mut s = super::lock(&self.state);
+        let explained = s
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::Fault(_) | Event::ClientGone | Event::Aborted));
+        if !explained {
+            s.events.push(Event::Aborted);
+        }
+    }
+
+    pub(crate) fn client_gone(&self) {
+        super::lock(&self.state).events.push(Event::ClientGone);
+    }
+
+    pub(crate) fn upstream_abandoned(&self) {
+        super::lock(&self.state)
+            .events
+            .push(Event::UpstreamAbandoned);
+    }
+
+    /// The client edge saw the client go.
+    pub(crate) fn is_client_gone(&self) -> bool {
+        super::lock(&self.state)
+            .events
+            .iter()
+            .any(|e| matches!(e, Event::ClientGone))
+    }
+
+    /// What the record is made from.
+    pub(crate) fn cause(&self) -> Cause {
+        let s = super::lock(&self.state);
+        let mut cause = Cause {
+            fault: s.fault().cloned(),
+            ..Cause::default()
+        };
+        for e in &s.events {
+            match e {
+                Event::Fault(_) => {}
+                Event::Aborted => cause.aborted = true,
+                Event::ClientGone => cause.client_gone = true,
+                Event::UpstreamAbandoned => cause.upstream_abandoned = true,
+            }
+        }
+        cause
     }
 
     /// The response head is going to the client. A layer's fault recorded
@@ -96,9 +180,9 @@ impl Attribution {
         let mut s = super::lock(&self.state);
         s.head_out = true;
         if !s.logged
-            && let Some(Fault::Layer { name, err }) = &s.fault
+            && let Some(Fault::Layer { name, err }) = s.fault().cloned()
         {
-            emit_stack_error(&self.meta, name, err, AddonMode::Enforce);
+            emit_stack_error(&self.meta, &name, &err, AddonMode::Enforce);
             s.logged = true;
         }
     }
@@ -108,19 +192,28 @@ impl Attribution {
     pub(crate) fn log(&self) {
         let mut s = super::lock(&self.state);
         if !s.logged
-            && let Some(Fault::Layer { name, err }) = &s.fault
+            && let Some(Fault::Layer { name, err }) = s.fault().cloned()
         {
-            emit_stack_error(&self.meta, name, err, AddonMode::Enforce);
+            emit_stack_error(&self.meta, &name, &err, AddonMode::Enforce);
             s.logged = true;
         }
     }
 
     pub(crate) fn fault(&self) -> Option<Fault> {
-        super::lock(&self.state).fault.clone()
+        super::lock(&self.state).fault().cloned()
     }
 
     pub(crate) fn is_faulted(&self) -> bool {
-        super::lock(&self.state).fault.is_some()
+        super::lock(&self.state).fault().is_some()
+    }
+}
+
+impl State {
+    fn fault(&self) -> Option<&Fault> {
+        self.events.iter().find_map(|e| match e {
+            Event::Fault(f) => Some(f),
+            Event::Aborted | Event::ClientGone | Event::UpstreamAbandoned => None,
+        })
     }
 }
 
@@ -175,7 +268,7 @@ impl HttpBody for Attributed {
         // Errors observed after that are consequences of the client loss,
         // not a new parse/upstream fault. Any earlier fault still stands.
         if let Some(Err(e)) = &frame
-            && this.st.cancellation() != Some(super::Cancellation::ClientGone)
+            && !this.st.attribution.is_client_gone()
             && let Some(fault) = this.side.fault(&this.st, e)
         {
             this.st.attribution.record(fault);
@@ -297,6 +390,70 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A client's upload cut on its way through two enforcing layers is
+    /// the client's: neither layer is blamed, and neither aborted.
+    #[tokio::test]
+    async fn a_cut_passing_through_two_layers_blames_neither() {
+        use super::super::chain::Head;
+        let kit = crate::testkit::Kit::builder()
+            .addon(crate::testkit::AddonDef::test_layer("a"))
+            .addon(crate::testkit::AddonDef::test_layer("b"))
+            .start()
+            .await;
+        let (st, _cx, mut ends) = crate::addons::test_flow(&kit);
+        let mut b = ends.layers.pop().unwrap();
+        let a = ends.layers.pop().unwrap();
+        a.stage.enforcing();
+        b.stage.enforcing();
+        let (sender, source) = Body::channel(u64::MAX, None);
+        let upload = attributed(&st, Side::Client, source);
+        let head = || Head::Request(http::Request::new(()).into_parts().0);
+        a.req_out.whole(head(), upload);
+        let (_, through_a) = b.req_in.head().await.unwrap();
+        b.req_out.whole(head(), through_a);
+        let (_, at_core) = ends.core.req_in.head().await.unwrap();
+        sender.abort(BodyError::Incomplete);
+        assert!(at_core.collect().await.is_err());
+        let cause = st.cause();
+        assert!(matches!(cause.fault, Some(Fault::Client(_))), "{cause:?}");
+        assert!(!cause.aborted, "{cause:?}");
+        drop(a.req_in);
+    }
+
+    /// The four outcomes: a layer's fault names it, a layer's own cut is
+    /// its abort, the client's loss and the upstream's failure are theirs.
+    #[tokio::test]
+    async fn each_cause_is_its_own_and_the_first_stands() {
+        let kit = crate::testkit::Kit::builder()
+            .addon(crate::testkit::AddonDef::test_layer("a"))
+            .start()
+            .await;
+        let (st, _cx, _ends) = crate::addons::test_flow(&kit);
+        st.fail("a", roxy_wasm::LayerError::NoResponse);
+        st.attribution.aborted();
+        st.attribution.record(Fault::UpstreamBody);
+        let cause = st.cause();
+        assert!(matches!(cause.fault, Some(Fault::Layer { ref name, .. }) if name == "a"));
+        assert!(!cause.aborted, "a cut after a fault is its consequence");
+
+        let (st, _cx, _ends) = crate::addons::test_flow(&kit);
+        st.attribution.aborted();
+        st.attribution.record(Fault::UpstreamBody);
+        let cause = st.cause();
+        assert!(cause.aborted);
+        assert!(matches!(cause.fault, Some(Fault::UpstreamBody)));
+
+        let (st, _cx, _ends) = crate::addons::test_flow(&kit);
+        st.tear_down(crate::addons::CLIENT_GONE);
+        st.attribution.aborted();
+        let cause = st.cause();
+        assert!(cause.client_gone && !cause.aborted, "{cause:?}");
+
+        let (st, _cx, _ends) = crate::addons::test_flow(&kit);
+        st.attribution.record(Fault::UpstreamBody);
+        assert_eq!(st.fault_reason().as_deref(), Some("upstream_body_failed"));
     }
 
     #[tokio::test]

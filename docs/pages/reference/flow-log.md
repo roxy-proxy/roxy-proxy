@@ -46,9 +46,8 @@ produces a `request` event:
 | `layer:<name>` | `layer_error` |
 | an upstream failure | the `upstream_error` reason ([upstream](/reference/upstream#errors)) |
 | roxy could not finish the exchange (its connection ended, or the server stopped, mid-flight) | `aborted` |
-| an addon layer dropped the exchange after the rules had forwarded it | `upstream_aborted` |
 | the upload made no progress after the upstream returned its response head | `upstream_body_timeout` ([upload progress](/reference/limits#timeouts)) |
-| an addon layer cut a lane of its own: the request it was forwarding, or the response it was giving | `forward_aborted`, `answer_aborted` (unless another reason stands) |
+| an addon layer gave up part of the exchange: it cut the request it was forwarding or the response it was giving, or stopped reading the response to a forward the rules had let through | `layer_aborted` (unless another reason stands; a cut that follows a fault or the client's loss is that fault's or the client's) |
 | the client went away | `client_gone` |
 | the HTTP/2 stream failed during cleanup after the response was written, without a client reset or connection loss | `h2_stream_error` |
 | an HTTP/2 client stopped taking the response | `client_stalled` |
@@ -60,7 +59,8 @@ A client may reset an HTTP/2 stream after its response was fully written,
 while an upload or addon is still running. roxy cancels that remaining
 work and records `client_gone`, retaining the response status and decision.
 An earlier policy or validation reason takes precedence; the fallback
-`upstream_aborted` is replaced by this observed client cancellation.
+`layer_aborted` for a forward nothing waited for is replaced by this
+observed client cancellation.
 It emits no `response_error` for an already completed response.
 
 | event | when |

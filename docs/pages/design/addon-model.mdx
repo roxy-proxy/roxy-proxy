@@ -108,13 +108,14 @@ The lifecycle rules are:
   of grammar, a reset, an invalid head attributed to it, or no answer) has its fault recorded before it is cancelled. If its response
   lane has no head, roxy puts the corresponding HTTP error response there
   for the downstream layers to handle like any other response.
-- **A layer answered** if the response lane it consumes had no head when
-  it put its own head on the lane it produces, decided then and never
-  re-derived. The first fault recorded stands, and a layer's is logged
+- **A layer answered** if it put its head on the lane it produces before
+  it had taken the head of the response lane it consumes, decided then and
+  never re-derived. The first fault recorded stands, and a layer's is logged
   once.
 - **A layer cutting a lane it produces is an abort, not a fault**: the
-  record says `forward_aborted` or `answer_aborted`, and the consumer sees
-  an incomplete body. A headless response cut from an enforcing layer is
+  record says `layer_aborted`, and the consumer sees an incomplete body. A
+  cut that follows a fault or the client's loss is not an abort: it is how
+  that failure reaches the next stage. A headless response cut from an enforcing layer is
   still its `no_response` fault and generates a refusal.
 - **A producer's end does not acknowledge delivery.** Its queued frames
   still belong to the consumer until read or discarded. Trailers are held
@@ -266,8 +267,9 @@ someone else's failure is a consequence, never a second fault.
 Final reason selection happens after reclamation, from the facts gathered
 by the adapters. A policy or validation reason already in the record is
 preserved. Otherwise a known fault behind a failed response body takes
-precedence, followed by a deliberate lane abort, observed cancellation,
-a response failure, an upload deadline, and finally upstream abandonment.
+precedence, followed by a layer's abort, observed cancellation, a
+response failure, an upload deadline, and finally a forward nothing waited
+for (`layer_aborted` too).
 Writing and discarding a response body use the same fault attribution.
 A later drain failure does not turn an already-written HEAD or bodiless
 response into a failed wire write, and discarded bytes are not counted as
@@ -285,7 +287,7 @@ successfully completed response.
 - A client upload that breaks is the client's, as without a stack: the
   connection closes on the parse error before the head, the body is cut
   after it, and no `layer_error` is logged however many layers fail on the
-  cut body.
+  cut body. A layer that passes the cut body on has not aborted it.
 - An upstream response body that fails before any layer has answered with
   a head of its own is the upstream's: `502`, `reason: upstream_body_failed`.
   One that fails after that ends the response lane upstream of the layer
@@ -317,8 +319,9 @@ that stops reading the response (drops the pending response, or returns
 without reading it) has the upstream request cancelled; the forward's body
 is still the layer's to finish or cut. A layer that cuts a lane of its own
 (drops a body unfinished) has aborted it: nothing comes back for a cut
-forward, and the record says `forward_aborted` or `answer_aborted`; that
-is not a failure. A layer that fails is torn down, and everything upstream
+forward, and the record says `layer_aborted`; that is not a failure. A
+forward cancelled because the layer stopped reading its response is
+`layer_aborted` too. A layer that fails is torn down, and everything upstream
 of it with it. Once a layer is done with the client's upload, the rest of
 it is dropped rather than held for a reader that will never come.
 
