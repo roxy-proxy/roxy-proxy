@@ -542,6 +542,15 @@ impl Chain {
         self.settle_recorded(id, LaneState::Cut(why), abort);
     }
 
+    /// `id`'s consumer read an error from its body: the lane is cut
+    /// whoever the producer is, and it is the producer's abort only while
+    /// the producer still holds the lane (`abort`: the error is not the
+    /// fail-closed cut of a producer that failed).
+    fn read_cut(&self, id: LaneId, why: String, abort: bool) {
+        let abort = abort && !self.producer_closed(id) && self.enforcing(id.producer());
+        self.settle_recorded(id, LaneState::Cut(why), abort);
+    }
+
     /// `id`'s consumer lets go of it before the end.
     fn stop(&self, id: LaneId, why: &'static str) {
         if !self.settle(id, LaneState::Stopped) {
@@ -1040,7 +1049,7 @@ impl Reading {
     fn cut(&mut self, e: &BodyError) {
         if !self.done.swap(true, Ordering::AcqRel) {
             let abort = *e != BodyError::Stopped;
-            self.chain.cut(self.lane, e.to_string(), abort);
+            self.chain.read_cut(self.lane, e.to_string(), abort);
             self.consumed();
         }
     }
@@ -1143,6 +1152,8 @@ mod tests {
         aborts: Mutex<usize>,
         /// The generated failure response, if one can be sent.
         response: Option<(u16, &'static str)>,
+        /// Its body fails as it is read.
+        broken: bool,
         release: Option<CancellationToken>,
     }
 
@@ -1156,12 +1167,18 @@ mod tests {
             _layer: usize,
         ) -> BoxFuture<Option<(http::response::Parts, Body)>> {
             let configured = self.response;
+            let broken = self.broken;
             let release = self.release.clone();
             Box::pin(async move {
                 if let Some(release) = release {
                     release.cancelled().await;
                 }
                 let (status, body) = configured?;
+                if broken {
+                    let (sender, body) = Body::channel(u64::MAX, None);
+                    sender.abort(BodyError::Incomplete);
+                    return Some((response(status), body));
+                }
                 Some((response(status), Body::from_bytes(body)))
             })
         }
@@ -1819,6 +1836,27 @@ mod tests {
         assert_eq!(l1.stage.answered(), Some(true));
         assert_eq!(l2.stage.answered(), Some(true));
         assert_eq!(c.answered_by(), Some(0));
+    }
+
+    /// A refusal whose body fails as it is read still cuts its lane, so
+    /// the exchange completes, and the failed layer has not aborted it.
+    #[tokio::test]
+    async fn a_refusal_body_that_fails_still_cuts_its_lane() {
+        let record = Arc::new(Record {
+            response: Some((503, "failure")),
+            broken: true,
+            ..Record::default()
+        });
+        let (c, mut edge, mut layers, core) = Chain::new(1, record.clone());
+        let l1 = layers.pop().unwrap();
+        l1.stage.enforcing();
+        l1.stage.fail(LayerError::NoResponse);
+        let (_, body) = edge.res_in.head().await.unwrap();
+        assert!(body.collect().await.is_err());
+        assert!(matches!(c.state(res(0)), LaneState::Cut(_)));
+        assert_eq!(*lock(&record.aborts), 0);
+        drop((edge, l1, core));
+        settles(c.until_over()).await;
     }
 
     #[tokio::test]
