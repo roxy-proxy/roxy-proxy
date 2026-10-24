@@ -142,12 +142,9 @@ hop, nothing it produces moves a lane, and the exchange does not wait for
 it. A head-only layer puts its head on a lane and the body of the lane it
 consumes in the same direction goes on with it (for a response, only when
 the status is the same; otherwise the answer is the layer's own, whole).
-The bypassed body and the layer's own output have independent ends. Bytes
-flow without waiting for the layer's end, but lane completion and trailers
-wait for both. This is the same contract for WASM streams and service
-`request_end` / `response_end` messages, even when no bytes are visible to
-the layer or sent on the wire. A head-only service's response end is still
-subject to the response idle deadline after a HEAD or 204 answer.
+The layer's output for that direction is the head alone: it puts no body
+of its own on the lane, so the bypassed body is the whole of the body, and
+its end is the lane's.
 
 ## Request and response production are independent
 
