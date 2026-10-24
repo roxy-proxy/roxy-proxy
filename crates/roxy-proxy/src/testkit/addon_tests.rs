@@ -1953,10 +1953,10 @@ mod service {
         );
     }
 
-    /// A service subscribed to the heads only is sent each head with its
-    /// end and no bytes, is told so on `open`, and the bodies go through
-    /// it untouched; an observer so subscribed holds no copy, so one that
-    /// never reads is not lagging.
+    /// A service subscribed to the heads only is sent each head alone, is
+    /// told so on `open`, and the bodies go through it untouched; an
+    /// observer so subscribed holds no copy, so one that never reads is not
+    /// lagging.
     #[tokio::test]
     async fn a_head_only_service_gets_heads_and_the_bodies_bypass_it() {
         use crate::addons::Part;
@@ -2016,6 +2016,43 @@ mod service {
             .filter(|e| e["event"] == "observer_lagged")
             .collect();
         assert!(lagged.is_empty(), "{lagged:#?}");
+        no_layer_error(&kit);
+    }
+
+    /// A head-only service sees the head as a head-only WASM layer does:
+    /// the body's framing is roxy's, so no `content-length`, and the body
+    /// still arrives whole.
+    #[tokio::test]
+    async fn a_head_only_service_sees_no_content_length() {
+        use crate::addons::Part;
+        let kit = Kit::builder().rules(RULES).start().await;
+        reload(
+            &kit,
+            RULES,
+            &[],
+            vec![subscribed(
+                addon("s", "pass", AddonMode::Enforce, |_| {}),
+                Part::Head,
+                Part::Head,
+            )],
+        );
+        let a = kit.h1().await.call("POST", "/x", &[], b"hello").await;
+        assert_eq!(a.status, 200, "{a:?}");
+        assert_eq!(a.json()["body_len"], 5);
+        let opens = kit.upstream.service().until_opened(1).await;
+        let id = u32::try_from(opens[0]["stream"].as_u64().unwrap()).unwrap();
+        let controls = kit.upstream.service().controls(id);
+        for kind in ["request", "response"] {
+            let head = controls
+                .iter()
+                .find(|m| m["type"] == kind)
+                .unwrap_or_else(|| panic!("{kind} in {controls:#?}"));
+            let fields = head["headers"].as_array().unwrap();
+            assert!(
+                fields.iter().all(|f| f[0] != "content-length"),
+                "{kind}: {head:#}"
+            );
+        }
         no_layer_error(&kit);
     }
 

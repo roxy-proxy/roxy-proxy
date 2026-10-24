@@ -82,8 +82,7 @@ async fn lone_stream_on(
     let lanes = (mode == AddonMode::Enforce).then(|| Lanes {
         req: layer.req_out,
         res: layer.res_out,
-        held_request: Arc::default(),
-        held_response: Arc::default(),
+        bypassed: Arc::default(),
     });
     let stream = Arc::new(Stream {
         id: 1,
@@ -96,8 +95,7 @@ async fn lone_stream_on(
         ended: CancellationToken::new(),
         answered: CancellationToken::new(),
         stop_in: [CancellationToken::new(), CancellationToken::new()],
-        held_request: Arc::default(),
-        held_response: Arc::default(),
+        bypassed: Arc::default(),
         wire: Arc::default(),
         calls: Mutex::new(None),
         draining: Mutex::new(None),
@@ -151,11 +149,13 @@ async fn a_head_only_lane_is_the_head_over_the_bypassed_body() {
             let (mut bypass, body) = Body::channel(u64::MAX, None);
             match dir {
                 Dir::Request => {
-                    *lock(&stream.held_request) = Some(body);
+                    stream.bypassed.hold_request(&mut http::Request::new(body));
                     stream.control(request_head());
                 }
                 Dir::Response => {
-                    *lock(&stream.held_response) = Some((http::StatusCode::OK, body));
+                    stream
+                        .bypassed
+                        .hold_response(&mut http::Response::new(body));
                     stream.control(In::Response {
                         status: 200,
                         headers: Vec::new(),
@@ -447,7 +447,7 @@ async fn a_stopped_forward_upload_keeps_the_upstream_response_input() {
 async fn a_headless_forward_end_releases_the_held_upload_before_the_answer_ends() {
     let (stream, _around, _kit) = lone_stream().await;
     let (upload, body) = Body::channel(u64::MAX, None);
-    *lock(&stream.held_request) = Some(body);
+    stream.bypassed.hold_request(&mut http::Request::new(body));
     stream.control(In::Response {
         status: 200,
         headers: Vec::new(),

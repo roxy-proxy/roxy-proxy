@@ -6,13 +6,14 @@
 //! bypassed body, so the layer's head carries none of it; a layer that
 //! passes on bytes or trailers for it fails the exchange closed.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use http::StatusCode;
 use http_body_util::BodyExt;
 use roxy_http::Body;
 use roxy_wasm::LayerError;
 
-use super::StackFlow;
+use super::{StackFlow, lock};
 use crate::in_flight::Dir;
 
 /// How much of one direction of the exchange a layer sees.
@@ -60,6 +61,56 @@ impl Subscription {
 /// framing is roxy's, not the layer's to see or state.
 pub(super) fn head_only(headers: &mut http::HeaderMap) {
     headers.remove(http::header::CONTENT_LENGTH);
+}
+
+/// The bodies held back from one head-only layer on one exchange, to go on
+/// with the heads it passes on. Both kinds of layer use it, so the rules
+/// for what goes on with what are the same for each.
+#[derive(Default)]
+pub(crate) struct Bypassed {
+    request: Mutex<Option<Body>>,
+    /// With the status it came with.
+    response: Mutex<Option<(StatusCode, Body)>>,
+}
+
+impl Bypassed {
+    /// Holds the request body back; the layer gets the head alone.
+    pub(super) fn hold_request(&self, req: &mut http::Request<Body>) {
+        head_only(req.headers_mut());
+        *lock(&self.request) = Some(std::mem::take(req.body_mut()));
+    }
+
+    /// Holds the response body from upstream back; the layer gets the
+    /// head alone.
+    pub(super) fn hold_response(&self, res: &mut http::Response<Body>) {
+        head_only(res.headers_mut());
+        let body = std::mem::take(res.body_mut());
+        *lock(&self.response) = Some((res.status(), body));
+    }
+
+    /// The body to go on with the request head the layer forwards.
+    pub(super) fn request(&self) -> Body {
+        lock(&self.request).take().unwrap_or_default()
+    }
+
+    /// The body to go on with a response head of `status` the layer
+    /// passes on: the one from upstream when the status is the same.
+    /// `None` means the answer is the layer's own, and the body from
+    /// upstream is let go of.
+    pub(super) fn response(&self, status: StatusCode) -> Option<Body> {
+        match lock(&self.response).take() {
+            Some((s, body)) if s == status => Some(body),
+            _ => None,
+        }
+    }
+
+    /// Lets go of the body held for `dir`, if one still is.
+    pub(super) fn release(&self, dir: Dir) {
+        match dir {
+            Dir::Request => drop(lock(&self.request).take()),
+            Dir::Response => drop(lock(&self.response).take()),
+        }
+    }
 }
 
 /// Watches what a head-only layer gave for the body of `dir`, which is not

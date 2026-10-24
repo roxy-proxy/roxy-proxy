@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::super::super::chain::{Head, LaneBody, LaneTx};
 use super::super::super::host::StackHost;
+use super::super::super::subscribe::Bypassed;
 use super::super::super::{AddonMode, Part, StackError, StackFlow, emit_stack_error};
 use super::super::{Call, In, Out, ServiceError, ServiceSpec};
 use super::inbox::{Inbox, feeder};
@@ -38,11 +39,8 @@ pub(crate) const MAX_HOST_CALLS_WAITING: usize = 64;
 pub(crate) struct Lanes {
     pub(crate) req: LaneTx,
     pub(crate) res: LaneTx,
-    /// The request body, when the layer sees the request head only.
-    pub(crate) held_request: Arc<Mutex<Option<Body>>>,
-    /// The response body from upstream with its status, when the layer
-    /// sees the response head only.
-    pub(crate) held_response: Arc<Mutex<Option<(http::StatusCode, Body)>>>,
+    /// What a head-only direction holds back from the service.
+    pub(crate) bypassed: Arc<Bypassed>,
 }
 
 /// One exchange on a connection.
@@ -63,8 +61,7 @@ pub(crate) struct Stream {
     pub(super) stop_in: [CancellationToken; 2],
     /// The bodies roxy holds back for a head-only direction (see
     /// [`Lanes`]).
-    pub(super) held_request: Arc<Mutex<Option<Body>>>,
-    pub(super) held_response: Arc<Mutex<Option<(http::StatusCode, Body)>>>,
+    pub(super) bypassed: Arc<Bypassed>,
     pub(super) wire: Arc<Wire>,
     /// Host-service calls waiting for the stream's worker, once it has one.
     pub(super) calls: Mutex<Option<mpsc::Sender<Call>>>,
@@ -322,8 +319,8 @@ impl Stream {
         if lock(&self.calls).is_some() {
             *lock(&self.draining) = ending.slot.take();
         }
-        drop(lock(&self.held_request).take());
-        drop(lock(&self.held_response).take());
+        self.bypassed.release(Dir::Request);
+        self.bypassed.release(Dir::Response);
         self.ended.cancel();
         lock(&self.link.shared.streams).open.remove(&self.id);
         drop(ending.slot);
@@ -755,8 +752,7 @@ impl Stream {
                 if self.head_only(Dir::Request) {
                     // The head is the whole of what the service sends: the
                     // body it did not see goes on with it, and ends the lane.
-                    let bypassed = lock(&self.held_request).take().unwrap_or_default();
-                    out.whole(head, bypassed);
+                    out.whole(head, self.bypassed.request());
                     return Ok(());
                 }
                 // On an upgrade the forwarded body is the client's side of
@@ -788,11 +784,7 @@ impl Stream {
                     // service passed on, when that is the same response:
                     // the same status. A different status is an answer of
                     // the service's own, whole.
-                    let bypassed = lock(&self.held_response).take();
-                    let body = match bypassed {
-                        Some((s, body)) if s == status => body,
-                        _ => Body::empty(),
-                    };
+                    let body = self.bypassed.response(status).unwrap_or_default();
                     out.whole(head, body);
                     return Ok(());
                 }
@@ -837,10 +829,7 @@ impl Stream {
         let ended = lock(&self.state).end_lane(dir, self.head_only(dir))?;
         match ended {
             Ended::Headless(out) => {
-                match dir {
-                    Dir::Request => drop(lock(&self.held_request).take()),
-                    Dir::Response => drop(lock(&self.held_response).take()),
-                }
+                self.bypassed.release(dir);
                 if let Some(out) = out {
                     match error {
                         Some(why) => out.cut_headless(why),
@@ -1055,13 +1044,9 @@ pub(crate) async fn open(
         .get_or_try_init(|| dial(st, &addon.name, &svc.endpoint, spec))
         .await?
         .clone();
-    let held_request = lanes
+    let bypassed = lanes
         .as_ref()
-        .map(|l| l.held_request.clone())
-        .unwrap_or_default();
-    let held_response = lanes
-        .as_ref()
-        .map(|l| l.held_response.clone())
+        .map(|l| l.bypassed.clone())
         .unwrap_or_default();
     let stream = {
         let mut s = lock(&link.shared.streams);
@@ -1082,8 +1067,7 @@ pub(crate) async fn open(
             ended: CancellationToken::new(),
             answered: CancellationToken::new(),
             stop_in: [CancellationToken::new(), CancellationToken::new()],
-            held_request,
-            held_response,
+            bypassed,
             wire: Arc::default(),
             calls: Mutex::new(None),
             draining: Mutex::new(None),

@@ -151,15 +151,12 @@ async fn enter(
                 observer: None,
                 call: None,
                 answer: answer.clone(),
-                held_request: Mutex::new(None),
-                held_response: Mutex::new(None),
+                bypassed: subscribe::Bypassed::default(),
             };
             // A head-only layer gets the head with an empty body; the body
             // stays here, to go on with the head the layer passes on.
             if addon.subscribe.request == subscribe::Part::Head {
-                let body = std::mem::take(req.body_mut());
-                subscribe::head_only(req.headers_mut());
-                *lock(&host.held_request) = Some(body);
+                host.bypassed.hold_request(&mut req);
             }
             // The answer goes on its lane as the guest gives it; this
             // returns once the handler has returned.
