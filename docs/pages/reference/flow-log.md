@@ -201,7 +201,8 @@ Fluent Bit can take the file as it is. Rotated files are
 | `seq` | counts records per flow and direction |
 
 `data` is standard base64 with padding, which makes captured bodies about
-a third larger than the bytes forwarded. A `data` record holds at most
+a third larger than the bytes forwarded. `limits.max_capture_body_bytes`
+counts body bytes, before encoding. A `data` record holds at most
 48 KiB of body, so a larger forwarded chunk spans several records with
 consecutive `seq`, and a body is its `data` records joined in `seq` order.
 A data line is therefore under 64 KiB plus about 100 bytes of fields. A
