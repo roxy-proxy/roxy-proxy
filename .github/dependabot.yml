@@ -1,5 +1,11 @@
-# Weekly version updates. npm and Actions: minor and patch bumps arrive as one
-# grouped PR per ecosystem and majors get their own; cargo: see below.
+# Weekly version updates. pip, npm and Actions: minor and patch bumps arrive as
+# one grouped PR per ecosystem and majors get their own; cargo: see below.
+#
+# Every ecosystem waits before taking a new release: a hijacked or malicious
+# publish is usually caught and yanked within days, and the wait keeps it out
+# of a bump PR in the meantime. Security updates ignore the cooldown, so a
+# release that fixes a published advisory still arrives at once; a fix with no
+# advisory waits like any other release, or is bumped by hand.
 version: 2
 updates:
   - package-ecosystem: cargo
@@ -12,6 +18,9 @@ updates:
       - /fuzz
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
     open-pull-requests-limit: 5
     # One PR for every cargo bump across all four workspaces, majors
     # included: the nested lock files pin the root crates' dependencies
@@ -28,6 +37,9 @@ updates:
       - /examples/quickstart/sentinel
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
     open-pull-requests-limit: 5
     groups:
       pip-minor-patch:
@@ -36,6 +48,9 @@ updates:
     directory: /docs
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
+      semver-major-days: 14
     open-pull-requests-limit: 5
     groups:
       npm-minor-patch:
@@ -44,6 +59,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
     groups:
       actions-minor-patch:
