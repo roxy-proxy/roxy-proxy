@@ -25,7 +25,7 @@ Configuring addons is covered in
 
 ## The stack
 
-<img src={addonStack} alt="The stack, top to bottom: client, then CONNECT and TLS, the first addon listed, the second addon listed, the rules, the address floor, the connection to the origin, and the origin. The request runs down through every step and the response runs back up. The two addons are marked as the addons, in the order listed; the address floor and the connection to the origin always run, after the rules. A dotted line between the rules and the address floor marks where capture records what crosses, and a flow-log strip down the left is fed by every step." />
+<img src={addonStack} alt="The stack, top to bottom: client, then CONNECT and TLS, the first addon listed, the second addon listed, the rules, the address floor, the connection to the origin, and the origin. The request runs down through every step and the response runs back up. The two addons are marked as the addons, in the order listed; the address floor and the connection to the origin always run, after the rules. A dotted line between the rules and the address floor marks where capture records what the rules allow, and a flow-log strip down the left is fed by every step." />
 
 Addons run in the order they are listed under `addons:`, between the
 client and the rules. Nothing configurable runs between the rules and the

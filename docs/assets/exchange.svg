@@ -60,7 +60,7 @@
   <text x="104" y="141" fill="#0f766e" font-size="14" font-weight="600">request</text>
   <text x="696" y="224" fill="#5f6b68" font-size="14" font-weight="600" text-anchor="end">response</text>
 
-  <!-- capture: taps what crosses between the rules and the network -->
+  <!-- capture: records what the rules allow, before the address floor -->
   <path d="M 546 66 V 278" fill="none" stroke="#0f766e" stroke-width="1.5" stroke-dasharray="2 4"/>
   <text x="546" y="58" fill="#0f766e" font-size="14" font-weight="600" text-anchor="middle">capture</text>
 

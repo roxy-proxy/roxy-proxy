@@ -56,11 +56,11 @@
   <text x="238" y="72" fill="#0f766e" font-size="14" font-weight="600" text-anchor="end">request</text>
   <text x="362" y="72" fill="#5f6b68" font-size="14" font-weight="600">response</text>
 
-  <!-- capture: taps what crosses between the rules and the network -->
+  <!-- capture: records what the rules allow, before the address floor -->
   <path d="M 100 356 H 520" fill="none" stroke="#0f766e" stroke-width="1.5" stroke-dasharray="2 4"/>
   <g fill="#0f766e" font-size="14" font-weight="600">
     <text x="536" y="342">capture: what</text>
-    <text x="536" y="360">crosses here</text>
+    <text x="536" y="360">the rules allow</text>
   </g>
 
   <!-- flow log: every step feeds the exchange's one record -->
