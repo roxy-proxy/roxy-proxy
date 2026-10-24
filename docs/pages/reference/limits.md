@@ -78,7 +78,7 @@ limits:
 | `body_idle_timeout` | the request is cut (`parse_error`, `body_timeout`) or the response is cut (`response_error`; `client_gone` on HTTP/1.1, `client_stalled` on HTTP/2) |
 | `response_body_idle_timeout` | the exchange ends (`response_error`, `response_body_timeout`): the connection closes on HTTP/1.1, the stream is reset with `CANCEL` on HTTP/2; while rules are still reading the body (`response.body.text`), nothing has been sent and the client gets a `504` instead |
 | `max_ws_message_bytes` | both sides close with `1009`; applies only when rules read messages ([WebSockets](/reference/websockets#message-rules)) |
-| `max_observer_lag_bytes` | the observer's copy is cut ([addon modes](/design/addon-model#modes)) |
+| `max_observer_lag_bytes` | the observer's copy is cut ([observers](/reference/addon-configuration#observers)) |
 
 The upstream dial is timed by `upstream.connect_timeout` (10 s), not a
 `limits` key: once for the TCP connect over all of a name's addresses and
