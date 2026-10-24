@@ -754,6 +754,7 @@ async fn forward<F: ClientTransport>(
         });
         req.meta.upgrade = None;
     }
+    crate::redact::request(cx, &mut req);
     if let Err(e) = cx
         .snap
         .upstream
@@ -787,7 +788,7 @@ async fn forward<F: ClientTransport>(
     match response_steps(cx, res, transport).await {
         ResponseVerdict::Continue(mut res) => {
             let needles = crate::redact::needles(cx);
-            let need = if needles.is_some() && cx.snap.http.redact_response_secrets.bodies {
+            let need = if crate::redact::masks_body(cx) {
                 Need::Masking
             } else if matches!(cx.response_leg, Leg::Stack { decode: true, .. }) {
                 Need::Layers

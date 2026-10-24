@@ -52,8 +52,8 @@ All three switches are off by default.
   request is left alone. Values that `sign` sends (the access key id and
   session token) are not masked, because neither works without the secret
   key, which never leaves roxy.
-- **How:** each byte becomes `*`, so lengths, `content-length` and byte
-  ranges stay the same.
+- **How:** each byte becomes `*`, so a value keeps its length. An
+  uncompressed body keeps its `content-length`.
 - **`min_length`** (at least 1): shorter values are not masked, since a
   short value would match unrelated text.
 - **Headers:** every header and trailer value, including a `101`'s.
@@ -64,9 +64,14 @@ All three switches are off by default.
 - **Compressed bodies:** roxy decompresses the body, masks it and
   compresses it again in the same coding
   ([content codings](/reference/http#content-codings)). A body roxy cannot
-  decompress, or a partial response (`206`) of a compressed body, is
-  refused with `503` and reason `unsupported_content_encoding` rather than
-  sent unmasked.
+  decompress is refused with `503` and reason
+  `unsupported_content_encoding` rather than sent unmasked.
+- **Ranges:** with `bodies` on, roxy drops `range` and `if-range` from a
+  request that injected a secret, so the upstream sends the whole body. A
+  range could cut a secret so that no whole copy of it is in the
+  response, and the client chooses where the range starts and ends. A
+  partial response (`206`) that comes back anyway is refused with `503`
+  and reason `partial_response`.
 - **Who sees it masked:** everything after the response rules: in-flight
   rules, the capture, addons and the client. The response rules and
   `response.body.text` see the response as the upstream sent it.

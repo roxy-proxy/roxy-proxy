@@ -247,38 +247,77 @@ async fn a_decoded_response_is_captured_in_its_coding() {
     assert_eq!(plain, format!("before {MASKED} after").as_bytes());
 }
 
-/// A body roxy cannot decode is refused rather than passed unscrubbed: a coding it does not decode, or a range of an encoded body.
+/// A body roxy cannot decode is refused rather than passed unmasked.
 #[tokio::test]
 async fn a_body_that_cannot_be_decoded_fails_closed() {
     let kit = kit(BOTH).await;
-    for headers in [
-        &[("x-echo-encoding", "compress")][..],
-        &[("x-echo-encoding", "gzip"), ("x-echo-status", "206")][..],
+    let mut c = kit.h1().await;
+    let headers = [("x-echo-encoding", "compress")];
+    let a = post(&mut c, "/echo", &headers, gzip(SECRET.as_bytes())).await;
+    assert_eq!(a.status, 503, "{a:?}");
+    let ev = kit.request_event().await;
+    assert_eq!(ev["terminal_rule"], "_fail_closed", "{ev:#}");
+    assert_eq!(ev["reason"], "unsupported_content_encoding", "{ev:#}");
+}
+
+/// The client chooses a range's bounds, so two ranges that each cut the
+/// secret would carry it out in pieces past a mask of whole occurrences.
+/// The request goes without `range` and `if-range`, and a `206` that
+/// comes back anyway, plain or encoded, is refused.
+#[tokio::test]
+async fn a_range_is_never_masked() {
+    let kit = kit(BOTH).await;
+    let mut c = kit.h1().await;
+    let a = c
+        .call(
+            "GET",
+            "/x",
+            &[("range", "bytes=1-"), ("if-range", "\"v1\"")],
+            b"",
+        )
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert!(
+        !seen[0].headers.contains_key("range"),
+        "{:?}",
+        seen[0].headers
+    );
+    assert!(
+        !seen[0].headers.contains_key("if-range"),
+        "{:?}",
+        seen[0].headers
+    );
+    for (n, body) in [
+        (2, format!("[{SECRET}]").into_bytes()),
+        (3, gzip(SECRET.as_bytes())),
     ] {
-        let mut c = kit.h1().await;
-        let a = post(&mut c, "/echo", headers, gzip(SECRET.as_bytes())).await;
-        assert_eq!(a.status, 503, "{headers:?}: {a:?}");
-        let ev = kit.request_event().await;
+        let encoded = body.starts_with(&[0x1f, 0x8b]);
+        let mut headers = vec![("x-echo-status", "206")];
+        if encoded {
+            headers.push(("x-echo-encoding", "gzip"));
+        }
+        let a = post(&mut kit.h1().await, "/echo", &headers, body).await;
+        assert_eq!(a.status, 503, "encoded {encoded}: {a:?}");
+        let ev = kit.events("request", n).await.remove(n - 1);
         assert_eq!(ev["terminal_rule"], "_fail_closed", "{ev:#}");
-        assert_eq!(ev["reason"], "unsupported_content_encoding", "{ev:#}");
+        assert_eq!(ev["reason"], "partial_response", "{ev:#}");
     }
 }
 
-/// A range of a plain body is scrubbed as it is.
+/// Without masking, a range is the client's business.
 #[tokio::test]
-async fn a_plain_range_is_scrubbed() {
-    let kit = kit(BOTH).await;
-    let mut c = kit.h1().await;
-    let a = post(
-        &mut c,
-        "/echo",
-        &[("x-echo-status", "206")],
-        format!("[{SECRET}]").into(),
-    )
+async fn a_range_passes_when_only_headers_are_masked() {
+    let kit = kit(ResponseRedaction {
+        bodies: false,
+        ..BOTH
+    })
     .await;
-    assert_eq!(a.status, 206, "{a:?}");
-    assert_eq!(body(&a), format!("[{MASKED}]"));
-    assert!(a.headers.contains_key("content-length"), "{a:?}");
+    let mut c = kit.h1().await;
+    let a = c.call("GET", "/x", &[("range", "bytes=1-")], b"").await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].headers["range"], "bytes=1-");
 }
 
 /// Layers downstream of the core see the scrubbed response, and the

@@ -41,7 +41,7 @@ Common reasons, by `terminal_rule`:
 
 | `terminal_rule` | `reason` |
 |---|---|
-| `_fail_closed` | `metric_unavailable`, `metric_table_full`, `address_list_unavailable`, `secret_missing`, `secret_invalid`, `body_too_large_to_inspect`, `body_decode_failed`, `unsupported_content_encoding`, `buffer_budget_exhausted`, `missing_value`, `state_unavailable`, `sign_conflict`, `effect_invalid` |
+| `_fail_closed` | `metric_unavailable`, `metric_table_full`, `address_list_unavailable`, `secret_missing`, `secret_invalid`, `body_too_large_to_inspect`, `body_decode_failed`, `unsupported_content_encoding`, `partial_response`, `buffer_budget_exhausted`, `missing_value`, `state_unavailable`, `sign_conflict`, `effect_invalid` |
 | `_address_policy` | `address_policy` |
 | `_expired` | `policy_expired` ([lease](/guides/operations#lease)) |
 | `_quarantined` | `quarantined` ([quarantine](/guides/operations#quarantine)) |

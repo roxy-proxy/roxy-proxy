@@ -21,9 +21,12 @@ use crate::pipeline::{FlowCx, Refusal, response_known_empty};
 use crate::server::Shared;
 
 /// Flow-log `reason` of a response that must be read as plain bytes but
-/// cannot be decoded: a coding roxy does not decode, or a range of an
-/// encoded body.
+/// is in a coding roxy does not decode.
 const UNDECODABLE: &str = "unsupported_content_encoding";
+
+/// Flow-log `reason` of a range (`206`) of a response that masking must
+/// read whole.
+const PARTIAL: &str = "partial_response";
 
 /// Where the core hands its response: to the client, or to the addon
 /// stack, which encodes it again at its client edge.
@@ -48,7 +51,8 @@ pub(crate) enum Need {
     /// The addon layers. A body they cannot have decoded is passed to them
     /// as it is, for a layer to judge.
     Layers,
-    /// The masking of secrets, which must not pass a body it cannot read.
+    /// The masking of secrets, which must not pass a body it cannot read
+    /// whole.
     Masking,
 }
 
@@ -63,6 +67,15 @@ pub(crate) fn response(
     if need == Need::None || response_known_empty(cx, res) {
         return Ok(Vec::new());
     }
+    let partial =
+        res.status == StatusCode::PARTIAL_CONTENT || res.headers.contains("content-range");
+    // Masking finds whole occurrences only, and a range's bounds are the
+    // client's to choose: ranges that each cut a secret would carry it out
+    // in pieces. The request went without `range` for this, so a range
+    // that still comes back is refused.
+    if need == Need::Masking && partial {
+        return Err(Refusal::fail_closed(PARTIAL));
+    }
     let refuse = || match need {
         Need::Masking => Err(Refusal::fail_closed(UNDECODABLE)),
         Need::Layers | Need::None => Ok(Vec::new()),
@@ -70,12 +83,9 @@ pub(crate) fn response(
     let Ok(codings) = coding::content_codings(&res.headers) else {
         return refuse();
     };
-    if codings.is_empty() {
-        return Ok(codings);
-    }
     // A range of an encoded body cannot be decoded on its own.
-    if res.status == StatusCode::PARTIAL_CONTENT || res.headers.contains("content-range") {
-        return refuse();
+    if codings.is_empty() || partial {
+        return Ok(Vec::new());
     }
     res.headers.remove("content-encoding");
     res.body = coding::decode_body(
