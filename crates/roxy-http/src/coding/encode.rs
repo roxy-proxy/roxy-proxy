@@ -34,18 +34,78 @@ fn memory(coding: Coding) -> u64 {
     }
 }
 
+/// A stack of encoders, fed plain bytes, each write flushed through every
+/// coding. It holds its memory's charge to the [`Meter`] for as long as it
+/// lives.
+pub struct Encoder {
+    /// `stages[0]` is the coding applied first.
+    stages: Vec<Stage>,
+    /// Holds the charge. Behind a lock only so an encoder can sit in a
+    /// shared structure; it is never called again.
+    _meter: std::sync::Mutex<Meter<'static>>,
+}
+
+impl std::fmt::Debug for Encoder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Encoder")
+            .field("stages", &self.stages.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Encoder {
+    /// Encoders for `codings` (in the order they are applied), their
+    /// memory charged to `meter` first; `None` when it refuses.
+    pub fn new(codings: &[Coding], mut meter: Meter<'static>) -> Option<Self> {
+        let mut held: u64 = 0;
+        let mut stages = Vec::with_capacity(codings.len());
+        for &c in codings {
+            held = held.saturating_add(memory(c));
+            if !meter(held) {
+                return None;
+            }
+            stages.push(Stage::new(c));
+        }
+        Some(Self {
+            stages,
+            _meter: std::sync::Mutex::new(meter),
+        })
+    }
+
+    /// `data` through every stage, flushed: a decoder can read all of it
+    /// from what has been returned so far.
+    pub fn encode(&mut self, data: &[u8]) -> Vec<u8> {
+        let mut buf = data.to_vec();
+        for s in &mut self.stages {
+            buf = s.flush(&buf);
+        }
+        buf
+    }
+
+    /// The end of every stage: each finishes its stream, which the stages
+    /// after it encode in turn.
+    pub fn finish(&mut self) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for s in &mut self.stages {
+            let mut out = s.flush(&buf);
+            out.extend(s.finish());
+            buf = out;
+        }
+        buf
+    }
+}
+
 /// `body`, plain, encoded with `codings` (in the order they are applied) as
 /// it streams. Each data frame comes out as soon as it went in, flushed
 /// through every coding; trailers follow. The encoders' memory is charged
-/// to `meter` first, and a charge it refuses fails the body with
-/// [`BodyError::BudgetExhausted`].
+/// to `meter` before the first frame, and a charge it refuses fails the
+/// body with [`BodyError::BudgetExhausted`].
 pub fn encode_body(body: Body, codings: &[Coding], meter: Meter<'static>) -> Body {
     Body::wrap_native(
         EncodedBody {
             inner: body,
-            codings: codings.to_vec(),
-            meter: Some(meter),
-            stages: Vec::new(),
+            pending: Some((codings.to_vec(), meter)),
+            enc: None,
             trailers: None,
             done: false,
         },
@@ -56,51 +116,19 @@ pub fn encode_body(body: Body, codings: &[Coding], meter: Meter<'static>) -> Bod
 
 struct EncodedBody {
     inner: Body,
-    codings: Vec<Coding>,
-    /// Taken when the stages are built, on the first poll.
-    meter: Option<Meter<'static>>,
-    /// `stages[0]` is the coding applied first.
-    stages: Vec<Stage>,
+    /// The codings and meter, until the encoder is built on the first poll.
+    pending: Option<(Vec<Coding>, Meter<'static>)>,
+    enc: Option<Encoder>,
     trailers: Option<HeaderMap>,
     done: bool,
 }
 
 impl EncodedBody {
-    /// Builds the stages once, charging their memory first.
-    fn stages(&mut self) -> Result<(), BodyError> {
-        let Some(mut meter) = self.meter.take() else {
-            return Ok(());
-        };
-        let mut held: u64 = 0;
-        for &c in &self.codings {
-            held = held.saturating_add(memory(c));
-            if !meter(held) {
-                return Err(BodyError::BudgetExhausted);
-            }
-            self.stages.push(Stage::new(c));
+    fn encoder(&mut self) -> Result<&mut Encoder, BodyError> {
+        if let Some((codings, meter)) = self.pending.take() {
+            self.enc = Some(Encoder::new(&codings, meter).ok_or(BodyError::BudgetExhausted)?);
         }
-        Ok(())
-    }
-
-    /// `data` through every stage, flushed.
-    fn encode(&mut self, data: &[u8]) -> Vec<u8> {
-        let mut buf = data.to_vec();
-        for s in &mut self.stages {
-            buf = s.flush(&buf);
-        }
-        buf
-    }
-
-    /// The end of every stage: each finishes its stream, which the stages
-    /// after it encode in turn.
-    fn finish(&mut self) -> Vec<u8> {
-        let mut buf = Vec::new();
-        for s in &mut self.stages {
-            let mut out = s.flush(&buf);
-            out.extend(s.finish());
-            buf = out;
-        }
-        buf
+        self.enc.as_mut().ok_or(BodyError::BudgetExhausted)
     }
 }
 
@@ -117,14 +145,17 @@ impl http_body::Body for EncodedBody {
             if this.done {
                 return Poll::Ready(this.trailers.take().map(|t| Ok(Frame::trailers(t))));
             }
-            if let Err(e) = this.stages() {
+            if let Err(e) = this.encoder() {
                 this.done = true;
                 return Poll::Ready(Some(Err(e)));
             }
             match ready!(Pin::new(&mut this.inner).poll_frame(cx)) {
                 Some(Ok(f)) => match f.into_data() {
                     Ok(d) if d.is_empty() => {}
-                    Ok(d) => return Poll::Ready(Some(Ok(Frame::data(this.encode(&d).into())))),
+                    Ok(d) => {
+                        let out = this.encoder()?.encode(&d);
+                        return Poll::Ready(Some(Ok(Frame::data(out.into()))));
+                    }
                     Err(f) => this.trailers = f.into_trailers().ok(),
                 },
                 Some(Err(e)) => {
@@ -133,8 +164,8 @@ impl http_body::Body for EncodedBody {
                     return Poll::Ready(Some(Err(e)));
                 }
                 None => {
+                    let tail = this.encoder()?.finish();
                     this.done = true;
-                    let tail = this.finish();
                     if !tail.is_empty() {
                         return Poll::Ready(Some(Ok(Frame::data(tail.into()))));
                     }
@@ -302,6 +333,30 @@ mod tests {
             }
             assert_eq!(got, b"first", "{c:?}");
         }
+    }
+
+    /// The charge is held for as long as the encoder lives.
+    #[test]
+    fn an_encoder_holds_its_charge() {
+        struct Lease(std::sync::Arc<std::sync::atomic::AtomicBool>);
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let released = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let lease = Lease(released.clone());
+        let enc = Encoder::new(
+            &[Coding::Gzip],
+            Box::new(move |_| {
+                let _ = &lease;
+                true
+            }),
+        )
+        .unwrap();
+        assert!(!released.load(std::sync::atomic::Ordering::SeqCst));
+        drop(enc);
+        assert!(released.load(std::sync::atomic::Ordering::SeqCst));
     }
 
     #[tokio::test]

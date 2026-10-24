@@ -167,8 +167,8 @@ of a captured head (URL, header names and values); nothing else is: the
 header-name redaction above is flow-log only, and bodies are captured
 **unredacted**, except that a response
 [`http.redact_response_secrets.bodies`](/reference/secrets#redacting-responses)
-masked is captured as masked, and a response decoded for the layers or
-for masking is captured decoded
+masked is captured as masked. A body roxy decoded for the layers or for
+masking is captured in its coding, as it travels
 ([content codings](/reference/http#content-codings)).
 
 ```yaml
@@ -203,7 +203,7 @@ Fluent Bit can take the file as it is. Rotated files are
 |---|---|
 | `flow` | joins records to the flow log |
 | `dir` | `request` (client to upstream) or `response` |
-| `kind` | `head` (the canonical head as forwarded, as an object under `head`), `data` (forwarded bytes, base64 under `data`), `truncated` (`limits.max_capture_body_bytes` reached for this direction; nothing more is captured; carries `cap`), or `end` (carries the total forwarded `bytes`, and `aborted: true` if the direction did not complete) |
+| `kind` | `head` (the canonical head as forwarded, as an object under `head`), `data` (forwarded bytes, base64 under `data`), `truncated` (`limits.max_capture_body_bytes` reached for this direction; nothing more is captured; carries `cap`, or `reason: buffer_budget_exhausted` when the budget could not cover the encoder that captures a decoded body in its coding), or `end` (carries the total forwarded `bytes`, and `aborted: true` if the direction did not complete) |
 | `seq` | counts records per flow and direction |
 
 `data` is standard base64 with padding, which makes captured bodies about

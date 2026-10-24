@@ -327,7 +327,7 @@ client as sent.
   `content-encoding`; so does a `206` or any response with `content-range`.
 - The response rules read the response before it is decoded, and decode
   it for themselves ([body rules](/reference/rule-language#body-rules)).
-  The in-flight body rules and the capture see it decoded.
+  The capture records it in its coding, as it travels.
 - No extension (`permessage-deflate` above all) is negotiated on a
   WebSocket a body-subscribed layer runs on ([WebSockets](/reference/websockets#extensions)).
 

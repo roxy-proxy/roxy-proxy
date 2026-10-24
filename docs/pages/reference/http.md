@@ -393,10 +393,10 @@ it leaves, so the client and the origin always get the coding they
 negotiated:
 
 - A response is decoded in the core, after the response rules, when a
-  layer that ran reads its body or it is masked. The in-flight body rules,
-  the capture and the layers see it decoded. It is encoded again for the
-  client: as the core hands it on, or at the client end of the addon
-  stack. A layer's own answer is not.
+  layer that ran reads its body or it is masked. It is encoded again for
+  the client: as the core hands it on, or at the client end of the addon
+  stack. A layer's own answer is not. The capture records it encoded, as
+  it travels, with an encoder of its own.
 - A request body is decoded as it enters the first layer that reads it,
   and encoded again as it reaches the core, so the rules, the capture and
   the origin see it in the client's coding.

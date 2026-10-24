@@ -30,7 +30,7 @@ use crate::len_u64;
 use crate::{Body, BodyError, Headers};
 
 mod encode;
-pub use encode::encode_body;
+pub use encode::{Encoder, encode_body};
 
 /// More codings than this in one `content-encoding` is refused rather than
 /// decoded: each one is another decoder (and window) to allocate.

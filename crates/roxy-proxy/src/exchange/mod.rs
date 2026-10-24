@@ -803,6 +803,8 @@ async fn forward<F: ClientTransport>(
             }
             let mut down_tap = down_tap;
             if let Some(t) = down_tap.as_mut() {
+                // Captured as it travels, not as it is decoded here.
+                t.encode_as(&codings, cx.shared.window_meter());
                 t.response_head(&res);
             }
             if let Some((upstream, key)) = upgrade {

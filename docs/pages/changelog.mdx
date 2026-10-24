@@ -15,7 +15,7 @@ The request trailers a service layer passes on are validated as a client's befor
 
 - A raw backtick in an HTTP/1 request path is rejected with `invalid_path` instead of being percent-encoded; HTTP/2 already refused it. In a query it is still percent-encoded to `%60` ([#582](https://github.com/roxy-proxy/roxy-proxy/pull/582)).
 - Capture is written to `capture.jsonl` with one JSON object per line, in place of `capture.rxc` and its length-framed records: the head nested under `head`, body bytes base64 under `data`, and at most 48 KiB of body per line. A line-oriented shipper such as Vector or Fluent Bit can take the file as it is ([#527](https://github.com/roxy-proxy/roxy-proxy/issues/527)).
-- A body decoded for addon layers (`http.decode_for_addons`) is encoded again in its codings as it leaves the stack, so the client and the origin get the coding they negotiated, where they used to get it uncompressed. The response is now decoded in the core, so the in-flight body rules and the capture see it decoded ([#603](https://github.com/roxy-proxy/roxy-proxy/issues/603)).
+- A body decoded for addon layers (`http.decode_for_addons`) is encoded again in its codings as it leaves the stack, so the client and the origin get the coding they negotiated, where they used to get it uncompressed. ([#603](https://github.com/roxy-proxy/roxy-proxy/issues/603)).
 - Secret values in the flow log, the operational log and capture heads are masked byte for byte with `*`, and header values hidden by name (`log.redact_headers`) and query values are logged as `******`, in place of `[REDACTED]` for both. A consumer matching `[REDACTED]` should match the new forms.
 
 ### Added

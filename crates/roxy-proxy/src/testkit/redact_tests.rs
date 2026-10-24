@@ -195,6 +195,58 @@ async fn masking_and_a_reading_layer_share_the_decoding() {
     assert_eq!(body, format!("BEFORE {MASKED} AFTER").as_bytes());
 }
 
+/// The decoding is internal: the capture records the response masked, in
+/// the coding it travels in.
+#[tokio::test]
+async fn a_decoded_response_is_captured_in_its_coding() {
+    let kit = Kit::builder()
+        .secret("token", SECRET)
+        .rules(RULES)
+        .http(|h| h.redact_response_secrets = BOTH)
+        .capture_all()
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+    let a = post(
+        &mut c,
+        "/echo",
+        &[("x-echo-encoding", "gzip")],
+        gzip(format!("before {SECRET} after").as_bytes()),
+    )
+    .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let ev = kit.request_event().await;
+    let flow = ev["flow"].as_str().unwrap();
+    let records = kit.captured();
+    let response: Vec<_> = records
+        .iter()
+        .filter(|(h, _)| h["flow"] == flow && h["dir"] == "response")
+        .collect();
+    let head: serde_json::Value = serde_json::from_slice(&response[0].1).unwrap();
+    assert!(
+        head["headers"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(["content-encoding", "gzip"])),
+        "{head:#}"
+    );
+    let data: Vec<u8> = response
+        .iter()
+        .filter(|(h, _)| h["kind"] == "data")
+        .flat_map(|(_, d)| d.clone())
+        .collect();
+    // What was captured is what the client got.
+    assert_eq!(&data, a.body.as_ref().unwrap());
+    let plain = roxy_http::coding::decode(
+        &[roxy_http::coding::Coding::Gzip],
+        &data,
+        1 << 20,
+        roxy_http::coding::unmetered(),
+    )
+    .unwrap();
+    assert_eq!(plain, format!("before {MASKED} after").as_bytes());
+}
+
 /// A body roxy cannot decode is refused rather than passed unscrubbed: a coding it does not decode, or a range of an encoded body.
 #[tokio::test]
 async fn a_body_that_cannot_be_decoded_fails_closed() {
