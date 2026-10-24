@@ -793,7 +793,7 @@ impl FlowSink for MemorySink {
 /// sensitive headers.
 #[derive(Debug, Clone)]
 pub struct Redactor {
-    secrets: Needles,
+    needles: Needles,
     headers: HashSet<String>,
 }
 
@@ -807,7 +807,7 @@ impl Redactor {
     /// A redactor with no secrets and the default redacted headers.
     pub fn new() -> Self {
         Self {
-            secrets: Needles::default(),
+            needles: Needles::default(),
             headers: DEFAULT_REDACTED_HEADERS
                 .iter()
                 .map(|h| (*h).to_owned())
@@ -817,7 +817,7 @@ impl Redactor {
 
     /// Register a secret value. Empty strings are ignored.
     pub fn add_secret(&mut self, secret: impl Into<String>) {
-        self.secrets.add(secret);
+        self.needles.add(secret);
     }
 
     /// Add a header name (case-insensitive) whose values are never logged.
@@ -833,7 +833,7 @@ impl Redactor {
     /// `s` with every registered secret masked
     /// ([`Needles::mask_str`]).
     pub fn redact_str<'a>(&self, s: &'a str) -> Cow<'a, str> {
-        self.secrets.mask_str(s)
+        self.needles.mask_str(s)
     }
 
     /// The loggable form of a header value: [`REDACTED`] for redacted header
