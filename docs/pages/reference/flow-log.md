@@ -53,6 +53,13 @@ produces a `request` event:
 | an HTTP/2 client stopped taking the response | `client_stalled` |
 | the response body was cut after its head went out | why it was cut, when roxy knows: `buffer_budget_exhausted` (a decoder window the [buffer budget](/reference/limits#limits) could not cover), `upstream_body_failed` (the upstream's body failed into an addon layer), `layer_error` (a layer failed; the `layer_error` event names it), or the client's `parse_error` reason when its request body was rejected while the response was being written; otherwise `response_write_failed` |
 
+One reason is chosen once the exchange is over, whatever order the facts
+arrived in. A policy or validation reason already in the record stands.
+Otherwise, in order: a known fault behind a response body that failed, a
+layer's abort, observed cancellation, the response's own failure, an
+upload deadline, then a forward nothing waited for (`layer_aborted` too). A fault a layer
+recovered from does not by itself fail a response that completed.
+
 ### Events
 
 A client may reset an HTTP/2 stream after its response was fully written,
@@ -77,7 +84,7 @@ It emits no `response_error` for an already completed response.
 | `ws_open`, `ws_close` | a relayed WebSocket, with byte counts; `ws_close` has `close_code` and `close_reason` when roxy ended it |
 | `ws_message` | a WebSocket message a rule denied, or one sampled by `log.flow.ws_message_every` ([WebSockets](/reference/websockets#message-rules)) |
 | `log` | a rule's `log` action |
-| `layer_error` | an addon layer failed; `kind` is `trap`, `budget:<limit>`, `capability:<name>`, `invalid_request`, `invalid_response`, `no_response`, `no_instance` (none of its `max_instances` came free within `first_byte_timeout`), `unsubscribed:<direction>`, `service:<code>`, `when:<code>`, ... In enforce mode it names the one layer blamed for the exchange ([who is blamed](/design/addon-model#who-is-blamed)), once; a client's broken upload, an upstream body or the buffer budget failing a layer logs none. In observe mode every failure of the observer's own is logged. When a [service layer's](/reference/service-layers#host-services) host-service call failed, `call` is the service's id for it |
+| `layer_error` | an addon layer failed; `kind` is `trap`, `budget:<limit>`, `capability:<name>`, `invalid_request`, `invalid_response`, `no_response`, `no_instance` (none of its `max_instances` came free within `first_byte_timeout`), `unsubscribed:<direction>`, `service:<code>`, `when:<code>`, ... In enforce mode it names the one layer blamed for the exchange ([who is blamed](/reference/addon-configuration#who-is-blamed)), once; a client's broken upload, an upstream body or the buffer budget failing a layer logs none. In observe mode every failure of the observer's own is logged. When a [service layer's](/reference/service-layers#host-services) host-service call failed, `call` is the service's id for it |
 | `layer_record` | an addon's `flow.record`; a [service layer's](/reference/service-layers#host-services) carries the service's id for the call as `call` ([addons](/design/addon-model)) |
 | `endpoint_call` | [addons](/design/addon-model) |
 | `observer_lagged` | an observe-mode addon's copy of a stream was cut; `reason` is `observer_behind` (it fell `max_observer_lag_bytes` behind), `buffer_budget_exhausted` (the [buffer budget](/reference/limits#limits) could not cover the copy) or `no_instance` (no instance of the layer came free within its `first_byte_timeout`) |

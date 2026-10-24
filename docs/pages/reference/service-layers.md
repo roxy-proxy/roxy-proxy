@@ -252,7 +252,7 @@ identity for future incompatible changes.
   `response` before it is no answer: `no_response`.
 - **A body that fails on its way to the service is not its failure**: its
   lane ends with the error, no `layer_error` is logged, and the stream
-  goes on ([who is blamed](/design/addon-model#who-is-blamed)).
+  goes on ([who is blamed](/reference/addon-configuration#who-is-blamed)).
 - **One stream's failure is its own**: a violation resets that stream
   only. Broken framing fails the whole connection: a text frame that is not
   a JSON object with a valid `stream`, a binary frame shorter than its

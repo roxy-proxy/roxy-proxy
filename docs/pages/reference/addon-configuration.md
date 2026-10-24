@@ -188,6 +188,23 @@ answers with) carries the body it did not see, spliced on by roxy.
   extensions, only when some layer that runs is subscribed to a body
   ([content codings](/reference/addon-configuration#content-codings), [WebSockets](/reference/addon-configuration#websockets)).
 
+### Observers
+
+An observe layer gets copies of both lanes and runs beside the exchange,
+which does not wait for it. Each copy of a body it is subscribed to is
+buffered for it, so one that keeps up sees every body in full, however
+large. A copy is cut, and the flow goes on, when the layer falls
+`limits.max_observer_lag_bytes` behind, the
+[buffer budget](/reference/limits#limits) cannot cover its next frame, or
+no instance comes free within its `first_byte_timeout` (`observer_lagged`,
+with the `reason`). A request refused or answered upstream of the
+observer before its body was read ends the copy where reading stopped,
+without an error, and the observer sees the refusal from `next`; a copy
+that fails (the client went away mid-upload) ends with that failure.
+`sample` gives an observer a share of the matching exchanges. It may
+`record` but cannot tag the flow or write state
+([capabilities](/reference/addon-configuration#capabilities)).
+
 ### Streaming protocols
 
 Lanes carry HTTP structure: one head, streaming body bytes, optional
@@ -247,21 +264,34 @@ flow however often it is asked.
 ### In the proxy
 
 The stack is a chain of stages joined by lanes
-([addon model](/design/addon-model#lanes-and-the-rules-that-move-them)):
-the client edge adapts the HTTP/1.1 connection or HTTP/2 stream and puts the
-client's request on the first lane, each layer runs on its own task, and
-the core stage validates the forwarded request, evaluates admission and
-in-flight rules, applies destination restrictions, and owns the upstream
-connection and any WebSocket relay. A layer's answer goes to the client
-as soon as the layer gives it; a forwarded request continues upstream
-while the layer waits for its response. The flow is logged once every lane is terminal,
-its body has been read or discarded, and all drivers, input pumps, upload
-monitors and enforcing host-service workers have finished, including
-destruction after cancellation. The transport observes client loss through
-reclamation. Upstream upload accounting completes before the core releases
-the context. Sending an early response does not bypass this barrier. HTTP/1.1 does not accept
-the next request until this work finishes, even if a layer has ended both
-of its lanes but its handler or host-service calls are still running.
+([lanes](/design/addon-model#lanes)): the client edge adapts the HTTP/1.1
+connection or HTTP/2 stream and puts the client's request on the first
+lane, each layer runs on its own task, and the core stage validates the
+forwarded request, evaluates admission and in-flight rules, applies
+destination restrictions, and owns the upstream connection and any
+WebSocket relay. A layer's answer goes to the client as soon as the layer
+gives it; a forwarded request continues upstream while the layer waits for
+its response.
+
+- **Teardown.** A layer that faults, or whose unfinished response lane
+  its reader stops, is cancelled with every stage upstream of it, even if
+  a response between them has already ended. Its unfinished lanes are cut
+  and the lanes it reads are released. A client that goes away tears the
+  whole exchange down.
+- **Ends are not delivery.** A body's end does not mean it was read.
+  Trailers are held until the body has ended cleanly and matched its
+  declared length, because trailers complete the message on the wire. An
+  unfinished lane goes out with unknown length (HTTP/1.1 chunked), so a cut
+  after the last declared byte still shows. HEAD and bodiless statuses
+  commit at the head, but their internal body still runs under the
+  response idle deadline.
+- **The flow is logged once the exchange is over:** every lane is
+  terminal, its body has been read or discarded, and every layer task,
+  pump, upload monitor and enforcing host-service worker has finished,
+  including after cancellation. An early answer does not bypass this.
+  HTTP/1.1 accepts the next request on the connection only after it,
+  even when a layer has ended both its lanes but its handler or calls are
+  still running.
 
 Once a layer is done with the client's upload, the rest of it is dropped:
 on HTTP/1.1 the codec drains or closes as it does after a deny
@@ -299,7 +329,7 @@ In the flow log:
 | `addons` | the layers that ran, in stack order; a layer its `when` or `sample` skipped is not in it |
 | `rules`, `decision`, `terminal_rule` | the rules' decision on the request that left the stack; `req` is what the client sent. Metric keys (for the rules' samples and `metric-get`) also come from the request that left. A layer whose `next` returned the rules' `403` and then answered `200` itself is logged `decision: deny`, `res.status: 200` |
 | `decision: answered`, `terminal_rule: layer:<name>` | a layer answered itself, whatever its status: the layer nearest the client that put its answer's head on its lane before taking the head of the response from upstream, decided then. A forward it kept reading the response of runs to its end, and the record keeps what the rules decided of it; one it stopped reading the response of is cancelled upstream, and one it cut itself is cut there, both with `reason: layer_aborted`. If a layer fails before publishing its answer, the generated refusal is the decision, `deny`, whatever a downstream layer makes of it. If it fails after its answer reaches the client, the answer remains recorded and its body is cut |
-| `503`, `terminal_rule: layer:<name>`, `reason: layer_error` | a layer failed before the response head; the connection is closed and a `layer_error` event follows with `kind` one of `trap`, `budget:<limit>`, `capability:<name>`, `invalid_request`, `invalid_response`, `no_response`, `unsubscribed:<direction>`, ... After the head, the body is cut (HTTP/1.1 breaks the connection, HTTP/2 resets the stream) and `layer_error` follows. Which layer, if any, is one rule ([who is blamed](/design/addon-model#who-is-blamed)) |
+| `503`, `terminal_rule: layer:<name>`, `reason: layer_error` | a layer failed before the response head; the connection is closed and a `layer_error` event follows with `kind` one of `trap`, `budget:<limit>`, `capability:<name>`, `invalid_request`, `invalid_response`, `no_response`, `unsubscribed:<direction>`, ... After the head, the body is cut (HTTP/1.1 breaks the connection, HTTP/2 resets the stream) and `layer_error` follows. Which layer, if any, is one rule ([who is blamed](/reference/addon-configuration#who-is-blamed)) |
 
 If a layer fails while handling a denial the core already made, its generated
 `503` still travels downstream, but the flow record keeps the original deny's
@@ -394,3 +424,29 @@ its handler lives on relaying the direction it is in.
 - Layers see canonical heads and body streams, never wire bytes, and have
   no filesystem, sockets or environment: all their I/O is `next`,
   `endpoints` and `flow`.
+
+#### Who is blamed
+
+One party is blamed for a failed exchange: the first to record a fault.
+Each records its own before anything downstream can fail on it (a layer as
+it fails, a body where it enters the stack, the transport as it gives the
+exchange up), so what a layer makes of someone else's failure is a
+consequence, never a second fault.
+
+- **A layer's own failure** (a trap, a budget, an invalid head, a broken
+  service stream) is the layer's: `503` with `terminal_rule: layer:<name>`
+  before the response head, a cut body after it, and one `layer_error`
+  either way. A request a layer passed on that does not validate further
+  upstream is put down to the nearest enforcing layer downstream of where
+  it failed.
+- **A client upload that breaks** is the client's, as without a stack: the
+  connection closes on the parse error before the head, the body is cut
+  after it, and no `layer_error` is logged. A layer that passes the cut
+  body on has not aborted it.
+- **An upstream response body that fails** before any layer has answered
+  with a head of its own is the upstream's: `502`,
+  `reason: upstream_body_failed`.
+- **A body the buffer budget cannot cover** on its way to a layer fails
+  closed as the budget's: `reason: buffer_budget_exhausted`.
+- **An observer is never blamed**, and a client that gives up is nobody's
+  failure.
