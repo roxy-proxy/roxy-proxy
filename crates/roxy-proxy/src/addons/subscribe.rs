@@ -65,15 +65,24 @@ pub(super) fn head_only(headers: &mut http::HeaderMap) {
 /// Watches what a head-only layer gave for the body of `dir`, which is not
 /// part of the lane: the bypassed body is. Bytes or trailers in it fail the
 /// layer; its end and any error are its own business, since nothing reads
-/// it. Runs until the layer's body ends, on the exchange's tracker.
+/// it. Runs until the layer's body ends or the layer is torn down, on the
+/// exchange's tracker.
 pub(super) fn watch_own(st: &Arc<StackFlow>, index: usize, dir: Dir, own: Body) {
     if http_body::Body::is_end_stream(&own) {
         return;
     }
     let st2 = st.clone();
+    let torn = st.chain().layer_torn_down(index);
     st.chain().spawn(async move {
         let mut own = own;
-        while let Some(Ok(frame)) = own.frame().await {
+        loop {
+            let frame = tokio::select! {
+                () = torn.cancelled() => return,
+                f = own.frame() => f,
+            };
+            let Some(Ok(frame)) = frame else {
+                return;
+            };
             if frame.data_ref().is_none_or(|d| !d.is_empty()) {
                 st2.layer_failed(index, LayerError::Unsubscribed(dir.as_str()));
                 return;

@@ -384,6 +384,11 @@ impl Chain {
         self.stages[layer + 1].torn_why.get().is_some()
     }
 
+    /// Cancelled when layer `layer` is torn down.
+    pub(crate) fn layer_torn_down(&self, layer: usize) -> CancellationToken {
+        self.stages[layer + 1].torn.clone()
+    }
+
     /// Why layer `layer` was torn down, once it has been.
     pub(crate) fn layer_torn_down_why(&self, layer: usize) -> &'static str {
         self.stages[layer + 1]
