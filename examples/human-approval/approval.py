@@ -10,7 +10,7 @@ person's side of it is the review queue in review.py.
 
 The stream parsing, the hold (a streamed response's head and
 `message_start` go to the agent at once, then a ping every few seconds
-until the verdict) and the roxy.layer.v6 protocol are the quickstart
+until the verdict) and the roxy.layer.v7 protocol are the quickstart
 sentinel's, imported from ../quickstart/sentinel.
 
     python approval.py [--listen 127.0.0.1:9000] [--ui 127.0.0.1:8585] [--log-dir DIR]

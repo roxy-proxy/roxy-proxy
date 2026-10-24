@@ -169,11 +169,11 @@ answers with) carries the body it did not see, spliced on by roxy.
   body from upstream is dropped, so a layer can refuse at the response head.
   A layer that answers without `next` resolving answers whole too, since
   there is no body from upstream.
-- A head-only layer passes on a head and no body of its own. A WASM layer
-  gives `next`, or `respond` with the status it was given, the `empty`
-  body or a `passthrough` of the empty body it got; `bytes` or `stream`
-  there fails the exchange closed at the call. A service layer sends a
-  head alone ([service layers](/reference/service-layers#frames)). The
+- A head-only layer passes on a head and no body of its own. Whatever body
+  a WASM layer gives `next`, or `respond` with the status it was given,
+  none of it reaches the lane: the first bytes or trailers it yields fail
+  the exchange closed. A service layer sends a head alone
+  ([service layers](/reference/service-layers#frames)). The
   failure is a `503` before the response head, a cut body after it, and
   `layer_error` with `kind: unsubscribed:request` or
   `unsubscribed:response`. An open lane has unknown length on the wire,

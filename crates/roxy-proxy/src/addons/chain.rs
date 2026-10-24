@@ -398,21 +398,6 @@ impl Chain {
         self.fail(layer + 1, err);
     }
 
-    /// Attribute a failure in the layer's own portion of a spliced body.
-    pub(super) fn body_aborted(&self, layer: usize, dir: crate::in_flight::Dir, why: String) {
-        let lane = match dir {
-            crate::in_flight::Dir::Request => LaneId {
-                hop: layer + 1,
-                dir: Dir::Req,
-            },
-            crate::in_flight::Dir::Response => LaneId {
-                hop: layer,
-                dir: Dir::Res,
-            },
-        };
-        self.cut(lane, why, true);
-    }
-
     /// Every lane has been consumed or abandoned, and all drivers have exited.
     #[cfg(test)]
     pub(crate) fn is_over(&self) -> bool {

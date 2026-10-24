@@ -242,6 +242,9 @@ enum In {
         #[serde(default)]
         message: Option<String>,
     },
+    /// An observe stream's service is done with the stream: it makes no
+    /// more calls.
+    Close,
     /// A host-service call, run beside the stream rather than in it.
     #[serde(skip)]
     Call(Call),
@@ -559,9 +562,7 @@ async fn pump_response(
                 let head = response_head(&parts, &body);
                 if head_only {
                     *lock(&kept) = Some((parts.status, body));
-                    if stream.send(&head).await {
-                        stream.send(&Out::ResponseEnd { error: None }).await;
-                    }
+                    stream.send(&head).await;
                 } else {
                     stream.pump(Dir::Response, head, body).await;
                 }
@@ -672,9 +673,9 @@ impl Clock {
 }
 
 /// Runs observe-mode service layer `index`: the copies go to the service
-/// on a stream of their own. What it sends back goes nowhere, but it ends
-/// the stream as it does an enforce one: both inputs consumed or stopped,
-/// both outputs ended, and accepted host-service calls answered.
+/// on a stream of their own, one way. The stream ends once both copies are
+/// sent or stopped, the service has sent `close`, and its accepted
+/// host-service calls are answered.
 pub(super) async fn observe(
     st: &Arc<StackFlow>,
     index: usize,

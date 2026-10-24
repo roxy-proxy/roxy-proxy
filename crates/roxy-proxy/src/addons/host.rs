@@ -123,14 +123,16 @@ impl LayerHost for StackHost {
             };
         }
         let subscribe = self.addon().subscribe;
-        // A head-only layer passes the head on; the body it did not see
-        // goes on with it, retaining its validation and clean-end check.
+        // A head-only layer passes the head on, and the body it did not see
+        // goes on with it. What the layer gave for the body is not part of
+        // the lane: it is only watched for bytes it may not send.
         let held = lock(&self.held_request).take();
         let req = match held {
             Some(held) => {
-                let mut req = req;
-                req.extensions_mut().remove::<GuestBody>();
-                req.map(|own| subscribe::splice(&self.st, self.index, Dir::Request, own, held))
+                let (mut parts, own) = req.into_parts();
+                parts.extensions.remove::<GuestBody>();
+                subscribe::watch_own(&self.st, self.index, Dir::Request, own);
+                LayerRequest::from_parts(parts, held)
             }
             None => req,
         };
@@ -157,14 +159,16 @@ impl LayerHost for StackHost {
             return;
         };
         // A head-only layer passing the response from upstream on (the
-        // same status) gets its body back; any other status is an answer
-        // of the layer's own, whole.
+        // same status) gets its body back, and what it gave for the body is
+        // only watched; any other status is an answer of the layer's own,
+        // whole.
         let held = lock(&self.held_response).take();
         let res = match held {
             Some((status, body)) if status == res.status() => {
-                let mut res = res;
-                res.extensions_mut().remove::<GuestBody>();
-                res.map(|own| subscribe::splice(&self.st, self.index, Dir::Response, own, body))
+                let (mut parts, own) = res.into_parts();
+                parts.extensions.remove::<GuestBody>();
+                subscribe::watch_own(&self.st, self.index, Dir::Response, own);
+                LayerResponse::from_parts(parts, body)
             }
             _ => res,
         };

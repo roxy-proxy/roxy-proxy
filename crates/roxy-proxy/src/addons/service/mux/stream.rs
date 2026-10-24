@@ -13,11 +13,11 @@ use roxy_wasm::LayerHost as _;
 use tokio::sync::{Notify, mpsc};
 use tokio_util::sync::CancellationToken;
 
-use super::super::super::chain::{Head, LaneTx};
+use super::super::super::chain::{Head, LaneBody, LaneTx};
 use super::super::super::host::StackHost;
 use super::super::super::{AddonMode, Part, StackError, StackFlow, emit_stack_error};
 use super::super::{Call, In, Out, ServiceError, ServiceSpec};
-use super::inbox::{Inbox, Output, feeder};
+use super::inbox::{Inbox, feeder};
 use super::link::{Link, Message, Queued, Wire, binary, dial, text};
 use super::lock;
 use super::pool::{Pool, PoolKey, Reservation};
@@ -180,8 +180,9 @@ impl StreamState {
     }
 
     /// The service sends the head of the `dir` lane: once, before its
-    /// end. The lane it goes on, when the stream carries one.
-    fn head(&mut self, dir: Dir) -> Result<Option<LaneTx>, ServiceError> {
+    /// end. A head-only lane is complete at its head. The lane it goes on,
+    /// when the stream carries one.
+    fn head(&mut self, dir: Dir, head_only: bool) -> Result<Option<LaneTx>, ServiceError> {
         let lane = self.lane(dir);
         match lane.sent {
             Sent::Nothing => {}
@@ -198,7 +199,7 @@ impl StreamState {
                 )));
             }
         }
-        lane.sent = Sent::Head;
+        lane.sent = if head_only { Sent::End } else { Sent::Head };
         Ok(lane.out.take())
     }
 
@@ -218,8 +219,11 @@ impl StreamState {
 
     /// The service ends the `dir` lane: once. What the end moves: the lane
     /// still headless, or the body being fed.
-    fn end_lane(&mut self, dir: Dir) -> Result<Ended, ServiceError> {
+    fn end_lane(&mut self, dir: Dir, head_only: bool) -> Result<Ended, ServiceError> {
         let lane = self.lane(dir);
+        if head_only && lane.sent != Sent::Nothing {
+            return Err(ServiceError::Unsubscribed(dir.as_str()));
+        }
         if lane.sent == Sent::End {
             return Err(ServiceError::Protocol(format!(
                 "a second {} end",
@@ -481,6 +485,10 @@ impl Stream {
         if !self.send(&head).await {
             return;
         }
+        // A head-only lane is its head: nothing follows it, not even an end.
+        if self.head_only(dir) {
+            return;
+        }
         // Nothing to read (and an empty observer copy may never be ended).
         let error = if body.is_end_stream() {
             None
@@ -582,23 +590,29 @@ impl Stream {
         }
     }
 
-    /// Bytes of the `dir` body from the service. They count against that
-    /// body's window in either mode. An observe stream's are discarded and
-    /// credited back as they go: the service never waits on what it sends.
-    /// An enforce stream's for a head-only direction are the layer's
+    /// Bytes of the `dir` body from the service, counted against that
+    /// body's window. An observe stream carries none from the service, and
+    /// a head-only direction none either way: those are the layer's
     /// failure, whenever they come.
     pub(super) fn bytes(self: &Arc<Self>, dir: Dir, b: &[u8]) {
         if b.is_empty() {
             return;
         }
-        if self.mode == AddonMode::Enforce && self.head_only(dir) {
+        if self.mode == AddonMode::Observe {
+            self.fail(
+                ServiceError::Protocol("body bytes on an observe stream".to_owned()),
+                Reset::Send,
+            );
+            return;
+        }
+        if self.head_only(dir) {
             self.fail(ServiceError::Unsubscribed(dir.as_str()), Reset::Send);
             return;
         }
         let n = b.len() as u64;
         let mut s = lock(&self.state);
         let lane = s.lane(dir);
-        if self.mode == AddonMode::Enforce && lane.sent != Sent::Head {
+        if lane.sent != Sent::Head {
             drop(s);
             self.fail(
                 ServiceError::Protocol(format!(
@@ -622,11 +636,8 @@ impl Stream {
         }
         let inbox = lane.inbox.clone();
         drop(s);
+        // A lane roxy stopped reading: the bytes are dropped, uncredited.
         let Some(inbox) = inbox else {
-            // An observe stream's bytes, or a lane roxy stopped reading.
-            if self.mode == AddonMode::Observe {
-                self.grant(dir, n);
-            }
             return;
         };
         let mut q = lock(&inbox.q);
@@ -662,6 +673,39 @@ impl Stream {
                 self.stop_in[dir_index(dir)].cancel();
                 return;
             }
+            In::Close => {
+                if self.mode == AddonMode::Enforce {
+                    self.fail(
+                        ServiceError::Protocol("close on an enforce stream".to_owned()),
+                        Reset::Send,
+                    );
+                    return;
+                }
+                let done = {
+                    let mut s = lock(&self.state);
+                    for lane in &mut s.lanes {
+                        lane.sent = Sent::End;
+                    }
+                    !s.waiting()
+                };
+                if done {
+                    self.settle(End::Complete);
+                }
+                return;
+            }
+            In::Request { .. }
+            | In::RequestEnd { .. }
+            | In::Response { .. }
+            | In::ResponseEnd { .. }
+            | In::Trailers { .. }
+                if self.mode == AddonMode::Observe =>
+            {
+                self.fail(
+                    ServiceError::Protocol("a lane message on an observe stream".to_owned()),
+                    Reset::Send,
+                );
+                return;
+            }
             In::Request { .. }
             | In::RequestEnd { .. }
             | In::Response { .. }
@@ -681,9 +725,9 @@ impl Stream {
         }
     }
 
-    /// A head, trailers or an end from the service: checked against the
-    /// lane's grammar, and put on the lane the service produces in that
-    /// direction (an observe stream's go nowhere).
+    /// A head, trailers or an end from the service on an enforce stream:
+    /// checked against the lane's grammar, and put on the lane the service
+    /// produces in that direction.
     fn lane_event(self: &Arc<Self>, m: In) -> Result<(), ServiceError> {
         let limits = &self.st.snap.limits;
         match m {
@@ -699,7 +743,7 @@ impl Stream {
                     .map_err(|_| ServiceError::Protocol(format!("invalid url {url:?}")))?;
                 let headers = super::super::header_map(&headers, limits.max_headers)?;
                 let declared = super::super::declared_length(&headers)?;
-                let out = lock(&self.state).head(Dir::Request)?;
+                let out = lock(&self.state).head(Dir::Request, self.head_only(Dir::Request))?;
                 let Some(out) = out else {
                     return Ok(());
                 };
@@ -709,10 +753,10 @@ impl Stream {
                 *r.headers_mut() = headers;
                 let head = Head::Request(r.into_parts().0);
                 if self.head_only(Dir::Request) {
-                    // The body the layer did not see goes on with the head
-                    // it passed on; the lane retains its clean-end check.
-                    let bound = lock(&self.held_request).take().unwrap_or_default();
-                    self.bind(Dir::Request, out, head, bound);
+                    // The head is the whole of what the service sends: the
+                    // body it did not see goes on with it, and ends the lane.
+                    let bypassed = lock(&self.held_request).take().unwrap_or_default();
+                    out.whole(head, bypassed);
                     return Ok(());
                 }
                 // On an upgrade the forwarded body is the client's side of
@@ -722,7 +766,7 @@ impl Stream {
                 } else {
                     limits.max_request_body_bytes
                 };
-                self.feed(Dir::Request, Output::Lane(out.head(head, declared, cap)));
+                self.feed(Dir::Request, out.head(head, declared, cap));
                 Ok(())
             }
             In::Response { status, headers } => {
@@ -730,7 +774,7 @@ impl Stream {
                     .map_err(|e| ServiceError::Protocol(e.to_string()))?;
                 let headers = super::super::header_map(&headers, limits.max_headers)?;
                 let declared = super::super::declared_length(&headers)?;
-                let out = lock(&self.state).head(Dir::Response)?;
+                let out = lock(&self.state).head(Dir::Response, self.head_only(Dir::Response))?;
                 self.answered.cancel();
                 let Some(out) = out else {
                     return Ok(());
@@ -744,12 +788,12 @@ impl Stream {
                     // service passed on, when that is the same response:
                     // the same status. A different status is an answer of
                     // the service's own, whole.
-                    let bound = lock(&self.held_response).take();
-                    let body = match bound {
+                    let bypassed = lock(&self.held_response).take();
+                    let body = match bypassed {
                         Some((s, body)) if s == status => body,
                         _ => Body::empty(),
                     };
-                    self.bind(Dir::Response, out, head, body);
+                    out.whole(head, body);
                     return Ok(());
                 }
                 // A `101`'s body is the upstream's side of the WebSocket,
@@ -760,15 +804,12 @@ impl Stream {
                 } else {
                     limits.max_response_body_bytes
                 };
-                self.feed(Dir::Response, Output::Lane(out.head(head, declared, cap)));
+                self.feed(Dir::Response, out.head(head, declared, cap));
                 Ok(())
             }
             In::Trailers { dir, headers } => {
                 if self.head_only(dir) {
-                    return Err(ServiceError::Protocol(format!(
-                        "trailers of a head-only {} body",
-                        dir.as_str()
-                    )));
+                    return Err(ServiceError::Unsubscribed(dir.as_str()));
                 }
                 let headers = super::super::header_map(&headers, limits.max_headers)?;
                 let inbox = lock(&self.state).trailers(dir)?;
@@ -780,7 +821,9 @@ impl Stream {
             }
             In::RequestEnd { error } => self.lane_end(Dir::Request, error),
             In::ResponseEnd { error } => self.lane_end(Dir::Response, error),
-            In::Credit { .. } | In::Reset { .. } | In::Stop { .. } | In::Call(_) => Ok(()),
+            In::Credit { .. } | In::Reset { .. } | In::Stop { .. } | In::Close | In::Call(_) => {
+                Ok(())
+            }
         }
     }
 
@@ -791,7 +834,7 @@ impl Stream {
     fn lane_end(&self, dir: Dir, error: Option<String>) -> Result<(), ServiceError> {
         // The service's text, bounded as its reset messages are.
         let error = error.map(|why| why.chars().take(200).collect::<String>());
-        let ended = lock(&self.state).end_lane(dir)?;
+        let ended = lock(&self.state).end_lane(dir, self.head_only(dir))?;
         match ended {
             Ended::Headless(out) => {
                 match dir {
@@ -807,12 +850,6 @@ impl Stream {
                 Ok(())
             }
             Ended::Body(Some(inbox)) => {
-                if error.is_some() && self.head_only(dir) {
-                    return Err(ServiceError::Protocol(format!(
-                        "an error on the {}_end of a head-only body",
-                        dir.as_str()
-                    )));
-                }
                 let mut q = lock(&inbox.q);
                 match error {
                     Some(why) => q.abort = Some(why),
@@ -822,17 +859,8 @@ impl Stream {
                 inbox.ready.notify_one();
                 Ok(())
             }
-            // A stopped lane has no inbox, and an observe stream's lanes
-            // go nowhere.
-            Ended::Body(None) => {
-                if error.is_some() && self.mode == AddonMode::Enforce {
-                    return Err(ServiceError::Protocol(format!(
-                        "an error on the {}_end of a head-only body",
-                        dir.as_str()
-                    )));
-                }
-                Ok(())
-            }
+            // A lane roxy stopped reading has no inbox.
+            Ended::Body(None) => Ok(()),
         }
     }
 
@@ -927,24 +955,14 @@ impl Stream {
         }
     }
 
-    /// Whether the layer is subscribed to the head of `dir` only: that
-    /// body is a head and an end on the stream, with no bytes between.
+    /// Whether the layer is subscribed to the head of `dir` only: that lane
+    /// is a head alone on the stream, each way.
     fn head_only(&self, dir: Dir) -> bool {
         self.st.snap.addons[self.index].subscribe.part(dir) == Part::Head
     }
 
-    /// A subscription changes byte visibility, not the service's explicit
-    /// end obligation. Both bodies flow independently, but must end before
-    /// the enclosing lane can complete (including its trailers).
-    fn bind(self: &Arc<Self>, dir: Dir, out: LaneTx, head: Head, bypassed: Body) {
-        let (end, own) = Body::channel(0, Some(0));
-        let body = super::super::super::subscribe::splice(&self.st, self.index, dir, own, bypassed);
-        self.feed(dir, Output::HeadOnly(end));
-        out.whole(head, body);
-    }
-
     /// Starts feeding the `dir` body from the stream into `body`.
-    fn feed(self: &Arc<Self>, dir: Dir, body: Output) {
+    fn feed(self: &Arc<Self>, dir: Dir, body: LaneBody) {
         // Observers have no outgoing lane; only enforcing streams reach here.
         debug_assert_eq!(self.mode, AddonMode::Enforce);
         let inbox = Arc::new(Inbox::default());
@@ -1121,13 +1139,16 @@ mod tests {
         let mut s = enforce();
         assert!(s.waiting());
         assert!(matches!(
-            s.end_lane(Dir::Response),
+            s.end_lane(Dir::Response, false),
             Ok(Ended::Headless(None))
         ));
         assert!(s.waiting(), "the request lane is still owed");
-        assert!(s.end_lane(Dir::Response).is_err(), "a second end");
-        s.head(Dir::Request).unwrap();
-        assert!(matches!(s.end_lane(Dir::Request), Ok(Ended::Body(None))));
+        assert!(s.end_lane(Dir::Response, false).is_err(), "a second end");
+        s.head(Dir::Request, false).unwrap();
+        assert!(matches!(
+            s.end_lane(Dir::Request, false),
+            Ok(Ended::Body(None))
+        ));
         assert!(s.waiting(), "both input lanes remain");
         s.inputs_done[0] = true;
         assert!(s.waiting(), "the upstream response remains");
@@ -1143,7 +1164,7 @@ mod tests {
         let mut s = enforce();
         s.lane(Dir::Request).stopped = true;
         assert!(s.waiting());
-        s.end_lane(Dir::Response).unwrap();
+        s.end_lane(Dir::Response, false).unwrap();
         assert!(s.waiting(), "a stopped upload does not stop either input");
         s.inputs_done = [true; 2];
         assert!(!s.waiting());
@@ -1152,23 +1173,44 @@ mod tests {
         assert!(s.ended());
     }
 
+    /// A head-only lane is complete at its head: an end after it is the
+    /// service sending what it is not subscribed to. An end alone still
+    /// carries nothing.
+    #[test]
+    fn a_head_only_lane_is_its_head() {
+        let mut s = enforce();
+        s.head(Dir::Request, true).unwrap();
+        assert!(s.lanes[0].done());
+        assert!(matches!(
+            s.end_lane(Dir::Request, true),
+            Err(ServiceError::Unsubscribed("request"))
+        ));
+        assert!(matches!(
+            s.end_lane(Dir::Response, true),
+            Ok(Ended::Headless(None))
+        ));
+    }
+
     /// Each head comes once, before its lane's end; trailers once, after
     /// the head and before the end.
     #[test]
     fn each_head_comes_once_before_its_end() {
         let mut s = enforce();
-        s.head(Dir::Response).unwrap();
-        assert!(s.head(Dir::Response).is_err(), "a second response");
-        s.head(Dir::Request).unwrap();
-        assert!(s.head(Dir::Request).is_err(), "a second request");
+        s.head(Dir::Response, false).unwrap();
+        assert!(s.head(Dir::Response, false).is_err(), "a second response");
+        s.head(Dir::Request, false).unwrap();
+        assert!(s.head(Dir::Request, false).is_err(), "a second request");
         assert!(s.trailers(Dir::Request).is_ok());
         assert!(s.trailers(Dir::Request).is_err(), "trailers twice");
-        s.end_lane(Dir::Request).unwrap();
+        s.end_lane(Dir::Request, false).unwrap();
         assert!(s.trailers(Dir::Request).is_err(), "trailers after the end");
 
         let mut s = enforce();
         assert!(s.trailers(Dir::Response).is_err(), "trailers before a head");
-        s.end_lane(Dir::Response).unwrap();
-        assert!(s.head(Dir::Response).is_err(), "a head after the end");
+        s.end_lane(Dir::Response, false).unwrap();
+        assert!(
+            s.head(Dir::Response, false).is_err(),
+            "a head after the end"
+        );
     }
 }

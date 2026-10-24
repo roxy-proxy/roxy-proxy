@@ -1,4 +1,4 @@
-//! An in-test `roxy.layer.v6` service behind the scripted upstream: a
+//! An in-test `roxy.layer.v7` service behind the scripted upstream: a
 //! WebSocket handshake carrying the subprotocol is served here, on any
 //! port. The connection's behaviour is picked by the handshake's path:
 //!
@@ -30,9 +30,6 @@
 //!   response body bytes;
 //! * `/svc/sever`: a pass-through that resets the stream on the first
 //!   response body bytes it gets;
-//! * `/svc/talk`: sends [`TALK_BYTES`] of request body on each stream as
-//!   it opens, with no head, within the credit roxy grants, and logs the
-//!   stream once all of it has gone;
 //! * `/svc/flood`: sends one request body frame of [`FLOOD_BYTES`] on
 //!   each stream as it opens, with no head and without waiting for
 //!   credit;
@@ -47,8 +44,11 @@
 //!   passes through once it is answered;
 //! * `/svc/late-quarantine`: passes the request through, calls
 //!   `quarantine` on the response head and passes it on once answered;
-//! * `/svc/audit`: a pass-through that calls `record` on roxy's
-//!   `response_end` and sends its own only once the record is answered.
+//! * `/svc/audit`: an observer that calls `record` once the response copy
+//!   is through, and closes only once the record is answered.
+//!
+//! On an observe stream every behaviour sends nothing back on the lanes,
+//! and closes once both copies are through (`hold` never closes).
 //!
 //! Every other connection credits roxy back for the bytes it receives.
 
@@ -98,9 +98,6 @@ fn dir_of(name: &str) -> Option<u8> {
 /// window.
 pub(crate) const FLOOD_BYTES: usize = 300 * 1024;
 
-/// What `/svc/talk` sends on each stream, on credit: several windows.
-pub(crate) const TALK_BYTES: usize = 4 * 256 * 1024;
-
 /// How long `/svc/pause` leaves its socket unread after the handshake.
 pub(crate) const PAUSE: std::time::Duration = std::time::Duration::from_millis(300);
 
@@ -117,7 +114,6 @@ pub(crate) struct ServiceLog {
     unknown_resets: Mutex<Vec<u32>>,
     /// Every control message, in arrival order.
     controls: Mutex<Vec<Value>>,
-    talked: Mutex<Vec<u32>>,
     /// Body bytes received per stream id, across connections, by
     /// direction byte.
     received: Mutex<HashMap<u32, [usize; 2]>>,
@@ -195,18 +191,6 @@ impl ServiceLog {
                 )
             });
     }
-
-    /// Waits until `n` `/svc/talk` streams got all their bytes out.
-    pub(crate) async fn until_talked(&self, n: usize) {
-        let wait = async {
-            while lock(&self.talked).len() < n {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
-        };
-        tokio::time::timeout(std::time::Duration::from_secs(10), wait)
-            .await
-            .expect("the service gets its bytes out");
-    }
 }
 
 /// Whether `req` is a service handshake.
@@ -280,14 +264,24 @@ struct Sess {
     /// Whether `request-trailers` adds the forbidden fields to this
     /// stream's trailer section (the request's URL ends in `/forbidden`).
     forbidden_trailers: bool,
+    /// An observe stream: one way, ended by the service's `close`.
+    observe: bool,
+    /// Each direction the layer sees the head of only: a head alone.
+    head_only: [bool; 2],
+    /// An observe stream's copies roxy has finished sending.
+    copied: [bool; 2],
 }
 
 impl Sess {
-    fn new() -> Self {
+    fn new(open: &Value) -> Self {
+        let head_only = |dir: &str| open["subscribe"][dir] == "head";
         Self {
             lanes: [Lane::new(), Lane::new()],
             calls_waiting: 0,
             forbidden_trailers: false,
+            observe: open["mode"] == "observe",
+            head_only: [head_only("request"), head_only("response")],
+            copied: [false; 2],
         }
     }
 }
@@ -313,7 +307,6 @@ enum Mode {
     Hoard,
     Forward,
     Overlong,
-    Talk,
     Flood,
     Pause,
     Slow,
@@ -387,8 +380,6 @@ impl Mode {
             Self::Forward
         } else if path.ends_with("/overlong") {
             Self::Overlong
-        } else if path.ends_with("/talk") {
-            Self::Talk
         } else if path.ends_with("/pause") {
             Self::Pause
         } else if path.ends_with("/slow") {
@@ -484,7 +475,6 @@ impl Conn {
             | Mode::Refuse
             | Mode::NoContent
             | Mode::Abort
-            | Mode::Talk
             | Mode::Flood
             | Mode::Pause
             | Mode::AnswerOpen
@@ -616,6 +606,9 @@ impl Conn {
         };
         let kind = v["type"].as_str().unwrap_or_default().to_owned();
         lock(&self.log.controls).push(v.clone());
+        if self.observing(id) && lane_of(&kind, &v).is_some() {
+            return self.copy_control(id, &kind, &v);
+        }
         match kind.as_str() {
             "request" if self.mode == Mode::AnswerOpen => {
                 let status = if v["method"] == "HEAD" { 200 } else { 204 };
@@ -629,8 +622,8 @@ impl Conn {
             }
             "request" if self.mode == Mode::TrailersCut => self.cut_declared_or_trailers(id, &v),
             "open" => {
+                self.opened(id, &v);
                 lock(&self.log.opens).push(v);
-                self.opened(id);
             }
             "credit" => {
                 let n = v["bytes"].as_u64().unwrap_or(0);
@@ -704,16 +697,6 @@ impl Conn {
                 self.pass_control(id, &kind, v);
             }
             "response_end" if self.mode == Mode::Hold => {}
-            "response_end" if self.mode == Mode::Audit => {
-                // The whole response has been read: record it, and end the
-                // stream only once the record is answered.
-                self.call_host(
-                    id,
-                    RESPONSE,
-                    vec![json!({"type": "record", "id": 1, "kind": "audit", "data": {"read": "response"}})],
-                );
-                self.pass_control(id, &kind, v);
-            }
             _ => self.pass_control(id, &kind, v),
         }
     }
@@ -768,6 +751,44 @@ impl Conn {
         self.send(text(id, json!({"type": "request_end"})));
     }
 
+    fn observing(&self, id: u32) -> bool {
+        self.streams.get(&id).is_some_and(|s| s.observe)
+    }
+
+    /// A head or end of an observer's copy: nothing goes back on an
+    /// observe stream. Once both copies are through (an end, or a head
+    /// alone for a head-only direction) the service closes, after `audit`
+    /// has recorded what it read; `hold` never does.
+    fn copy_control(&mut self, id: u32, kind: &str, v: &Value) {
+        let Some(dir) = lane_of(kind, v) else {
+            return;
+        };
+        let Some(s) = self.streams.get_mut(&id) else {
+            return;
+        };
+        if kind.ends_with("_end") || s.head_only[usize::from(dir)] {
+            s.copied[usize::from(dir)] = true;
+        }
+        if dir == RESPONSE && s.copied[usize::from(RESPONSE)] && self.mode == Mode::Audit {
+            self.call_host(
+                id,
+                RESPONSE,
+                vec![json!({"type": "record", "id": 1, "kind": "audit", "data": {"read": "response"}})],
+            );
+        }
+        self.close_if_done(id);
+    }
+
+    fn close_if_done(&mut self, id: u32) {
+        let Some(s) = self.streams.get(&id) else {
+            return;
+        };
+        if s.observe && s.copied == [true; 2] && s.calls_waiting == 0 && self.mode != Mode::Hold {
+            self.streams.remove(&id);
+            self.send(text(id, json!({"type": "close"})));
+        }
+    }
+
     /// Passes a head or end straight back in its own direction, when the
     /// behaviour passes that direction.
     fn pass_control(&mut self, id: u32, kind: &str, mut v: Value) {
@@ -786,8 +807,8 @@ impl Conn {
     }
 
     /// Stream `id` opened: what the behaviour does before roxy's request.
-    fn opened(&mut self, id: u32) {
-        let mut sess = Sess::new();
+    fn opened(&mut self, id: u32, open: &Value) {
+        let mut sess = Sess::new(open);
         sess.lanes[usize::from(REQUEST)].held = self.mode == Mode::Patient;
         self.streams.insert(id, sess);
         match self.mode {
@@ -818,7 +839,9 @@ impl Conn {
             | Mode::RequestTrailers => {}
             Mode::ForwardOnOpen => {
                 self.send(text(id, json!({"type": "request", "method": "POST", "url": "http://up.test/x", "headers": []})));
-                self.send(text(id, json!({"type": "request_end"})));
+                if !self.streams[&id].head_only[usize::from(REQUEST)] {
+                    self.send(text(id, json!({"type": "request_end"})));
+                }
             }
             Mode::Host => self.call_host(
                 id,
@@ -834,13 +857,6 @@ impl Conn {
             ),
             Mode::Quarantine => {
                 self.call_host(id, REQUEST, vec![json!({"type": "quarantine", "id": 1})]);
-            }
-            Mode::Talk => {
-                let s = self.streams.get_mut(&id).expect("just opened");
-                s.lanes[usize::from(REQUEST)]
-                    .queue
-                    .push_back(Queued::Bytes(Bytes::from(vec![0x5au8; TALK_BYTES])));
-                self.flush(id, REQUEST);
             }
             Mode::Flood => self.send(binary(id, REQUEST, &vec![0x5au8; FLOOD_BYTES])),
         }
@@ -870,6 +886,7 @@ impl Conn {
             }
             self.flush(id, REQUEST);
             self.flush(id, RESPONSE);
+            self.close_if_done(id);
         }
     }
 
@@ -906,7 +923,7 @@ impl Conn {
             return;
         }
         if self.passes(dir)
-            && let Some(s) = self.streams.get_mut(&id)
+            && let Some(s) = self.streams.get_mut(&id).filter(|s| !s.observe)
         {
             let data = if self.mode == Mode::Shout && dir == RESPONSE {
                 Bytes::from(data.to_ascii_uppercase())
@@ -951,9 +968,6 @@ impl Conn {
                     }
                 }
             }
-        }
-        if lane.queue.is_empty() && self.mode == Mode::Talk {
-            lock(&self.log.talked).push(id);
         }
         for m in out {
             self.send(m);

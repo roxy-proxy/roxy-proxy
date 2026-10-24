@@ -199,20 +199,10 @@ causes, on the operational log line a `log` writes, and on the cause of
 the `quarantined` event a `quarantine` trips. `endpoints.call`
 has no message: a service calls what it needs itself.
 
-### Migration from v6
+### Versions
 
-`roxy.layer.v7` is incompatible with `roxy.layer.v6`, `roxy.layer.v5` and
-the experimental `roxy.layer.v0`. Update the WebSocket subprotocol on both
-peers together. Two things change from v6:
-
-- A head-only lane is a head alone. Stop sending `request_end` /
-  `response_end` after a head on a direction subscribed `head`, and expect
-  none from roxy.
-- An observe stream is one way. Stop sending heads, bytes and ends on it,
-  and send `close` when done with it instead.
-
-The bundled Python helper implements this contract. Incompatible protocol
-changes use a new subprotocol name so older peers fail at negotiation.
+roxy offers `roxy.layer.v7` only, and a service that does not select it
+fails at the handshake. The bundled Python helper implements it.
 
 WASM layers use `roxy:addon@0.3.0`; rebuild components with the matching SDK
 and WIT. Components using `roxy:addon@0.2.1` or the experimental unversioned

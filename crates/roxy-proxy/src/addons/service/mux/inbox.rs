@@ -4,9 +4,9 @@
 
 use std::sync::{Arc, Mutex};
 
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use http::HeaderMap;
-use roxy_http::{BodyError, BodySender};
+use roxy_http::BodyError;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
@@ -45,7 +45,7 @@ impl Inbox {
 
 /// Moves one body's bytes from its inbox to the lane, crediting the
 /// service as they go.
-pub(super) async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut body: Output, dir: Dir) {
+pub(super) async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut body: LaneBody, dir: Dir) {
     loop {
         let (chunk, trailers, end, abort) = {
             let mut q = lock(&inbox.q);
@@ -113,54 +113,6 @@ pub(super) async fn feeder(stream: Arc<Stream>, inbox: Arc<Inbox>, mut body: Out
             () = inbox.ready.notified() => {}
             () = inbox.abort.cancelled() => {}
             () = body.closed() => return consumer_gone(&stream, &inbox, dir),
-        }
-    }
-}
-
-/// A full subscription writes the lane directly. A head-only subscription
-/// supplies the empty producer body joined with the bypassed body by the
-/// same adapter used for WASM. Its end completes only that producer body;
-/// the lane still owes the bypassed body's end and consumption.
-pub(super) enum Output {
-    Lane(LaneBody),
-    HeadOnly(BodySender),
-}
-
-impl Output {
-    async fn send_data(&mut self, data: Bytes) -> Result<(), BodyError> {
-        match self {
-            Self::Lane(body) => body.send_data(data).await,
-            Self::HeadOnly(body) => body.send_data(data).await,
-        }
-    }
-
-    async fn send_trailers(&mut self, trailers: HeaderMap) -> Result<(), BodyError> {
-        match self {
-            Self::Lane(body) => body.send_trailers(trailers).await,
-            Self::HeadOnly(body) => body.send_trailers(trailers).await,
-        }
-    }
-
-    async fn finish(self) -> Result<(), BodyError> {
-        match self {
-            Self::Lane(body) => body.finish().await,
-            Self::HeadOnly(body) => body.finish().await,
-        }
-    }
-
-    fn abort(self, why: String) {
-        match self {
-            Self::Lane(body) => body.abort(why),
-            // Head-only error ends are protocol faults, recorded before
-            // this cancellation reaches the shared subscription adapter.
-            Self::HeadOnly(body) => body.abort(BodyError::Stopped),
-        }
-    }
-
-    async fn closed(&self) {
-        match self {
-            Self::Lane(body) => body.closed().await,
-            Self::HeadOnly(body) => body.closed().await,
         }
     }
 }

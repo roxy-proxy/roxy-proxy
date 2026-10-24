@@ -1,4 +1,4 @@
-"""The service side of roxy's service layers (`roxy.layer.v6`).
+"""The service side of roxy's service layers (`roxy.layer.v7`).
 
 roxy keeps a few WebSocket connections open to the service and carries
 each exchange as a stream on one of them. Text frames are JSON control
@@ -24,7 +24,13 @@ and stops inputs it will not consume (this module does both). A body that fails 
 `error` on the end rather than ending the stream. The reader of a body may
 `stop` it: after roxy's `stop` for a lane this side sends no more of it.
 Each body is flow-controlled with `credit` messages, and either side may
-abandon a stream with `reset`. This module handles the streams, credit,
+abandon a stream with `reset`.
+
+A direction the layer subscribes to as `head` is a head alone each way:
+no bytes, trailers or end follow it. Here its body reads as empty and
+`forward` or `respond` sends the head only. An observe stream is one way:
+the service sends nothing on its lanes, `forward` and `respond` send
+nothing, and the stream sends `close` once the handler returns. This module handles the streams, credit,
 stops and resets, and turns each exchange into one coroutine:
 
     async def handle(ex: Exchange) -> None:
@@ -66,7 +72,7 @@ from typing import Any
 
 from websockets.asyncio.server import ServerConnection, serve as ws_serve
 
-SUBPROTOCOL = "roxy.layer.v6"
+SUBPROTOCOL = "roxy.layer.v7"
 
 # The direction byte of a binary frame, and the `dir` of a credit message.
 REQUEST = 0
@@ -196,6 +202,8 @@ class _Conn:
             flow = {k: v for k, v in msg.items() if k not in ("type", "stream")}
             s = _Stream(self, sid, flow)
             s.observe = flow.get("mode") == "observe"
+            subscribe = flow.get("subscribe") or {}
+            s.head_only = {d: subscribe.get(n) == "head" for d, n in _DIR_NAMES.items()}
             self.streams[sid] = s
             s.task = asyncio.create_task(s.run(observe=s.observe))
             return
@@ -225,6 +233,11 @@ class _Conn:
         else:
             direction = _DIR_OF_MESSAGE.get(kind, REQUEST)
             s.inbox(direction).put_nowait(msg)
+            if kind in ("request", "response") and s.head_only[direction]:
+                # The head is the whole lane: its body reads as empty.
+                s.inbox(direction).put_nowait({"type": f"{kind}_end"})
+                s._ends_received[direction] = True
+                s._maybe_ended()
             if kind in ("request_end", "response_end"):
                 s._ends_received[direction] = True
                 s._maybe_ended()
@@ -263,6 +276,8 @@ class _Stream:
         self.pending: dict[int, asyncio.Future[dict[str, Any]]] = {}
         self._next_call = 0
         self.observe = False
+        # Directions subscribed as `head`: a head alone each way.
+        self.head_only = {REQUEST: False, RESPONSE: False}
         # A `request` was forwarded.
         self.forwarded = False
         self._ends_sent = {REQUEST: False, RESPONSE: False}
@@ -390,22 +405,21 @@ class _Stream:
             # request lane headless, and releases unread inputs.
             await exchange._finish_forwarding()
             await self._stop_inputs()
-            for direction in (REQUEST, RESPONSE):
-                if not self._ends_sent[direction]:
-                    await self.send({"type": f"{_DIR_NAMES[direction]}_end"}, end=direction)
+            await self._end_outputs()
             await self._settled.wait()
         except ForwardEnded as e:
             if exchange is not None:
                 await exchange._stop_forwarding()
             await self._stop_inputs()
             for direction in (REQUEST, RESPONSE):
-                if not self._ends_sent[direction]:
+                if not self._ends_sent[direction] and not self.observe:
                     end: dict[str, Any] = {"type": f"{_DIR_NAMES[direction]}_end"}
                     if direction == REQUEST:
                         end["error"] = "the forward ended before the upload completed"
                     elif e.error is not None:
                         end["error"] = e.error
                     await self.send(end, end=direction)
+            await self._end_outputs()
             await self._settled.wait()
         except asyncio.CancelledError:
             # roxy reset the stream, or the connection went.
@@ -428,6 +442,19 @@ class _Stream:
                 await exchange._stop_forwarding()
             self.fail_calls(ProtocolError("the stream has ended"))
             self.conn.streams.pop(self.id, None)
+
+    async def _end_outputs(self) -> None:
+        """Ends what is left of this side's lanes: with an end alone each,
+        or on an observe stream, which has none, with `close`."""
+        if self.observe:
+            if not all(self._ends_sent.values()):
+                await self.conn.send(self.id, {"type": "close"})
+                for direction in self._ends_sent:
+                    self._lane_done(direction)
+            return
+        for direction in (REQUEST, RESPONSE):
+            if not self._ends_sent[direction]:
+                await self.send({"type": f"{_DIR_NAMES[direction]}_end"}, end=direction)
 
     async def recv(self, direction: int) -> dict[str, Any] | bytes:
         lane = self.lanes[direction]
@@ -579,10 +606,12 @@ class Exchange:
         """The whole request body."""
         return b"".join([c async for c in self.body()])
 
-    async def _send(self, msg: dict[str, Any]) -> None:
-        await self._s.send(msg)
-
     async def _send_body(self, direction: int, body: Body) -> None:
+        if self._s.head_only[direction]:
+            # The head was the whole lane.
+            if isinstance(body, bytes) and body:
+                raise ProtocolError(f"the {_DIR_NAMES[direction]} is subscribed head-only")
+            return
         end: dict[str, Any] = {"type": f"{_DIR_NAMES[direction]}_end"}
         if isinstance(body, bytes):
             if body:
@@ -652,7 +681,12 @@ class Exchange:
 
         Completing both outputs leaves the response input available.
         To keep the forward running, consume its response; returning from
-        the handler stops any inputs it left unfinished."""
+        the handler stops any inputs it left unfinished.
+
+        On an observe stream nothing is sent: roxy forwards the exchange
+        as it is, and this returns the copy of its response head."""
+        if self._s.observe:
+            return _response_of(await self._s.recv(RESPONSE))
         await self._s.send(
             {
                 "type": "request",
@@ -661,6 +695,7 @@ class Exchange:
                 "headers": request.headers,
             },
             forward=True,
+            end=REQUEST if self._s.head_only[REQUEST] else None,
         )
         self._forwarding = asyncio.create_task(self._send_body(REQUEST, body))
         head = asyncio.ensure_future(self._s.recv(RESPONSE))
@@ -677,16 +712,7 @@ class Exchange:
             head.cancel()
             await asyncio.wait({head})
             raise
-        if isinstance(m, bytes):
-            raise ProtocolError("body bytes before the response head")
-        if m.get("type") == "response_end":
-            raise ForwardEnded(m.get("error"))
-        if m.get("type") != "response":
-            raise ProtocolError(f"expected response, got {m.get('type')}")
-        return Response(
-            status=m["status"],
-            headers=[tuple(h) for h in m.get("headers", [])],  # type: ignore[misc]
-        )
+        return _response_of(m)
 
     def response_body(self) -> AsyncIterator[bytes]:
         """The response body from upstream, as it arrives. Read it once, after
@@ -707,15 +733,33 @@ class Exchange:
         reads its response; a handler that wants nothing forwarded does not
         forward. It may finish its answer while still consuming the forward's
         response. A body that failed on its way in is
-        relayed cut, with the error on its end."""
-        await self._send(
+        relayed cut, with the error on its end. On an observe stream nothing
+        is sent: roxy's own answer stands."""
+        if self._s.observe:
+            return
+        await self._s.send(
             {
                 "type": "response",
                 "status": response.status,
                 "headers": response.headers,
-            }
+            },
+            end=RESPONSE if self._s.head_only[RESPONSE] else None,
         )
         await self._send_body(RESPONSE, body)
+
+
+def _response_of(m: dict[str, Any] | bytes) -> Response:
+    """The response head the forward's response lane opened with."""
+    if isinstance(m, bytes):
+        raise ProtocolError("body bytes before the response head")
+    if m.get("type") == "response_end":
+        raise ForwardEnded(m.get("error"))
+    if m.get("type") != "response":
+        raise ProtocolError(f"expected response, got {m.get('type')}")
+    return Response(
+        status=m["status"],
+        headers=[tuple(h) for h in m.get("headers", [])],  # type: ignore[misc]
+    )
 
 
 Handler = Callable[[Exchange], Awaitable[None]]
