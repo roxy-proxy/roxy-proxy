@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="340" viewBox="0 0 800 340" font-family="Inter, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="17">
+  <defs>
+    <marker id="req" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0f766e"/>
+    </marker>
+    <marker id="res" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5f6b68"/>
+    </marker>
+    <marker id="thin" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7e8986"/>
+    </marker>
+  </defs>
+
+  <!-- the sealed network: nothing leaves it except through roxy -->
+  <rect x="8" y="8" width="452" height="322" rx="10" fill="none" stroke="#16201e" stroke-width="1.5" stroke-dasharray="6 4"/>
+  <text x="24" y="34" fill="#16201e" font-weight="600">sandbox network</text>
+  <text x="24" y="54" fill="#7e8986" font-size="14">no route out except roxy</text>
+
+  <!-- workload -->
+  <rect x="24" y="110" width="186" height="80" rx="12" fill="#f3f5f4" stroke="#cfd4d2"/>
+  <text x="117" y="136" fill="#16201e" font-weight="600" text-anchor="middle">workload</text>
+  <text x="117" y="158" fill="#5f6b68" font-size="13" text-anchor="middle">HTTPS_PROXY=roxy:3128</text>
+  <text x="117" y="177" fill="#5f6b68" font-size="13" text-anchor="middle">trusts roxy's CA</text>
+
+  <!-- roxy, the only host on both networks; drawn over the boundary -->
+  <rect x="340" y="80" width="268" height="190" rx="10" fill="#ffffff" stroke="#0f766e" stroke-width="1.5"/>
+  <text x="356" y="106" fill="#0f766e" font-weight="600">roxy</text>
+  <g stroke="#cfd4d2" fill="#f3f5f4">
+    <rect x="356" y="118" width="116" height="56" rx="6"/>
+    <rect x="356" y="214" width="50" height="34" rx="6"/>
+    <rect x="414" y="214" width="80" height="34" rx="6"/>
+  </g>
+  <text x="414" y="142" fill="#16201e" font-weight="600" text-anchor="middle">proxy port</text>
+  <text x="414" y="163" fill="#5f6b68" font-size="14" text-anchor="middle">3128</text>
+  <text x="381" y="236" fill="#16201e" font-size="14" font-weight="600" text-anchor="middle">CA</text>
+  <text x="454" y="236" fill="#16201e" font-size="14" font-weight="600" text-anchor="middle">secrets</text>
+  <g fill="#5f6b68" font-size="14" text-anchor="middle">
+    <text x="546" y="134">decrypt</text>
+    <text x="546" y="154">addons</text>
+    <text x="546" y="174">rules</text>
+    <text x="546" y="194">address floor</text>
+    <text x="546" y="214">flow log</text>
+  </g>
+
+  <!-- allowed upstreams -->
+  <rect x="634" y="96" width="158" height="92" rx="8" fill="#f3f5f4" stroke="#cfd4d2"/>
+  <text x="713" y="122" fill="#16201e" font-weight="600" text-anchor="middle">allowed</text>
+  <text x="713" y="146" fill="#5f6b68" font-size="14" text-anchor="middle">api.anthropic.com</text>
+  <text x="713" y="168" fill="#5f6b68" font-size="14" text-anchor="middle">github.com</text>
+
+  <!-- request and response -->
+  <g fill="none" stroke-width="2" stroke-linejoin="round">
+    <path d="M 210 136 H 338" stroke="#0f766e" marker-end="url(#req)"/>
+    <path d="M 608 124 H 632" stroke="#0f766e" marker-end="url(#req)"/>
+    <path d="M 634 160 H 610" stroke="#5f6b68" marker-end="url(#res)"/>
+    <path d="M 340 164 H 212" stroke="#5f6b68" marker-end="url(#res)"/>
+  </g>
+  <text x="218" y="127" fill="#0f766e" font-size="14" font-weight="600">request</text>
+  <text x="332" y="184" fill="#5f6b68" font-size="14" font-weight="600" text-anchor="end">response</text>
+  <text x="713" y="214" fill="#0f766e" font-size="14" font-weight="600" text-anchor="middle">real key added</text>
+
+  <!-- the CA, fetched from roxy -->
+  <path d="M 356 231 H 316 V 262 H 117 V 192" fill="none" stroke="#7e8986" stroke-width="1.2" stroke-dasharray="3 3" marker-end="url(#thin)"/>
+  <text x="128" y="256" fill="#5f6b68" font-size="13">roxy-ca.pem, port 3130</text>
+
+  <!-- a direct route out: blocked at the boundary -->
+  <path d="M 44 190 V 304 H 452" fill="none" stroke="#7e8986" stroke-width="1.5" stroke-dasharray="4 3"/>
+  <g stroke="#16201e" stroke-width="2.2" stroke-linecap="round">
+    <line x1="454" y1="298" x2="466" y2="310"/>
+    <line x1="466" y1="298" x2="454" y2="310"/>
+  </g>
+  <text x="56" y="296" fill="#5f6b68" font-size="14">direct TCP, UDP and DNS: no route</text>
+</svg>

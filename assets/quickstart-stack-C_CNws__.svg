@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="416" viewBox="0 0 800 416" font-family="Inter, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="17">
+  <defs>
+    <marker id="req" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0f766e"/>
+    </marker>
+    <marker id="res" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#5f6b68"/>
+    </marker>
+    <marker id="thin" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7e8986"/>
+    </marker>
+  </defs>
+
+  <!-- the three services the layers talk to -->
+  <g fill="#ffffff" stroke="#cfd4d2">
+    <rect x="111" y="4" width="110" height="52" rx="6"/>
+    <rect x="229" y="4" width="110" height="52" rx="6"/>
+    <rect x="347" y="4" width="110" height="52" rx="6"/>
+  </g>
+  <g fill="#16201e" font-size="16" font-weight="600" text-anchor="middle">
+    <text x="166" y="26">auth-service</text>
+    <text x="284" y="26">quota-board</text>
+    <text x="402" y="26">sentinel</text>
+  </g>
+  <g fill="#5f6b68" font-size="13" text-anchor="middle">
+    <text x="166" y="46">/introspect</text>
+    <text x="284" y="46">/check, /report</text>
+    <text x="402" y="46">WebSocket</text>
+  </g>
+
+  <!-- roxy -->
+  <rect x="100" y="96" width="592" height="204" rx="10" fill="#ffffff" stroke="#0f766e" stroke-width="1.5"/>
+  <text x="114" y="120" fill="#0f766e" font-weight="600">roxy</text>
+
+  <!-- stages -->
+  <g stroke="#cfd4d2" fill="#f3f5f4">
+    <rect x="112" y="130" width="108" height="156" rx="6" stroke-dasharray="4 3"/>
+    <rect x="230" y="130" width="108" height="156" rx="6" stroke-dasharray="4 3"/>
+    <rect x="348" y="130" width="108" height="156" rx="6" stroke-dasharray="4 3"/>
+    <rect x="466" y="130" width="100" height="156" rx="6"/>
+    <rect x="576" y="130" width="104" height="156" rx="6"/>
+  </g>
+  <g fill="#16201e" font-size="16" font-weight="600" text-anchor="middle">
+    <text x="166" y="154">auth-gate</text>
+    <text x="284" y="154">token-quota</text>
+    <text x="516" y="154">rules</text>
+    <text x="628" y="154">connect</text>
+  </g>
+  <g fill="#5f6b68" font-size="13" text-anchor="middle">
+    <text x="166" y="240">WASM</text>
+    <text x="166" y="258">401 if unknown</text>
+    <text x="166" y="276">tags the user</text>
+    <text x="284" y="240">WASM</text>
+    <text x="284" y="258">429 when over</text>
+    <text x="284" y="276">meters usage</text>
+    <text x="402" y="240">service</text>
+    <text x="402" y="258">judges tool use</text>
+    <text x="402" y="276">holds the reply</text>
+    <text x="516" y="258">adds API key</text>
+    <text x="516" y="276">allows model</text>
+    <text x="628" y="258">address floor</text>
+    <text x="628" y="276">private_ok</text>
+  </g>
+
+  <!-- client and upstream -->
+  <rect x="4" y="172" width="80" height="48" rx="24" fill="#f3f5f4" stroke="#cfd4d2"/>
+  <text x="44" y="202" fill="#16201e" font-weight="600" text-anchor="middle">client</text>
+  <rect x="702" y="172" width="94" height="48" rx="24" fill="#f3f5f4" stroke="#cfd4d2"/>
+  <text x="749" y="201" fill="#16201e" font-size="15" font-weight="600" text-anchor="middle">fake-model</text>
+  <g fill="#5f6b68" font-size="13" text-anchor="middle">
+    <text x="44" y="240">chat.py,</text>
+    <text x="44" y="256">as alice</text>
+    <text x="749" y="240">POST</text>
+    <text x="749" y="256">/v1/messages</text>
+  </g>
+
+  <!-- request and response, each leaving roxy for the sentinel and coming back -->
+  <g fill="none" stroke-width="2" stroke-linejoin="round">
+    <path d="M 84 178 H 380 V 58" stroke="#0f766e" marker-end="url(#req)"/>
+    <path d="M 394 58 V 178 H 700" stroke="#0f766e" marker-end="url(#req)"/>
+    <g stroke="#f3f5f4" stroke-width="6">
+      <line x1="410" y1="170" x2="410" y2="186"/>
+      <line x1="424" y1="170" x2="424" y2="186"/>
+    </g>
+    <path d="M 702 214 H 424 V 58" stroke="#5f6b68" marker-end="url(#res)"/>
+    <path d="M 410 58 V 214 H 86" stroke="#5f6b68" marker-end="url(#res)"/>
+  </g>
+  <text x="402" y="154" fill="#16201e" font-size="16" font-weight="600" text-anchor="middle" stroke="#f3f5f4" stroke-width="6" stroke-linejoin="round" paint-order="stroke">sentinel</text>
+
+  <!-- endpoint calls -->
+  <g stroke="#7e8986" stroke-width="1.2" fill="none">
+    <line x1="159" y1="176" x2="159" y2="58" marker-end="url(#thin)"/>
+    <line x1="173" y1="58" x2="173" y2="176" marker-end="url(#thin)"/>
+    <line x1="270" y1="176" x2="270" y2="58" marker-end="url(#thin)"/>
+    <line x1="284" y1="58" x2="284" y2="176" marker-end="url(#thin)"/>
+    <line x1="298" y1="212" x2="298" y2="58" marker-end="url(#thin)"/>
+  </g>
+  <g fill="#5f6b68" font-size="13">
+    <text x="153" y="82" text-anchor="end">who?</text>
+    <text x="264" y="82" text-anchor="end">may spend?</text>
+    <text x="304" y="82">used</text>
+  </g>
+
+  <!-- flow log -->
+  <g stroke="#cfd4d2" stroke-dasharray="3 3">
+    <line x1="166" y1="286" x2="166" y2="324"/>
+    <line x1="284" y1="286" x2="284" y2="324"/>
+    <line x1="402" y1="286" x2="402" y2="324"/>
+    <line x1="516" y1="286" x2="516" y2="324"/>
+    <line x1="628" y1="286" x2="628" y2="324"/>
+  </g>
+  <rect x="8" y="324" width="784" height="84" rx="10" fill="#f8f9f8" stroke="#e6e8e7"/>
+  <text x="400" y="348" fill="#3d4846" font-size="16" text-anchor="middle">flow log: one line per exchange</text>
+  <g fill="#5f6b68" font-size="13" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" text-anchor="middle">
+    <text x="400" y="372">"addons":["auth-gate","token-quota","sentinel"]  "tags":["user:alice"]</text>
+    <text x="400" y="392">"mutations":["set_header:x-api-key"]  "decision":"allow"  "res":{"status":200}</text>
+  </g>
+</svg>

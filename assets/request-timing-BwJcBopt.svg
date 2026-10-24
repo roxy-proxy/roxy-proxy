@@ -1,0 +1,104 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="264" viewBox="0 52 800 264" font-family="Inter, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="17">
+  <defs>
+    <marker id="req" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#0f766e"/>
+    </marker>
+    <marker id="thin" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7e8986"/>
+    </marker>
+  </defs>
+
+  <!-- client and upstream -->
+  <rect x="4" y="186" width="76" height="46" rx="23" fill="#f3f5f4" stroke="#cfd4d2"/>
+  <text x="42" y="215" fill="#16201e" font-weight="600" text-anchor="middle">client</text>
+  <rect x="710" y="186" width="86" height="46" rx="23" fill="#f3f5f4" stroke="#cfd4d2"/>
+  <text x="753" y="215" fill="#16201e" font-size="16" font-weight="600" text-anchor="middle">upstream</text>
+
+  <!-- roxy -->
+  <rect x="96" y="56" width="600" height="250" rx="10" fill="#ffffff" stroke="#0f766e" stroke-width="1.5"/>
+  <text x="110" y="80" fill="#0f766e" font-weight="600">roxy</text>
+
+  <!-- legend: the head travels first, the body streams behind it -->
+  <g stroke="#0f766e" stroke-width="2">
+    <line x1="420" y1="76" x2="448" y2="76"/>
+    <line x1="570" y1="76" x2="598" y2="76" stroke-dasharray="6 4"/>
+  </g>
+  <g fill="#5f6b68" font-size="14">
+    <text x="454" y="81">request head</text>
+    <text x="604" y="81">body bytes</text>
+  </g>
+
+  <!-- stations: enforce layers and the rules in the path -->
+  <g stroke="#cfd4d2" fill="#f3f5f4">
+    <rect x="110" y="100" width="86" height="192" rx="6"/>
+    <rect x="316" y="100" width="86" height="192" rx="6"/>
+    <rect x="418" y="100" width="264" height="192" rx="6"/>
+  </g>
+  <g fill="#16201e" font-weight="600" text-anchor="middle">
+    <text x="153" y="126">layer A</text>
+    <text x="359" y="126">layer C</text>
+    <text x="550" y="126">rules</text>
+  </g>
+  <g fill="#5f6b68" font-size="13" text-anchor="middle">
+    <text x="153" y="144">enforce</text>
+    <text x="359" y="144">enforce</text>
+  </g>
+
+  <!-- observer beside the path, on a copy -->
+  <rect x="212" y="100" width="88" height="54" rx="6" fill="#ffffff" stroke="#cfd4d2" stroke-dasharray="4 3"/>
+  <text x="256" y="123" fill="#16201e" font-weight="600" font-size="15" text-anchor="middle">layer B</text>
+  <text x="256" y="143" fill="#5f6b68" font-size="13" text-anchor="middle">observe</text>
+  <line x1="256" y1="222" x2="256" y2="157" stroke="#7e8986" stroke-dasharray="3 3" marker-end="url(#thin)"/>
+  <text x="262" y="248" fill="#5f6b68" font-size="13">a copy</text>
+
+  <!-- the two lanes: head (solid) and body bytes (dashed), client to upstream -->
+  <g fill="none" stroke="#0f766e" stroke-width="2" stroke-linejoin="round">
+    <g marker-end="url(#req)">
+      <path d="M 80 196 H 108"/>
+      <path d="M 196 196 H 314"/>
+      <path d="M 402 196 H 416"/>
+      <path d="M 682 196 H 708"/>
+    </g>
+    <path d="M 110 196 H 196"/>
+    <path d="M 316 196 H 402"/>
+    <path d="M 418 196 H 682"/>
+    <g stroke-dasharray="6 4" marker-end="url(#req)">
+      <path d="M 80 222 H 108"/>
+      <path d="M 196 222 H 314"/>
+      <path d="M 402 222 H 416"/>
+      <path d="M 682 222 H 708"/>
+    </g>
+    <g stroke-dasharray="6 4">
+      <path d="M 110 222 H 196"/>
+      <path d="M 316 222 H 402"/>
+      <path d="M 418 222 H 682"/>
+    </g>
+  </g>
+
+  <!-- each layer's `when`, on the head as it reaches the layer -->
+  <g fill="#0f766e">
+    <circle cx="140" cy="196" r="4.5"/>
+    <circle cx="256" cy="196" r="4.5"/>
+    <circle cx="340" cy="196" r="4.5"/>
+  </g>
+  <g fill="#5f6b68" font-size="13">
+    <text x="140" y="184" text-anchor="middle">when</text>
+    <text x="262" y="186">when</text>
+    <text x="340" y="184" text-anchor="middle">when</text>
+  </g>
+
+  <!-- the rules: one admission decision on the head, re-checks as the body streams -->
+  <path d="M 444 186 L 454 196 L 444 206 L 434 196 Z" fill="#ffffff" stroke="#0f766e" stroke-width="1.5"/>
+  <g fill="#0f766e">
+    <circle cx="520" cy="222" r="4"/>
+    <circle cx="570" cy="222" r="4"/>
+    <circle cx="620" cy="222" r="4"/>
+  </g>
+  <g fill="#5f6b68" font-size="14" text-anchor="middle">
+    <text x="550" y="162">admission, once, on the head:</text>
+    <text x="550" y="180">allow · deny · change it</text>
+    <text x="550" y="248">in flight, as bytes pass:</text>
+    <text x="550" y="266">body.bytes · byte metrics</text>
+    <text x="550" y="284">deny or quarantine only</text>
+  </g>
+</svg>

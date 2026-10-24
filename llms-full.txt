@@ -41,7 +41,7 @@ Sitemap:
 
 # Overview
 
-<img src={exchange} alt="An exchange through roxy: TLS decryption, then an addon stack (here a service addon and a WASM addon), then the rules, then the upstream connector with its address floor; the response returns the same way; every stage writes to the flow log" />
+<img src={exchange} alt="An exchange through roxy: TLS decryption, then an addon stack (here a service addon and a WASM addon), then the rules, then the upstream connector with its address floor, with capture recording what the rules allow before the connector; the response returns the same way; every stage writes to the flow log" />
 
 roxy is a strict, programmable HTTP firewall. Requests and responses stream through addons that can rewrite, hold, answer or block them, then through rules that decide what is forwarded. Anything roxy cannot parse, verify or classify is denied ([how roxy works](/design/how-it-works)).
 
@@ -1025,7 +1025,7 @@ naming the imports that do not match.
 
 # How roxy works
 
-<img src={howItWorks} alt="One exchange through roxy, top to bottom. The client's request enters roxy and passes through four stages: decrypt and parse (CONNECT, TLS, strict parse into the canonical request, and the lease check), the addon stack (enforce layers in order, with observers beside them on a copy), the rules (lease checked again; deny wins; effects: secrets, headers, redirect, sign) and connect (DNS, address floor, upstream TLS), then reaches the upstream. The response returns up the same stages: re-framed by the connector, re-checked by the rules, seen by the addons, and canonically re-serialised to the client. Each stage has an exit branching to the right: a parse failure is refused with parse_error, an expired policy denies with _expired at either lease check, an addon can answer the client directly or deny with layer:name, the rules deny with the rule id, and the address floor denies with _address_policy. A flow-log strip down the right edge is fed by every stage and every exit: one record per exchange, never dropped." />
+<img src={howItWorks} alt="One exchange through roxy, top to bottom. The client's request enters roxy and passes through four stages: decrypt and parse (CONNECT, TLS, strict parse into the canonical request, and the lease check), the addon stack (enforce layers in order, with observers beside them on a copy), the rules (lease checked again; deny wins; effects: secrets, headers, redirect, sign) and connect (DNS, address floor, upstream TLS), then reaches the upstream. The response returns up the same stages: re-framed by the connector, re-checked by the rules, seen by the addons, and canonically re-serialised to the client. Each stage has an exit branching to the right: a parse failure is refused with parse_error, an expired policy denies with _expired at either lease check, an addon can answer the client directly or deny with layer:name, the rules deny with the rule id, and the address floor denies with _address_policy. A dotted line between the rules and connect marks where capture records what the rules allow. A flow-log strip down the right edge is fed by every stage and every exit: one record per exchange, never dropped." />
 
 An exchange is one request and its response. Every exchange takes the same
 path, however roxy is deployed.
@@ -1317,15 +1317,7 @@ Configuring addons is covered in
 
 ## The stack
 
-```
-                 request ↓                                   ↑ response
-         ┌─ CONNECT and TLS ─────────────────────────────────────────────┐
-         ├─ first addon listed                                           │
-         ├─ second addon listed                                          │
-         ├─ rules                                                        │
-         ├─ address floor                                                │
-         └─ connection to the origin ────────────────────────────────────┘
-```
+<img src={addonStack} alt="The stack, top to bottom: client, then CONNECT and TLS, the first addon listed, the second addon listed, the rules, the address floor, the connection to the origin, and the origin. The request runs down through every step and the response runs back up. The two addons are marked as the addons, in the order listed; the address floor and the connection to the origin always run, after the rules. A dotted line between the rules and the address floor marks where capture records what the rules allow, and a flow-log strip down the left is fed by every step." />
 
 Addons run in the order they are listed under `addons:`, between the
 client and the rules. Nothing configurable runs between the rules and the
@@ -1381,7 +1373,7 @@ write to finish before passing on the bytes B will read them with. A WASM
 addon's calls always finish before it carries on. A service layer waits
 for the `result` itself.
 
-<img src={layerOrdering} alt="Two enforce layers, A and B, in roxy's request path, left to right, then the rules. The client's head (a solid line) and body bytes (a dashed line) run through A, then B, then to the rules; the gap between A and B is labelled: a chunk reaches B only after A sends it. Part-way through the body, A calls state_put, drawn as an arrow down to a host services strip along the bottom with a result arrow back up, and the note awaits result, then sends on; A's body line is broken at that point. In B, on the chunk that followed, a state_get arrow goes down to the strip and a result comes back, with the note on that chunk: sees A's write. A dotted line between the two calls says ordered only by A's await. The strip reads host services (add_tag, state_put, state_get, record, quarantine, and more): beside the pipeline. Under it: each layer's calls run on their own worker, so A's put lands before B's get only because A awaited its result; a write for this exchange's admission lands before the request is forwarded; any other is seen by the next rule that reads it: a tag in flight on this exchange, state there or at a later exchange's admission." />
+<img src={layerOrdering} alt="Two enforce layers, A and B, in roxy's request path, left to right, then the rules. The client's head (a solid line) and body bytes (a dashed line) run through A, then B, then to the rules; between A and B, a chunk reaches B once A sends it. Part-way through the body, A calls state_put, drawn as an arrow down to a host services strip along the bottom with a result arrow back up, and the note awaits result, then sends on; A's body line is broken at that point. In B, on the chunk that followed, a state_get arrow goes down to the strip and a result comes back, with the note on that chunk: sees A's write. A dotted line between the two calls says ordered only by A's wait. The strip lists host services: add_tag, state_put, state_get, record, and more." />
 
 For the rules to see a tag or state write when they decide on the
 request, it must land before the addon passes the request on. A later
@@ -3092,8 +3084,13 @@ Rotation needs `path`, since stdout cannot be rotated.
 
 ## Capture
 
-Capture records whole requests and responses, as forwarded, to
-`<capture_dir>/capture.jsonl`. It records the exchanges a rule selects
+Capture records whole requests and responses to
+`<capture_dir>/capture.jsonl`. It sits between the rules and the address
+floor. It records the request once the rules allow it, with their
+changes, and the response as it arrives from the upstream, before any
+addon changes it. If the address floor or the connection then fails, the
+capture holds the request head and an `end` with `aborted: true`, and no
+body. It records the exchanges a rule selects
 with `capture: request | response | both`, or every exchange with
 `log.capture.all: true`. It is written like the flow log, with the same
 batching, rotation and backpressure.
