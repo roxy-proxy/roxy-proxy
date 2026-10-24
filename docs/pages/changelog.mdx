@@ -20,7 +20,7 @@ The request trailers a service layer passes on are validated as a client's befor
 
 ### Added
 
-- `http.redact_response_secrets` masks the secret values an exchange's `set_header` effects injected, byte for byte with `*`, in the response head and trailers (`headers`) and in the body as it streams (`bodies`). Values under `min_length` bytes (default 8) are left alone. With `bodies`, those requests go out without `accept-encoding`, and a response roxy cannot decode is refused `unsupported_content_encoding`. `quarantine: true` quarantines the process when a masked part held a secret, with the new cause `secret_in_response` ([#576](https://github.com/roxy-proxy/roxy-proxy/issues/576)).
+- `http.redact_response_secrets` masks the secret values an exchange's `set_header` effects injected, byte for byte with `*`, in the response head and trailers (`headers`) and in the body as it streams (`bodies`). Values under `min_length` bytes (default 8) are left alone. With `bodies`, an encoded response is decoded, masked and encoded again in the same codings, so the client keeps the coding it negotiated, and a response roxy cannot decode is refused `unsupported_content_encoding`. `quarantine: true` quarantines the process when a masked part held a secret, with the new cause `secret_in_response` ([#576](https://github.com/roxy-proxy/roxy-proxy/issues/576)).
 
 ### Fixed
 

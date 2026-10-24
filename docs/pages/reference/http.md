@@ -385,9 +385,11 @@ the response and roxy builds a `CanonicalResponse`:
 roxy decodes `content-encoding` to inspect a body, never to forward it:
 `body.text` and `response.body.text` see the decoded text
 ([body rules](/reference/rule-language#body-rules)); the bytes forwarded
-are the bytes received. The one exception is addons: bodies are decoded at
-the edge of the stack and forwarded decoded
+are the bytes received. Two things change that. Addons: bodies are decoded
+at the edge of the stack and forwarded decoded
 ([content codings for addons](/reference/addon-configuration#content-codings)).
+A response [masked for secrets](/reference/secrets#redacting-responses):
+it is decoded, masked and encoded again in the codings it arrived in.
 
 | coding | format |
 |---|---|
@@ -410,10 +412,9 @@ the edge of the stack and forwarded decoded
 every request as roxy reads it, so origins answer uncompressed. Addons,
 rules and the flow log see the request without it.
 
-`http.redact_response_secrets.bodies` also removes `accept-encoding`, after
-the admission rules, from a request a `set_header` injected a secret of at
-least `min_length` bytes into
-([secrets](/reference/secrets#redacting-responses)).
+Encoding again uses fast settings, flushed per chunk: `gzip` and
+`deflate` at level 1, `br` at quality 4 with a 256 KiB window, and
+`zstd` as one frame per chunk.
 
 ## Deny responses
 

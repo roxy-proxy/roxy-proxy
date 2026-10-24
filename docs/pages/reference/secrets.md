@@ -65,14 +65,14 @@ http:
 - **Bodies:** masked as they stream. A chunk that ends in what could be
   the start of a secret has those bytes (at most `longest secret - 1`)
   held back until the next chunk shows whether the rest follows; nothing
-  else is buffered or delayed. A body keeps its declared length.
-- **Content codings:** with `bodies` on, an injecting request goes out
-  without `accept-encoding`, so the upstream answers uncompressed. A
-  response that is encoded anyway is decoded
-  ([content codings](/reference/http#content-codings)) and passed on,
-  to the addon layers and the client, as plain bytes without
-  `content-encoding` or a declared length. One in a coding roxy does not
-  decode, or a `206` (or `content-range`) of an encoded body, is refused
+  else is buffered or delayed. A plain body keeps its declared length.
+- **Content codings:** the request keeps the client's `accept-encoding`,
+  and the client gets the coding the upstream answered in. An encoded
+  body is decoded ([content codings](/reference/http#content-codings)),
+  masked and encoded again in the same codings, each chunk flushed
+  through the encoder as it is masked, so a stream is not held back. It
+  loses its declared length, since the new encoding has its own. One in
+  a coding roxy does not decode, or a `206` (or `content-range`) of an encoded body, is refused
   `503` (`terminal_rule: _fail_closed`, `reason:
   unsupported_content_encoding`) instead of passed unmasked. A `206` of a
   plain body is masked range by range, its ranges unchanged: a secret

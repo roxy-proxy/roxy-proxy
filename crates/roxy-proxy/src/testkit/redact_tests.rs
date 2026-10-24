@@ -114,8 +114,10 @@ async fn an_exchange_that_injected_nothing_is_left_alone() {
     assert_eq!(body(&a), SECRET);
 }
 
+/// An encoded body is decoded, masked and encoded again, so the client
+/// gets the coding it asked for.
 #[tokio::test]
-async fn an_encoded_body_is_decoded_then_scrubbed() {
+async fn an_encoded_body_is_masked_and_re_encoded() {
     let kit = kit(BOTH).await;
     let mut c = kit.h1().await;
     let echoed = format!("before {SECRET} after");
@@ -127,35 +129,23 @@ async fn an_encoded_body_is_decoded_then_scrubbed() {
     )
     .await;
     assert_eq!(a.status, 200, "{a:?}");
-    assert!(!a.headers.contains_key("content-encoding"), "{a:?}");
-    assert_eq!(body(&a), format!("before {MASKED} after"));
+    assert_eq!(a.headers["content-encoding"], "gzip", "{a:?}");
+    let plain = roxy_http::coding::decode(
+        &[roxy_http::coding::Coding::Gzip],
+        a.body.as_ref().expect("a whole body"),
+        1 << 20,
+        roxy_http::coding::unmetered(),
+    )
+    .unwrap();
+    assert_eq!(plain, format!("before {MASKED} after").as_bytes());
     let seen = kit.upstream.wait_seen(1).await;
-    assert!(
-        !seen[0].headers.contains_key("accept-encoding"),
-        "an injecting request asks for no coding"
+    assert_eq!(
+        seen[0].headers["accept-encoding"], "gzip",
+        "the client's accept-encoding goes to the upstream"
     );
 }
 
-/// `accept-encoding` is only dropped when bodies are scrubbed.
-#[tokio::test]
-async fn accept_encoding_stays_when_only_headers_are_scrubbed() {
-    let kit = kit(ResponseRedaction {
-        headers: true,
-        ..ResponseRedaction::default()
-    })
-    .await;
-    let a = kit
-        .h1()
-        .await
-        .call("GET", "/reflect", &[("accept-encoding", "gzip")], b"")
-        .await;
-    assert_eq!(a.status, 200, "{a:?}");
-    let seen = kit.upstream.wait_seen(1).await;
-    assert_eq!(seen[0].headers["accept-encoding"], "gzip");
-}
-
-/// A body roxy cannot read as plain bytes is refused rather than passed
-/// unscrubbed: a coding it does not decode, or a range of an encoded body.
+/// A body roxy cannot decode is refused rather than passed unscrubbed: a coding it does not decode, or a range of an encoded body.
 #[tokio::test]
 async fn a_body_that_cannot_be_decoded_fails_closed() {
     let kit = kit(BOTH).await;

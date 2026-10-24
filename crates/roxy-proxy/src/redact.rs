@@ -7,7 +7,9 @@
 //! byte, so lengths, `content-length` and byte ranges stay as the upstream
 //! sent them. The stage runs in the core, after the response rules and
 //! before the in-flight body checks, the capture tap and the addon layers,
-//! so everything downstream of the upstream sees the masked response.
+//! so everything downstream of the upstream sees the masked response. An
+//! encoded body is decoded, masked and encoded again in the same codings,
+//! so the client gets the coding it negotiated.
 //!
 //! Matching is literal, so this stops a verbatim echo only: a value the
 //! upstream transforms (base64, escaping, a change of case) passes.
@@ -34,8 +36,8 @@ use crate::server::Shared;
 const UNDECODABLE: &str = "unsupported_content_encoding";
 
 /// Scrubs `res` as `http.redact_response_secrets` asks, if this exchange
-/// injected a secret. A body that cannot be read as plain bytes is refused
-/// rather than passed unscrubbed.
+/// injected a secret. A body that cannot be decoded is refused rather than
+/// passed unscrubbed.
 pub(crate) fn response(cx: &FlowCx, res: &mut CanonicalResponse) -> Result<(), Refusal> {
     let switches = cx.snap.http.redact_response_secrets;
     if !(switches.headers || switches.bodies) {
@@ -65,34 +67,40 @@ pub(crate) fn response(cx: &FlowCx, res: &mut CanonicalResponse) -> Result<(), R
     if response_known_empty(cx, res) {
         return Ok(());
     }
-    if switches.bodies {
-        decode(cx, res)?;
-    }
+    let codings = if switches.bodies {
+        decode(cx, res)?
+    } else {
+        Vec::new()
+    };
     let body = std::mem::take(&mut res.body);
     res.body = MaskedBody::wrap(body, needles, switches, alarm);
+    if !codings.is_empty() {
+        let body = std::mem::take(&mut res.body);
+        res.body = coding::encode_body(body, &codings, cx.shared.window_meter());
+    }
     Ok(())
 }
 
-/// Leaves `res`'s body as plain bytes: decoded by its `content-encoding`,
-/// or refused when it cannot be. A range of an encoded body cannot be
-/// decoded on its own; a range of a plain one is masked as it is.
-fn decode(cx: &FlowCx, res: &mut CanonicalResponse) -> Result<(), Refusal> {
+/// Leaves `res`'s body as plain bytes, decoded by its `content-encoding`,
+/// and returns the codings to encode it in again; or refuses it when it
+/// cannot be decoded. A range of an encoded body cannot be decoded on its
+/// own; a range of a plain one is masked as it is.
+fn decode(cx: &FlowCx, res: &mut CanonicalResponse) -> Result<Vec<coding::Coding>, Refusal> {
     let codings =
         coding::content_codings(&res.headers).map_err(|_| Refusal::fail_closed(UNDECODABLE))?;
     if codings.is_empty() {
-        return Ok(());
+        return Ok(codings);
     }
     if res.status == StatusCode::PARTIAL_CONTENT || res.headers.contains("content-range") {
         return Err(Refusal::fail_closed(UNDECODABLE));
     }
-    res.headers.remove("content-encoding");
     res.body = coding::decode_body(
         std::mem::take(&mut res.body),
         &codings,
         cx.snap.limits.max_response_body_bytes,
         cx.shared.window_meter(),
     );
-    Ok(())
+    Ok(codings)
 }
 
 /// Masks every value in `headers`; whether any held a secret.

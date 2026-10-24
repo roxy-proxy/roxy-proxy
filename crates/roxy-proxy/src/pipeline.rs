@@ -1203,13 +1203,6 @@ fn request_rules(cx: &mut FlowCx, mut req: CanonicalRequest) -> Verdict {
     if let Some(r) = refusal {
         return Verdict::Deny(r);
     }
-    let redaction = cx.snap.http.redact_response_secrets;
-    if redaction.bodies && cx.injected.iter().any(|v| v.len() >= redaction.min_length) {
-        // A body roxy scrubs must arrive in a coding it can read: asking
-        // for none leaves only an upstream that ignores the request to be
-        // decoded or refused.
-        req.headers.remove("accept-encoding");
-    }
     settle_request_facts(cx, &req);
     Verdict::Continue(req)
 }

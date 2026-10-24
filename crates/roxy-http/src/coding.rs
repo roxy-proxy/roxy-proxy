@@ -1,5 +1,6 @@
 //! Content codings (RFC 9110 §8.4.1): strict, bounded decoders for `gzip`,
-//! `deflate`, `br` and `zstd`.
+//! `deflate`, `br` and `zstd`, and streaming encoders to put a decoded body
+//! back in its coding ([`encode_body`]).
 //!
 //! A [`Decoder`] is push in, pull out: [`Decoder::feed`] queues encoded
 //! bytes and [`Decoder::read`] produces at most as many decoded bytes as the
@@ -27,6 +28,9 @@ use ruzstd::decoding::{BlockDecodingStrategy, FrameDecoder};
 
 use crate::len_u64;
 use crate::{Body, BodyError, Headers};
+
+mod encode;
+pub use encode::encode_body;
 
 /// More codings than this in one `content-encoding` is refused rather than
 /// decoded: each one is another decoder (and window) to allocate.
