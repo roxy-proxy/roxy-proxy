@@ -1,36 +1,28 @@
 # TLS
 
-How roxy speaks TLS to clients. The CA itself is in
-[managing the CA](/guides/ca-certificates).
+How roxy speaks TLS to clients on a proxy listener. Setting up the CA is
+in [managing the CA](/guides/ca-certificates).
 
 ## Leaf certificates
 
-Minted on demand per host: a DNS SAN, or an IP SAN for IP targets; ECDSA
-P-256; 7-day validity, or until the CA expires if sooner; signed by the CA;
-all leaves share one key pair. Cached in an LRU of `tls.leaf_cache_size`
-entries (at least 1; `roxy check` refuses 0), minted on the blocking pool
-for the name the handshake will serve (the SNI, or the CONNECT host when
-the client sends none).
+roxy creates a certificate for each host the first time a client
+connects to it, signed by its CA. Certificates are ECDSA P-256 and valid
+for seven days, or until the CA expires if that is sooner. roxy keeps up
+to `tls.leaf_cache_size` of them.
 
 ## Client-facing TLS
 
-* The certificate is picked by SNI; no SNI means the CONNECT host. An SNI
-  that is present but invalid fails the handshake. Valid means valid as a
-  request host: ASCII A-labels, IPv6 in brackets, and a last label that is
-  numeric or `0x`-hex only as a dotted-quad IPv4 address.
-* Hosts are canonicalised everywhere (lower-cased, one trailing dot
-  removed), and that form is the leaf cache key: `CONNECT Example.COM.:443`
-  with SNI `example.com` is one host and one leaf.
-* ALPN offers `h2` (with `http.enable_h2`) and `http/1.1`.
-* TLS 1.2 and 1.3. No session resumption: no session storage, no TLS 1.3
-  tickets.
-* The handshake must complete within `limits.header_timeout`
-  (`tls_handshake_timeout`).
+* roxy picks the certificate by SNI, or by the CONNECT host if the client
+  sends no SNI. An invalid SNI fails the handshake.
+* Host names are compared in lower case without a trailing dot, so
+  `CONNECT Example.COM.:443` with SNI `example.com` is one host.
+* roxy offers HTTP/2 (with `http.enable_h2`) and HTTP/1.1.
+* TLS 1.2 and 1.3 are supported. Sessions are not resumed.
+* The handshake must finish within `limits.header_timeout`.
 
 ## ClientHello sniffing
 
-After a CONNECT, roxy reads just enough of the first TLS record to confirm
-the tunnel carries TLS and extract the SNI and ALPN, with a hard cap
-(16 KiB) and a timeout. The whole handshake message must be present and
-well-formed. A ClientHello split across several TLS records, or a malformed
-`server_name` (non-ASCII, control characters, NUL, duplicate entries), counts as not TLS and the connection is closed.
+After a CONNECT, roxy reads the first TLS message to confirm that the
+tunnel carries TLS and to find the SNI. A ClientHello that is malformed,
+over 16 KiB, or split across several TLS records is treated as not TLS,
+and the connection is closed.

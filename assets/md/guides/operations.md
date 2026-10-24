@@ -1,174 +1,95 @@
 # Operations
 
-roxy's own logs go to stderr (`--log-format json|pretty`, `--log-level` or
-`RUST_LOG`); the flow log goes to stdout or `log.flow.path`
+roxy's own logs go to stderr (`--log-format json|pretty`, `--log-level`
+or `RUST_LOG`). The flow log goes to stdout or a file
 ([flow log](/reference/flow-log)). `SIGHUP` reloads the config and reopens
-log files. `SIGTERM` or ctrl-c stops accepting, drains exchanges in flight
-for up to 10 seconds, and flushes the flow log and capture before exiting.
+log files. `SIGTERM` or Ctrl-C stops accepting connections, lets
+exchanges in flight finish for up to 10 seconds, and flushes the logs
+before exiting.
 
 ## Health
 
-The `ca_server` listener answers two probes, both plain HTTP `GET`:
+The `ca_server` listener answers two checks:
 
 | path | `200` when | otherwise |
 |---|---|---|
-| `/healthz` | the process is up and accepting connections | no answer |
-| `/readyz` | a policy has been applied, its lease has not run out and the process is not quarantined | `503` with a one-word reason: `quarantined` ([quarantine](/guides/operations#quarantine)), `no_policy` (nothing applied yet) or `policy_expired` ([lease](/guides/operations#lease)) |
+| `/healthz` | the process is up | no answer |
+| `/readyz` | a policy is loaded, it has not expired, and roxy is not quarantined | `503` with the reason: `no_policy`, `policy_expired` or `quarantined` |
 
-Use `/readyz` for a compose `depends_on` wait or a Kubernetes readiness
-probe, and `/healthz` for a liveness probe or a container `HEALTHCHECK`.
-Readiness reads the policy the proxy is evaluating against, so a reload
-with a later lease makes it ready without a restart.
+`/healthz` also sends `x-roxy-policy: valid`, `expired` or `quarantined`.
+Use `/healthz` for liveness and `/readyz` for readiness. An empty policy
+counts as ready: it denies everything, on purpose. `no_policy` is only
+seen in node mode, before the first lease arrives.
 
-The `ca_server` listener has its own connection cap, separate from the
-proxy's: `limits.max_connections` in total, with no per-client cap. A
-client that fills the proxy's cap does not stop the probes answering, but
-one that fills the `ca_server` cap does, so keep that port reachable only
-from the workloads that fetch the CA and from the probe. Refused
-`ca_server` connections are logged in roxy's own log, not the flow log.
+`roxy health` checks `http://127.0.0.1:3130/healthz` for images without
+curl. `--ready` checks `/readyz` instead and `--url` sets the address. It
+exits 0 on a `200` and 1 otherwise.
 
-An empty policy is ready: it is a deny-all that someone applied, so a roxy
-told to refuse everything stays in rotation and its refusals are audited.
-From a config file a policy is always applied at startup, so `no_policy` is
-only seen by a node waiting for its first lease.
-
-`roxy health` is the probe for images without a shell or curl: it `GET`s
-`http://127.0.0.1:3130/healthz` (`--ready`: `/readyz`; `--url` names
-another address) and exits 0 on a `200`, 1 on anything else, with the
-reason on stderr.
+`ca_server` has its own connection cap. Keep its port reachable only from
+the health checks and the workloads that fetch the CA, since a client that
+fills the cap blocks the checks.
 
 ## Reload
 
-`roxy check --config <file>` runs the part of startup that opens no socket
-and writes no file: parse, validate, compile the rules and the WASM
-addons, load the address lists, load a provided CA (`tls.ca_cert`,
-`tls.ca_key`), read `tls.upstream.extra_roots` and build the resolver. It
-loads the CA through the same function startup does, so the warnings
-startup logs about it (a key readable by others, a certificate close to
-expiry) are printed by `check` as `warning:` lines. Diagnostics carry the
-config path, rule id and position. It leaves to
-startup resolving `secrets` from the environment, generating a CA in
-`tls.ca_dir`, opening `log.flow.path` and `capture_dir`, and binding the
-listeners.
+`roxy check --config <file>` validates a config without starting roxy: it
+parses it, compiles the rules and addons, and loads the address lists and
+a provided CA. It does not read secrets from the environment.
 
-Reload shares that path. roxy watches the config file, the address-list
-files and the addon `.wasm` files, following symlinks, so a file swapped
-underneath its path (a Kubernetes `ConfigMap` mount) counts as changed; a
-change, or `SIGHUP`, triggers a reload. On success the new policy is
-swapped in atomically: exchanges in flight finish under the policy they
-started with, and the next request on any connection uses the new one. On
-failure the old policy stays, a `config_reload_failed` event carries the
-diagnostics, and nothing is partially applied: not the policy, not the
-metric store, and not the compiled addons the next reload reuses. A
-shutdown signal during a reload abandons it and drains the running policy.
+roxy watches the config file, the address-list files and the addon
+`.wasm` files, and reloads when one changes or on `SIGHUP`. A reload that
+succeeds is applied at once: exchanges in flight finish under the old
+policy, and the next request uses the new one. A reload that fails
+changes nothing, and logs a `config_reload_failed` event with the
+diagnostics.
 
-Metric series survive a reload when their metric is
-[unchanged](/reference/rate-limits#metrics). When the new
-config keeps every running metric, the rebuilt store goes in before the
-policy swap, so no flow on either side meets a metric its store does not
-know. When a metric is removed or reshaped, the store follows the swap, and
-only an exchange still finishing under the old policy can find its metric
-gone (and is then failed closed).
+Rate-limit counters survive a reload when their metric is unchanged
+([metrics](/reference/rate-limits#metrics)).
 
 ### Restart-only settings
 
-Some settings take effect only when roxy starts: `listeners`, `ca_server`,
-`tls.ca_dir`, `tls.ca_cert`, `tls.ca_key`, `tls.leaf_cache_size`,
-`tls.upstream`, `upstream.dns`, `limits.max_connections`,
-`limits.max_connections_per_client`, `limits.max_state_entries`,
-`limits.max_capture_body_bytes`, `log.flow`, `log.capture` and
-`capture_dir`. A reload keeps their running values, applies everything
-else, and warns naming each one that changed. The new config is validated
-with the running values; when that fails, the diagnostics name the
-restart-only settings the file changed.
+Some settings take effect only when roxy starts: `listeners`, `ca_server`, `tls.ca_dir`, `tls.ca_cert`, `tls.ca_key`, `tls.leaf_cache_size`, `tls.upstream`, `upstream.dns`, `limits.max_connections`, `limits.max_connections_per_client`, `limits.max_state_entries`, `limits.max_capture_body_bytes`, `log.flow`, `log.capture` and `capture_dir`. A reload keeps their running values, applies everything else, and warns about each one that changed.
 
-The resolver is one of them: its cache serves every policy, so a reload
-that touches only rules or lists keeps every cached answer. The upstream
-connection pools are the snapshot's and start empty on each reload.
-
-A connection takes `tls.require_sni_match`, `http.enable_h2`,
-`http.allow_plain_in_connect` and the `limits` and `http` parsing settings
-when it is accepted and keeps them; a reload changes them for new
-connections only ([limits](/reference/limits#limits)).
+Connection-level settings, such as the HTTP parsing limits and timeouts,
+are fixed when a connection is accepted. A reload changes them for new
+connections only.
 
 ## Lease
 
-A top-level `valid_until: <RFC 3339>` makes the loaded policy a lease.
-Until that instant the policy applies as written. From it, every request
-is denied with `terminal_rule: _expired` and reason `policy_expired`, and
-an open WebSocket relay stops at its next chunk or message. The lease is
-checked before the addons run and again before the rules, so a request an
-addon holds across the instant is denied when the addon forwards it, as a
-request sent after the instant is. Each check is a wall-clock comparison
-against the host's clock, using the loaded policy's instant whichever
-policy the exchange began under: a reload that moves it later keeps open
-relays going, and one that moves it earlier stops them at their next chunk
-or message. The first exchange that finds the policy expired logs one
-`policy_expired` event; later ones are ordinary `_expired` denies.
+A top-level `valid_until: <RFC 3339 time>` makes the policy expire. From
+that moment every request is denied with `terminal_rule: _expired`, and
+open WebSockets are closed. `/healthz` stays up and `/readyz` answers
+`503 policy_expired`.
 
-An expired policy is a policy, not a fault. The listeners stay up,
-`/healthz` keeps answering `200` with `x-roxy-policy: expired` (`valid`
-otherwise, `quarantined` under a quarantine), `roxy health` prints `ok
-(policy expired)`, and `/readyz` answers `503 policy_expired`. A document already past its `valid_until`
-loads and denies rather than failing to start. `roxy check` prints `valid
-until:` and warns when the instant has passed. In
-[node mode](/guides/node-mode) the control plane's lease sets it.
-
-The way back is a reload: a config whose `valid_until` is later, or
-absent, is swapped in like any other. There is no fallback policy: a policy
-that must not expire has no `valid_until`.
+To recover, load a config with a later `valid_until`, or none. There is
+no fallback policy. In [node mode](/guides/node-mode) the control plane
+sets `valid_until` from its lease.
 
 ## Quarantine
 
-A quarantine is roxy refusing every exchange, whatever the policy says,
-until something outside the process lifts it. It is for a workload that has
-shown itself hostile: once tripped, the proxy stays shut across reloads and
-restarts, and the client cannot talk its way out.
+A quarantine makes roxy refuse every request, whatever the policy says,
+until someone lifts it from outside the process. It is for a workload
+that has shown itself hostile. It survives reloads and restarts.
 
-Three things trip it:
+Three things can trip it:
 
-* a rule's `quarantine` action ([actions](/reference/rule-language#actions)):
-  the exchange is refused, by whichever deny wins, and the proxy is
-  quarantined, even if a rule below it fails closed;
-* an enforce layer's `flow.quarantine`
-  ([host services](/reference/host-services#quarantine-quarantine)): the
-  exchange it was called on is refused `_quarantined`, and the proxy is
-  quarantined;
-* a listener's `quarantine_on.parse_errors` threshold
-  ([listeners](/reference/http#listener-modes)): that many `parse_error`
-  events on the listener within the window, counting every reason except
-  timeouts (`header_timeout`, `body_timeout`, `tunnel_timeout`,
-  `tls_handshake_timeout`, `h2_handshake_timeout`), a client that left
-  (`unexpected_eof`, `io_error`) or that ended the TLS handshake with an
-  alert of its own (`tls_alert_received`, as a client that does not trust
-  roxy's CA does), and roxy's own failures (`connect_write_failed`,
-  `leaf_mint_failed`, `invalid_state`). Off unless
-  set; set it on a sandbox's listener, not a gateway's, where one client
-  would shut the proxy for every other.
+* a rule's `quarantine` action
+  ([actions](/reference/rule-language#actions));
+* an addon calling `flow.quarantine`
+  ([host services](/reference/host-services#quarantine-quarantine));
+* a listener's `quarantine_on.parse_errors` threshold: that many
+  malformed requests within the window
+  ([listener modes](/reference/http#listener-modes)). Timeouts and
+  clients that disconnect do not count. Use it on a sandbox's listener,
+  never a gateway's.
 
-While quarantined, every request is refused with `403`, `terminal_rule: _quarantined` and reason `quarantined`, before the addons and the rules, and
-before the lease is checked. An open WebSocket relay stops at its next
-chunk or message. Connections open at the trip have one second to finish,
-then they are closed, so a stream in flight carries little further; the
-exchange that tripped it uses that second to write its own refusal. The
-trip is logged once as a `quarantined` event with the incident id, when it
-tripped and why ([flow log](/reference/flow-log#events)). `/healthz` stays
-`200` with `x-roxy-policy: quarantined`, `roxy health` prints `ok
-(quarantined)`, and `/readyz` answers `503 quarantined`. CA distribution
-keeps working.
+While quarantined, every request is refused with `403` and
+`terminal_rule: _quarantined`. Open connections are closed after one
+second. The trip is logged as a `quarantined` event with an incident id
+([flow log](/reference/flow-log#events)). `/readyz` answers
+`503 quarantined`, and the CA is still served.
 
-A config that can quarantine (a `quarantine` action, `quarantine_on` on a
-listener, or an addon holding the `quarantine` capability) needs `roxy run --state-dir DIR`: roxy refuses to start, or to
-reload into such a config, without it. The trip writes `DIR/quarantine`
-(the incident as JSON, mode `0600`), and a start that finds the file starts
-quarantined, logging the `quarantined` event again with `restored: true`.
-The in-memory state changes before the file is written. A write failure is
-logged as an error and leaves the process quarantined; whether a restart
-starts quarantined then depends on whether the file landed before the
-failure, so check for `DIR/quarantine` before restarting.
-
-Lifting it is never the proxy's own doing. From a config file: stop roxy,
-remove `DIR/quarantine`, start it again. A reload does not lift it, and a
-restart with the file in place does not either. In [node
-mode](/guides/node-mode#the-lease) the control plane releases it by naming
-the incident id in its lease, and the node logs `quarantine_released`.
+A config that can quarantine needs `roxy run --state-dir DIR`. The trip
+writes `DIR/quarantine`, and roxy starts quarantined while that file
+exists. To lift it, stop roxy, remove `DIR/quarantine` and start it again.
+In [node mode](/guides/node-mode#the-lease) the control plane lifts it
+instead.

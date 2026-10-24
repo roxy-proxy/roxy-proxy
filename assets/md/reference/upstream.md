@@ -1,21 +1,21 @@
 # Upstream
 
-How roxy reaches the origin: its own DNS, the
-[address floor](/reference/address-lists#address-floor) that every
-connection passes, and upstream TLS.
+How roxy reaches the origin: it resolves names itself, checks every
+address against the [address floor](/reference/address-lists#address-floor),
+and verifies the origin's TLS certificate.
 
 ```yaml
 upstream:
   dns:
     resolver: system           # system | [ "1.1.1.1:53", ... ]
-    cache_ttl_cap: 60s         # caps each record's TTL in the cache
-    static_hosts: {}           # name: ip, answered before DNS; still passes the address floor
+    cache_ttl_cap: 60s         # the longest roxy caches an answer
+    static_hosts: {}           # name: ip, used before DNS; still checked by the address floor
   deny_private_ranges: true
-  deny_cidrs: []               # never valid destinations
-  allow_cidrs: []              # exceptions to the private-range floor only
+  deny_cidrs: []               # never connect to these
+  allow_cidrs: []              # exceptions to the private ranges only
   deny_lists: [blocked]        # names from address_lists
-  connect_timeout: 10s         # TCP connect, over all of a name's addresses together; then the TLS handshake, within another
-  max_h2_connections_per_origin: 4   # at least 1
+  connect_timeout: 10s         # for the TCP connection, then again for the TLS handshake
+  max_h2_connections_per_origin: 4
 
 tls:
   upstream:
@@ -24,62 +24,45 @@ tls:
     min_version: "1.2"         # "1.2" | "1.3"
 ```
 
-`deny_cidrs` and `allow_cidrs` entries are normalised like address-list
-entries: an IPv4-mapped entry (`::ffff:203.0.113.0/120`) becomes the IPv4
-CIDR (`203.0.113.0/24`) and matches the address however a client spells
-it. An entry must be a network: `roxy check` refuses one with host bits
-set (`10.1.2.3/8`) and names the network it would have meant.
-`static_hosts` keys are host names as a request carries them (ASCII
-labels, IDNA already converted to A-labels), not IP addresses.
+`deny_cidrs` and `allow_cidrs` entries must be networks: `roxy check`
+refuses `10.1.2.3/8` and suggests `10.0.0.0/8`.
 
 ## DNS
 
-roxy resolves names itself with `hickory-resolver` (the workload's own DNS
-is irrelevant; block it at the network layer). The resolver and its cache
-are built once, at start: `upstream.dns` is a
-[restart-only setting](/guides/operations#restart-only-settings), and a
-reload keeps the cached answers. A and AAAA are both looked up. Several addresses are dialled one at a time, IPv4 and IPv6 alternating
-from the resolver's first, within one `connect_timeout` for all; each
-attempt gets an equal share of the time left.
+roxy resolves upstream names itself, so the workload's DNS plays no part.
+If a name has several addresses, roxy tries them in turn, alternating
+IPv4 and IPv6, within one `connect_timeout`. The resolver is set up at
+startup, so changing `upstream.dns` needs a
+[restart](/guides/operations#restart-only-settings).
 
 ## Upstream TLS
 
-rustls with the bundled Mozilla roots (`webpki-roots`), plus `extra_roots`
-under `strict+extra_roots`. Verification is always on. The SNI is the
-canonical host. ALPN offers `h2` and `http/1.1` (only `http/1.1` for
-WebSocket upgrades). The handshake has its own `connect_timeout` after the
-TCP connect's: an upstream that accepts the connection but never completes
-TLS fails with `504`, reason `timeout`, message `upstream TLS handshake`.
+roxy verifies every upstream certificate against the Mozilla root
+certificates, plus `extra_roots` with `verify: strict+extra_roots`.
+Verification cannot be turned off. The TLS handshake has its own
+`connect_timeout`.
 
 ## Connections
 
-Connections to an origin are pooled by scheme and authority and closed
-after 90 s idle. HTTP/1.1 opens one connection per concurrent request.
-HTTP/2 multiplexes: an origin that negotiates `h2` gets up to
-`max_h2_connections_per_origin` connections, each driven by its own task.
-A request goes to the connection with the fewest exchanges in flight (a
-response body still streaming counts), so a lightly used origin stays on
-one connection and concurrent load spreads evenly across the limit. Each
-connection offers a 2 MiB stream window, an 8 MiB connection window and
-1 MiB frames.
+roxy keeps connections to each origin open for reuse, and closes them
+after 90 seconds idle. Over HTTP/1.1 it opens one connection per request
+in progress. Over HTTP/2 it uses up to `max_h2_connections_per_origin`
+connections and spreads requests across them.
 
-An origin that closes an HTTP/2 connection with `GOAWAY` (nginx does at
-`keepalive_requests`) fails every stream above the last one it names, which
-it never processed. roxy sends such a request again on another connection,
-up to twice, if it has no body; a request with a body is answered `502`
-(`upstream_error`, reason `protocol_error`), as its body has already
-streamed to the connection.
+If an HTTP/2 origin closes a connection before handling some requests,
+roxy retries those without a body on another connection. A request with
+a body gets `502`, since its body has already been sent.
 
 ## Errors
 
 | failure | response | flow log |
 |---|---|---|
-| address floor | `403`, `_address_policy` | `upstream_denied`, reason `private_range:<class>`, `deny_cidrs` or `list:<name>` |
-| DNS, connect, TLS | `502` | `upstream_error`, reason `dns_failed`, `connect_failed` or `tls_failed` |
-| a target roxy cannot dial (no host, an unknown scheme) | `502` | `upstream_error`, reason `invalid_target` |
-| timeout (connect, TLS handshake or response headers) | `504` | `upstream_error`, reason `timeout`; `message` names the stage |
-| a response roxy cannot canonicalise | `502` | `upstream_error`, reason `protocol_error` |
+| the address floor refuses the address | `403`, `_address_policy` | `upstream_denied` |
+| DNS, connection or TLS failure | `502` | `upstream_error`, reason `dns_failed`, `connect_failed` or `tls_failed` |
+| a target roxy cannot connect to | `502` | `upstream_error`, reason `invalid_target` |
+| a timeout connecting, during the TLS handshake or waiting for the response | `504` | `upstream_error`, reason `timeout` |
+| a response roxy cannot parse | `502` | `upstream_error`, reason `protocol_error` |
 
-Every row answers with the same body
-([deny responses](/reference/http#deny-responses)); the reason is in the
+The client gets the usual refusal body
+([deny responses](/reference/http#deny-responses)). The reason is in the
 flow log only.

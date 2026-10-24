@@ -3,48 +3,34 @@
 <img src={howItWorks} alt="One exchange through roxy, top to bottom. The client's request enters roxy and passes through four stages: decrypt and parse (CONNECT, TLS, strict parse into the canonical request, and the lease check), the addon stack (enforce layers in order, with observers beside them on a copy), the rules (lease checked again; deny wins; effects: secrets, headers, redirect, sign) and connect (DNS, address floor, upstream TLS), then reaches the upstream. The response returns up the same stages: re-framed by the connector, re-checked by the rules, seen by the addons, and canonically re-serialised to the client. Each stage has an exit branching to the right: a parse failure is refused with parse_error, an expired policy denies with _expired at either lease check, an addon can answer the client directly or deny with layer:name, the rules deny with the rule id, and the address floor denies with _address_policy. A flow-log strip down the right edge is fed by every stage and every exit: one record per exchange, never dropped." />
 
 An exchange is one request and its response. Every exchange takes the same
-path, whichever way roxy is deployed.
+path, however roxy is deployed.
 
 ## Decrypt and parse
 
-A listener accepts the connection. On an `http_proxy` listener a CONNECT
-opens a tunnel; roxy checks that its first bytes are a TLS ClientHello
-(by default its SNI, if sent, must name the CONNECT host), terminates TLS
-with a leaf from its own CA, and reads HTTP/1.1 or HTTP/2 inside;
-`http.allow_plain_in_connect` also admits plain HTTP in the tunnel
-([CONNECT](/reference/http#connect)). On an `http` listener TLS ends at
-the load balancer in front and roxy reads plain origin-form requests
-([HTTP](/reference/http)). Either way the connection then carries a
-sequence of exchanges (HTTP/1.1 keep-alive) or concurrent ones (HTTP/2
-streams).
+On a proxy listener the client sends `CONNECT`, and roxy terminates the TLS
+inside the tunnel with a certificate from its own CA. On a gateway
+listener, a load balancer in front has already terminated TLS
+([HTTP](/reference/http)).
 
-roxy parses each request head into one canonical form, which is what it
-sends upstream; ambiguous input is rejected, not resolved, so what the
-rules and addons see is exactly what is forwarded
-([canonical request](/reference/http#canonical-request)). The body stays a
-stream.
+roxy parses each request into one canonical form and sends that form
+upstream. Ambiguous input is rejected rather than guessed at, so what the
+addons and rules see is exactly what is forwarded. Bodies stay streams.
 
 ## Addons
 
-Logic that needs to understand the traffic goes in an addon: an external
-service that the traffic streams through, or a WASM component that runs
-in process. An addon owns both lanes of the exchanges it chooses and can
-rewrite, withhold, answer or block. Requests pass through addons in their
-configured order, then reach the core stage. The core validates the final
-request, evaluates the rules, applies destination restrictions and owns
-the upstream connection. The rules judge the forwarded request as if the
-client had sent it
-([addon model](/design/addon-model),
-[addon configuration](/reference/addon-configuration)).
+An addon is a WASM component that runs inside roxy or an external service
+the traffic streams through. Addons run in the order they are configured
+and can rewrite, hold, answer or block the exchange. Whatever an addon
+passes on is checked again as strictly as a client request
+([addon model](/design/addon-model)).
 
 ## Rules
 
-The rules are a list of allows plus the denies that restrict them, in one
-YAML file. A matching deny always wins, and anything no rule allows is
-denied. The forwarding decision is made before the request goes upstream;
-rules that read the bodies or the response are re-checked in flight as they
-stream, and can still stop the exchange. Metrics give rate limits and byte
-budgets ([policy evaluation](/design/policy-evaluation)).
+The rules are a list of allows, and denies that restrict them. A matching
+deny always wins, and anything no rule allows is denied. The decision to
+forward is made on the request head. Rules that read bodies or the
+response are checked again as the bytes stream, and can still stop the
+exchange ([policy evaluation](/design/policy-evaluation)).
 
 ```yaml
 secrets:
@@ -61,48 +47,34 @@ rules:
       - set_header: { authorization: "Bearer ${secret:openai}" }   # the client never sees the key
       - allow
 
-  - id: upload-cap                         # re-checked as the body streams
+  - id: upload-cap                         # checked as the body streams
     when: host == "api.openai.com" and body.bytes > 10mb
     then: { deny: { status: 413 } }
 ```
 
-The request steps run in a fixed order: a bounded body buffer only when a
-rule reads `body.text`, then the admission decision and its effects. The
-[lease](/guides/operations#lease) is checked before the addons run and again
-at admission, so a request an addon held across expiry is denied. The only
-verdict that leads to the upstream is `Continue`; every error maps to a
-deny or a close. The steps are not an extension point: extensions are
-addons, downstream of them.
-
 ## Connect
 
-The upstream connector resolves the host itself, checks every candidate IP
-against the address floor, and connects. A name that resolves somewhere
-private is refused, and so is a redirect target or addon endpoint that
-does ([upstream](/reference/upstream),
+roxy resolves the host itself and checks every address against the
+address floor before it connects. A name that resolves to a private
+address is refused unless a rule allows it
+([upstream](/reference/upstream),
 [address floor](/reference/address-lists#address-floor)).
 
 ## Respond
 
-When the response head arrives, the response steps run: a bounded buffer
-of the response body only when a rule reads `response.body.text`, then the
-in-flight rules, which may still stop the exchange or change the head. As
-body bytes stream roxy re-checks those rules, records byte metrics,
-and holds each chunk until the flow log is ready. The response is re-framed
-for the client and passes back up the addon stack.
+The response comes back the same way: rules that read it are checked, the
+addons see it, and roxy re-frames it for the client.
 
 ## Log
 
-Every stage writes to the flow log: one JSON line per exchange, naming the
+Every step writes to the flow log: one JSON line per exchange, naming the
 rule that decided, the addons that ran and what changed. The log never
-drops a record; when it falls behind, traffic waits
+drops a record. When it falls behind, traffic waits
 ([flow log](/reference/flow-log)).
 
-## Policy snapshots
+## Reloads
 
-The compiled policy (rules, metrics, addons, address lists) is an immutable
-snapshot swapped atomically on reload, and an exchange runs to the end on
-the snapshot it started with, except that each lease check uses the
-currently loaded policy's expiry. In [node mode](/guides/node-mode) the
-snapshot comes from a control plane's lease instead of a file, and the flow
-log is also shipped back to it.
+The compiled config is swapped in whole when it changes. An exchange
+finishes under the config it started with
+([reload](/guides/operations#reload)). In [node mode](/guides/node-mode)
+the config comes from a control plane instead of a file.

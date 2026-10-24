@@ -1,7 +1,7 @@
 # HTTP
 
-How clients talk to roxy, how requests are parsed and canonicalised, and
-what goes to the upstream and back.
+How clients talk to roxy, how requests are parsed, and what goes to the
+upstream and back.
 
 ## Listener modes
 
@@ -10,407 +10,211 @@ what goes to the upstream and back.
 | `http_proxy` (default) | HTTP/1.1 to a proxy (`HTTP_PROXY` / `HTTPS_PROXY`) | absolute-form, or CONNECT and then origin-form inside the tunnel |
 | `http` | plain HTTP/1.1 to roxy as if it were the server | origin-form; `Host` names the target |
 
-Each mode accepts one protocol and closes anything else. roxy does not
-authenticate clients; rules see `listener.name` and `client.ip`.
+roxy does not authenticate clients. Rules see `listener.name` and
+`client.ip`.
 
 ```yaml
 listeners:
   - name: proxy
     mode: http_proxy           # the default
     bind: 0.0.0.0:3128
-    quarantine_on:             # optional; off when absent
+    quarantine_on:             # optional
       parse_errors: { count: 20, window: 1m }
   - name: gateway
     mode: http
     bind: 0.0.0.0:8080
-    forwarded_for:             # optional; without it X-Forwarded-For is ignored
-      trusted_hops: 1          # the proxies in front of roxy: here, one load balancer
+    forwarded_for:             # optional; mode: http only
+      trusted_hops: 1          # the proxies in front of roxy
 ```
 
-`quarantine_on.parse_errors` puts the whole process into
-[quarantine](/guides/operations#quarantine) once the listener has logged
-`count` parse errors within `window` (`count` at least 1, `window` a whole
-number of seconds, at least `1s`). It counts a client sending what roxy will not parse, not one that
-is slow or leaves. Setting it needs `roxy run --state-dir`.
-
-`forwarded_for.trusted_hops` (at least 1; `mode: http` only) names the
-client from `X-Forwarded-For` ([below](/reference/http#clients-behind-a-load-balancer)).
+`quarantine_on.parse_errors` [quarantines](/guides/operations#quarantine)
+roxy once the listener has refused `count` malformed requests within
+`window`. It needs `roxy run --state-dir`.
 
 ## HTTP proxy
 
-* **Absolute-form** (`GET http://host/path HTTP/1.1`): plain HTTP; `Host`
-  must equal the URI authority.
-* **CONNECT**: a tunnel roxy inspects ([below](/reference/http#connect)).
-* **Origin-form**: rejected, except to `roxy.internal`, which serves the CA
-  certificate at `/roxy-ca.pem`
-  ([CA distribution](/guides/ca-certificates#ca-distribution)) and `404`
-  for anything else.
-* `Proxy-Authorization` is hop-by-hop: dropped, never forwarded.
+* **Absolute-form** (`GET http://host/path HTTP/1.1`) is plain HTTP.
+  `Host` must match the URL.
+* **CONNECT** opens a tunnel that roxy inspects ([below](/reference/http#connect)).
+* **Origin-form** is refused, except for the host `roxy.internal`, which
+  serves the CA at `/roxy-ca.pem`
+  ([CA distribution](/guides/ca-certificates#ca-distribution)).
+* `Proxy-Authorization` is never forwarded.
 
 ## HTTP listener
 
-For a gateway behind a TLS-terminating load balancer
+For a gateway behind a load balancer that terminates TLS
 ([HTTP gateway](/guides/gateway)).
 
-* Only origin-form. Absolute-form, CONNECT and `*` are refused
-  (`target_form_mismatch`; `bad_request_target` for `*`) and the connection
-  closed.
-* The target is `Host`: required, exactly one (`missing_host`,
-  `multiple_host`, `bad_authority`), port 80 unless given, scheme `http`.
-  Hosts may differ between requests on one connection.
-* Without a `redirect` the upstream is the `Host` authority over plain
-  HTTP; `redirect` with `scheme: https` sends it on over TLS.
-* `roxy.internal` is a host like any other.
-* A TLS handshake is closed at the record header (`tls_on_http_listener`).
+* Only origin-form requests are accepted.
+* `Host` names the target: exactly one, port 80 unless given, scheme
+  `http`. Without a `redirect` the request goes to that host over plain
+  HTTP.
+* A client that starts a TLS handshake is closed
+  (`tls_on_http_listener`).
 
 ### Clients behind a load balancer
 
-Without `forwarded_for`, `client.ip` is the TCP peer: behind a load
-balancer, the load balancer. With `forwarded_for.trusted_hops: N`, each of
-the N proxies in front of roxy is taken to append the address it accepted
-the connection from to `X-Forwarded-For`, so the client is the Nth entry
-from the right of the header (every `X-Forwarded-For` line joined in
-order). Entries to its left are the client's own and are never read.
+Without `forwarded_for`, `client.ip` is the TCP peer, which behind a load
+balancer is the load balancer. With `forwarded_for.trusted_hops: N`, each
+of the N proxies in front of roxy is taken to append the address it saw
+to `X-Forwarded-For`, so the client is the Nth entry from the right.
+Entries further left were written by the client and are ignored.
 
-* That address is `client.ip` in rules, metric keys and the flow log, and
-  the addon principal's `client_ip`: roxy has one notion of the client.
-  The flow log keeps the TCP peer as `client.peer` for forensics
-  ([flow log](/reference/flow-log#flow-log)).
-* Each request is resolved on its own: a kept-alive connection from a load
-  balancer carries many clients.
-* A request with fewer entries than hops, a trusted entry that is not a
-  bare IPv4 or IPv6 address (a port, brackets, a zone, `unknown`, an
-  obfuscated identifier), or a header over 4 KiB in all is refused as a
-  request roxy cannot parse: `400`, reason `forwarded_for_invalid`, the
-  connection closed, counted by `quarantine_on.parse_errors`. It is never
-  attributed to the peer: a bypassed or misconfigured load balancer must
-  neither let a client choose its address nor fold every client into one.
-* An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`), as an entry or as the
-  peer of a dual-stack `[::]` listener, is the IPv4 address it embeds, as a
-  host literal is.
-* The header goes upstream as received; roxy neither appends the peer nor
-  strips it.
-* `limits.max_connections_per_client` is applied when the connection is
-  accepted, before any header, so it counts the peer
-  ([limits](/reference/limits#connections)).
+* That address is `client.ip` everywhere: rules, metric keys, addons and
+  the flow log. The flow log also records the TCP peer as `client.peer`.
+* A request with fewer entries than hops, or with a trusted entry that is
+  not a plain IP address, is refused with `400`
+  (`forwarded_for_invalid`). It is never attributed to the peer instead.
+* The header is forwarded as received.
 
-A hop count says how the header was built; it does not prove a connection
-came through those proxies. A client that can reach the listener directly
-can write N well-formed entries and choose its `client.ip`, so the
-listener must be reachable only from the trusted proxies, which is the
-network's claim to make (a security group, a private subnet), as
-containment is ([threat model](/design/threat-model#which-use-case-claims-what)).
-
-The setting is refused on an `http_proxy` listener: the requests inside a
-CONNECT tunnel carry whatever `X-Forwarded-For` the client wrote, and no
-proxy in front of roxy can add to them.
+The hop count does not prove that a request came through those proxies.
+A client that can reach the listener directly can write its own entries,
+so the network must let only the trusted proxies reach the listener.
 
 ## CONNECT
 
-A CONNECT gets `200 Connection Established`; decisions are made on the
-requests inside the tunnel. The tunnel's first bytes must be:
+A CONNECT gets `200 Connection Established`. Rules decide on the requests
+inside the tunnel. The tunnel's first bytes must be:
 
-* **A TLS ClientHello**
-  ([ClientHello sniffing](/reference/tls#clienthello-sniffing)). With
-  `tls.require_sni_match` (default true) the SNI must name the CONNECT host,
-  compared canonicalised (`sni_mismatch`); an unusable SNI is closed
-  (`bad_sni`); no SNI means the CONNECT host. roxy terminates TLS with a
-  leaf for that host; the inner protocol is HTTP/1.1 or HTTP/2 by ALPN.
-* **Plaintext HTTP**, only with `http.allow_plain_in_connect` (default
+* **A TLS ClientHello.** With `tls.require_sni_match` (default true) the
+  SNI must name the CONNECT host (`sni_mismatch`). roxy terminates TLS
+  with a certificate for that host, then reads HTTP/1.1 or HTTP/2.
+* **Plain HTTP**, only with `http.allow_plain_in_connect` (default
   false).
 
-Anything else is closed; raw TCP never passes. Inside a tunnel, requests
-are origin-form and their `Host` (or `:authority`) must match the CONNECT
-host, port-normalised, whatever the SNI said.
+Anything else is closed, so raw TCP never passes. Requests inside the
+tunnel must name the CONNECT host.
 
 ## HTTP/2
 
-Inside a TLS tunnel, by ALPN (`http.enable_h2`, default true). The `h2`
-crate parses it; the same semantic validation as HTTP/1.1 follows
-([HTTP/2 requests](/reference/http#http2-requests)). Upstream, roxy offers
-`h2` and `http/1.1` and serialises as whichever the origin negotiates: the
-canonical authority goes out as `host` over HTTP/1.1 and as `:authority`
-alone over HTTP/2, never both. WebSocket upgrades always use HTTP/1.1
+roxy offers HTTP/2 inside TLS tunnels (`http.enable_h2`, default true).
+Upstream, it uses HTTP/2 or HTTP/1.1, whichever the origin chooses.
+WebSocket upgrades always use HTTP/1.1
 ([WebSockets](/reference/websockets)).
 
 ### Informational responses
 
-Upstream informational responses such as `103 Early Hints` are not relayed
-to the client, whether or not addons are enabled. The upstream HTTP client
-consumes them and returns the final response. Roxy generates its own
-`100 Continue` when admitting an upload; it does not forward the origin's
-`100`. A WebSocket `101 Switching Protocols` is handled separately as an
-upgrade.
-
-Addon response lanes carry one final head. They cannot publish `103` and
-then a final response. An addon that starts a synthetic `200` streaming
-response has committed that status and those headers; it may subsequently
-use upstream body bytes, but cannot replace the head.
+roxy does not relay `1xx` responses from upstream, such as
+`103 Early Hints`. It sends its own `100 Continue` once the rules allow an
+upload.
 
 ### Trailers
 
-Two settings, one per direction. `http.allow_response_trailers` (default
-true) forwards an origin's response trailers to the client, as HTTP/2
-trailers or as the trailer section of a chunked HTTP/1.1 response (a
-response with a declared length cannot carry them). gRPC, which puts the
-call's outcome in `grpc-status`, works by default.
-`http.allow_request_trailers` (default false) accepts trailers on requests,
-HTTP/2 trailers or a chunked trailer section; without it a request that
-carries them is refused with reason `trailers`. Request trailers arrive
-after the rules have decided, so they stay opt-in. In either direction a
-trailer section may not carry framing, routing, authentication or
-`content-*` fields (`authorization`, `cookie`, `set-cookie`, `range`,
-`max-forwards`, `cache-control`, every hop-by-hop name): on a request that
-is a rejection, on a response the body is cut before the client sees it
-complete. A body a rule or addon buffers to read keeps its trailers, and
-the trailers a layer attaches to the request it passes on are held to the
-same rules as a client's. A request trailer section is held to
-`limits.max_headers` and `limits.max_header_bytes`, as a head is. The byte
-limit counts each decoded field as `name: value\r\n`; HTTP/1.1 also checks
-the raw section, including its final CRLF.
+`http.allow_response_trailers` (default true) forwards an origin's
+response trailers, so gRPC works. `http.allow_request_trailers` (default
+false) accepts trailers on requests; without it, a request with trailers
+is refused (`trailers`). Request trailers arrive after the rules have
+decided, which is why they are opt-in, and can only be forwarded to an
+HTTP/2 origin.
 
-Request trailers reach an origin only over `h2`: HTTP/1.1 needs the names
-in a `Trailer` header before the body. Trailers to an HTTP/1.1 origin fail
-with reason `trailers` (`400` and close on HTTP/1.1, a stream reset on
-HTTP/2) before the origin sees the request complete, for as long as any
-HTTP/1.1 connection to that origin is open or pooled (hyper keeps idle
-connections about 90 s), including one opened for a request held to
-HTTP/1.1.
-
-## Canonical request
-
-The client-facing HTTP/1.1 codec is roxy's own (on `httparse` for
-tokenising): ambiguities RFC 9112 lets a server resolve are rejected
-([why roxy parses HTTP/1.1 itself](/reference/architecture#why-roxy-parses-http11-itself)).
-
-```rust
-pub struct CanonicalRequest {
-    pub method: Method,        // validated token
-    pub scheme: Scheme,        // Http | Https
-    pub authority: Authority,  // host (DNS name | IPv4 | IPv6), port always explicit
-    pub path: Path,            // normalised, see below
-    pub query: Option<Query>,  // validated raw bytes, parsed pairs for matching
-    pub headers: Headers,      // lowercase names, ordered, validated, hop-by-hop removed
-    pub body: Body,            // a stream; its known length, if any, decides upstream framing
-    pub meta: RequestMeta,     // client version, receipt time, head size, target form, expect/upgrade
-}
-```
+A trailer may not carry framing, routing, authentication or `content-*`
+fields. A request with one is refused. A response with one is ended
+early, so the client never sees it as complete.
 
 ## Rejection rules
 
-A violation closes the connection, not just the request, and emits a
-`parse_error` flow event with a stable reason code. The knobs live under
-`http:` and default to strict.
-
-The header and body rules are one implementation, applied to every request
-roxy judges: an HTTP/1.1 head, an HTTP/2 stream, and what a service layer
-passes on. Each path adds only its own wire rules ahead of them (line
-structure for HTTP/1.1, pseudo-headers and connection-specific fields for
-HTTP/2, the fields a layer may not set), so a field list one path refuses
-the others refuse for the same reason.
+A malformed request closes the connection and logs a `parse_error` event
+with a stable reason code. The settings under `http:` default to strict.
+The same checks apply to HTTP/1.1, HTTP/2 and requests an addon passes on.
 
 ### Request line
 
-* The method is a `token` of at most 32 bytes.
-* The target form fits the context: absolute-form on the proxy port,
-  origin-form in a tunnel or on an `http` listener, authority-form only for
-  CONNECT on the proxy port.
-* The version is exactly `HTTP/1.1`. `HTTP/1.0` needs `http.allow_http10`
-  and its connection closes after the response whatever `Connection` says;
-  `HTTP/0.9` is never accepted. A response of unknown length to an HTTP/1.0
-  client is close-delimited: the body ends when roxy closes the connection.
-  If the upstream body is cut short (upstream error, size cap, timeout,
-  forbidden trailer) roxy closes the connection all the same, so the client
-  cannot tell a cut body from a complete one. roxy still logs the failure.
-* Lines end in CRLF; a bare LF or CR anywhere in the head is rejected.
-* Head at most `limits.max_header_bytes` (64 KiB); URL at most
-  `limits.max_url_bytes` (8 KiB).
+* The method is a token of at most 32 bytes.
+* The version is `HTTP/1.1`. `HTTP/1.0` needs `http.allow_http10`.
+* Lines end in CRLF. A bare LF or CR anywhere in the head is refused.
+* The head is at most `limits.max_header_bytes` (64 KiB) and the URL at
+  most `limits.max_url_bytes` (8 KiB).
 
 ### Headers
 
-* Names are `token`s, no whitespace before the colon, no obs-fold.
-* Values are visible ASCII, SP and HTAB, surrounding whitespace stripped.
-  CR, LF, NUL and other controls are rejected; non-ASCII needs
-  `http.allow_obs_text`, under which the rules read each such byte as the
-  ISO-8859-1 character of the same value
-  ([comparison](/reference/rule-language#expressions)).
+* No whitespace before the colon, no folded lines.
+* Values are visible ASCII, space and tab. Control characters are
+  refused. Bytes above 127 need `http.allow_obs_text`, and rules read
+  each as one ISO-8859-1 character.
 * At most `limits.max_headers` (100) fields.
-* Exactly one `Host`, matching the URI authority (absolute-form) or the
-  CONNECT host (tunnel); on an `http` listener it names the target. An
-  HTTP/1.0 absolute-form request may omit it.
-* A host is a DNS name of A-labels, a strict dotted-quad IPv4 literal or a
-  bracketed IPv6 literal. An IPv4-mapped IPv6 literal (`[::ffff:a.b.c.d]`)
-  is the IPv4 address it embeds and is parsed, matched, logged and
-  forwarded as `a.b.c.d`.
-* At most one `Content-Length`, digits only, at most 19 digits; a duplicate
-  is rejected even with equal values. A non-zero length declared for a body
-  that has already ended (a layer passing `content-length` with an empty
-  body) is `bad_content_length`, not an empty body.
-* `Transfer-Encoding`, if present, is exactly `chunked`: one field, one
-  value, no parameters, no other codings; rejected together with
-  `Content-Length`.
-* GET, HEAD, DELETE, OPTIONS and TRACE carry a body only with
-  `http.allow_body_on_get`: without it, `Transfer-Encoding: chunked` or a
-  `Content-Length` above zero on those methods is rejected
-  (`body_on_bodiless_method`), whatever the body turns out to hold. CONNECT
-  never carries a body.
-* `Expect` may only be `100-continue`; anything else gets `417`. roxy sends
-  `100 Continue` once the rules allow the request; when a rule reads the
-  request body it goes out before the body is judged, and a deny follows
-  the body.
-* On a listener with `forwarded_for`, `X-Forwarded-For` must name the
-  client at the trusted hop
-  (`forwarded_for_invalid`; [clients behind a load balancer](/reference/http#clients-behind-a-load-balancer)).
-* Hop-by-hop fields (`Connection` and every field it names, `Keep-Alive`,
+* Exactly one `Host`, matching the URL or the CONNECT host.
+* A host is a DNS name in ASCII (internationalised names as `xn--`
+  labels), an IPv4 address, or a bracketed IPv6 address.
+* At most one `Content-Length`, digits only. A duplicate is refused even
+  with the same value.
+* `Transfer-Encoding`, if present, is exactly `chunked`, and never
+  together with `Content-Length`.
+* GET, HEAD, DELETE, OPTIONS and TRACE may carry a body only with
+  `http.allow_body_on_get` (`body_on_bodiless_method`).
+* `Expect` may only be `100-continue`; anything else gets `417`.
+* Hop-by-hop fields (`Connection` and the fields it names, `Keep-Alive`,
   `Proxy-Connection`, `Proxy-Authorization`, `Proxy-Authenticate`, `TE`,
-  `Trailer`, `Transfer-Encoding`, `Upgrade`) are consumed and never
-  forwarded.
+  `Trailer`, `Transfer-Encoding`, `Upgrade`) are never forwarded.
   `Upgrade` is honoured only for a WebSocket a rule allows.
 
 ### Body
 
-* Chunk sizes are hex, at most 16 digits. Chunk extensions need
-  `http.allow_chunk_extensions`, and with them the whole chunk-size line is
-  at most 4096 bytes; trailers need `http.allow_request_trailers`
-  and an `h2` origin ([trailers](/reference/http#trailers)). The final CRLF
-  is enforced.
-* At most `limits.max_request_body_bytes` (1 GiB), enforced while
-  streaming: exceeding it closes the connection mid-stream.
-* The first request head on a connection must arrive within
-  `limits.header_timeout` (10 s) of the connection opening; every later
-  head within `header_timeout` of its first byte, pipelined bytes included.
-  In a tunnel each step gets its own `header_timeout`: the CONNECT head,
-  the first bytes that say whether the tunnel carries TLS, the client TLS
-  handshake, then the first request head (on HTTP/2, the handshake and
-  then the first stream). The body may not stall longer than `limits.body_idle_timeout` (10 m), which also
-  bounds how long the client may go without taking the next part of the
-  response (on HTTP/2: stream reset with `CANCEL`, `response_error`, reason
-  `client_stalled`).
-* A client that closes while roxy still waits for the response ends the
-  exchange; nothing is written back; reason `client_gone`.
+* Chunk extensions need `http.allow_chunk_extensions`.
+* A body is at most `limits.max_request_body_bytes` (1 GiB).
+* Timeouts are in [limits](/reference/limits#limits).
 
 ### HTTP/2 requests
 
-* Pseudo-headers (`:method`, `:scheme`, `:authority`, `:path`) exactly once
-  each, before regular headers.
-* Connection-specific headers (`connection`, `keep-alive`,
-  `transfer-encoding`, `upgrade`, `proxy-connection`) reset the stream
-  (RFC 9113 §8.2.2). `te` is accepted only as `trailers`.
-* `:path` goes through the same normaliser and `limits.max_url_bytes` cap
-  once the `h2` crate has accepted it. The entire `:path` must be UTF-8;
-  invalid UTF-8 closes the connection. In the path or query, a raw space or
-  control byte, `<` or `>` resets the stream; so does a backtick in the path
-  or `"` in the query. A fragment is discarded after UTF-8 validation.
-  These failures happen before roxy sees the request, with no `parse_error`
-  event. `:authority` must equal the CONNECT authority; a `host` header,
-  if present, must equal `:authority`.
+* The pseudo-headers appear exactly once each, before other headers.
+* Connection-specific headers reset the stream. `te` is accepted only as
+  `trailers`.
+* `:path` is normalised like an HTTP/1.1 target. `:authority` must match
+  the CONNECT host, and so must `host` if present.
 * `limits.h2_max_concurrent_streams` and `limits.h2_max_header_list_bytes`
   cap streams per connection and header bytes per stream.
-  CONTINUATION-flood and rapid-reset defences come from the `h2` crate.
-* The first stream must open within `limits.header_timeout`; between
-  requests the connection may idle for `limits.idle_timeout`.
 
 ## URL normalisation
 
 Applied to the request target, for matching and forwarding alike.
 
-1. The path starts with `/` and contains `pchar` and `/`, with well-formed
-   percent-encodings. `[ ] { } | ^` are percent-encoded rather than
-   rejected (`/a|b` becomes `/a%7Cb`). Space, control bytes, `"`,
-   `<`, `>`, `\`, a raw backtick and non-ASCII are rejected.
+1. The path starts with `/`. Percent-encodings must be well formed.
+   `[ ] { } | ^` are percent-encoded. Space, control characters, `"`, `<`,
+   `>`, `\`, a backtick and non-ASCII are refused.
 2. Percent-encoded unreserved characters (`A–Z a–z 0–9 - . _ ~`) are
-   decoded; other encodings stay (`%2F` stays `%2F`).
+   decoded. Other encodings stay as they are: `%2F` stays `%2F`.
 3. Hex digits in the remaining encodings are upper-cased.
-4. Dot segments (including ones `%2E`-encoded before step 2) are removed
-   per RFC 3986 §5.2.4. A path that climbs above the root is rejected.
+4. Dot segments are removed, including encoded ones. A path that climbs
+   above the root is refused.
 5. An empty path becomes `/`.
-6. The query is validated the same way and its hex upper-cased. `/`, `?`,
-   `[` and `]` are also allowed raw; `{ } | ^` and `` ` `` are
-   percent-encoded; nothing is decoded. It is parsed into pairs for
-   matching only.
-7. A fragment in an HTTP/1.1 target is rejected. The `h2` crate drops a
-   fragment from an HTTP/2 `:path` before roxy sees it.
-8. The host is lower-cased; IDNA labels must already be A-labels (`xn--`),
-   raw Unicode is rejected; the port is made explicit; a trailing dot is
-   removed.
+6. The query is validated the same way, but nothing in it is decoded.
+7. A fragment is refused.
+8. The host is lower-cased, its trailing dot removed, and the port made
+   explicit.
 
-## Upstream serialisation
+## Upstream requests
 
-HTTP/2 or HTTP/1.1, whichever ALPN negotiates. HTTP/2 takes the
-pseudo-headers from the canonical fields and drops `host` for
-`:authority`. HTTP/1.1:
-
-* `METHOD <origin-form path[?query]> HTTP/1.1`;
-* `host` first, then the headers in canonical order, lowercase;
-* `content-length` when known, otherwise clean `chunked` with no
-  extensions, never both; a body with trailers fails instead;
-* connection management by roxy's pool; no client hop-by-hop field
-  survives.
-
-Changes from rules and addons are applied to the canonical model before
-serialisation and pass the same validation: a header value with a CRLF
-denies the flow.
+roxy writes the request out in one canonical form, over HTTP/2 or
+HTTP/1.1. Changes made by rules and addons pass the same validation as
+the client's request: a header value containing a line break denies the
+exchange.
 
 ## Responses
 
-Upstreams are trusted ([threat model](/design/threat-model)). hyper parses
-the response and roxy builds a `CanonicalResponse`:
-
-* Status and headers are kept, names lower-cased; `Set-Cookie` and
-  `WWW-Authenticate` stay separate fields.
-* Hop-by-hop fields are stripped and the framing regenerated:
-  `content-length` when known, otherwise clean chunked (HTTP/1.1) or DATA
-  frames (HTTP/2), with the origin's trailers after the body
-  ([trailers](/reference/http#trailers)). Responses to HEAD, and `1xx`,
-  `204` and `304`, carry no body. Empty non-final DATA frames are never
-  sent upstream.
-* `limits.max_response_body_bytes` (1 GiB) caps the body.
-  `limits.response_header_timeout` (15 m) starts once the request body has
-  been sent; while it is still being sent, the exchange fails (`504`) only
-  if the upstream stops taking it for twice `limits.body_idle_timeout`.
-* The upstream may pause up to `limits.response_body_idle_timeout` (30 m)
-  between parts of the body; longer ends the exchange (`response_error`,
-  reason `response_body_timeout`): close on HTTP/1.1, `CANCEL` on HTTP/2,
-  or a `504` while rules are still reading the body and nothing has been
-  sent.
-* A client that closes while roxy waits for the next part of the body ends
-  the exchange at once on both versions: the body is dropped, releasing the
-  upstream and any service streams; a part already there is still written.
-  On HTTP/1.1 a client that shut down only its sending side counts as gone.
-* Redirects are forwarded, not followed. Encoded bodies pass through
-  untouched ([below](/reference/http#content-codings)).
+Upstreams are trusted ([threat model](/design/threat-model)), but roxy
+re-frames every response: hop-by-hop fields are removed and the framing
+rebuilt. Redirects are forwarded, not followed. Compressed bodies pass
+through unchanged. Size and time limits are in
+[limits](/reference/limits#limits).
 
 ## Content codings
 
-roxy decodes `content-encoding` to inspect a body, never to forward it:
-`body.text` and `response.body.text` see the decoded text
-([body rules](/reference/rule-language#body-rules)); the bytes forwarded
-are the bytes received. The one exception is addons: bodies are decoded at
-the edge of the stack and forwarded decoded
+roxy decodes `content-encoding` only to inspect a body. `body.text` and
+`response.body.text` see the decoded text, while the bytes forwarded are
+the bytes received ([body rules](/reference/rule-language#body-rules)).
+Addons are the exception: by default they get decoded bodies
 ([content codings for addons](/reference/addon-configuration#content-codings)).
 
-| coding | format |
-|---|---|
-| `gzip`, `x-gzip` | RFC 1952; several members in a row are one body |
-| `deflate` | zlib format (RFC 1950), as RFC 9110 defines it; raw deflate is refused |
-| `br` | RFC 7932, the window the stream declares (up to 16 MiB) |
-| `zstd` | RFC 8878, window at most 8 MiB (RFC 9659) |
+roxy decodes `gzip`, `x-gzip`, `deflate`, `br` and `zstd`, stacked up to
+four deep. Decoding is strict: a truncated or corrupt body cannot be
+inspected, and a rule that reads it fails closed.
 
-* Stacked codings are undone in reverse order; `identity` is ignored; at
-  most 4 codings, more is refused.
-* An empty body is empty whatever its coding.
-* Decoding is strict: truncated data, a bad checksum, or bytes after the
-  end of the stream make the body undecodable.
-* Decoders work in bounded steps (a highly compressed body costs time, not
-  memory); each decoder's window is charged to the
-  [buffer budget](/reference/limits#buffer-budget) before it is allocated.
-  The decoded size counts against the same cap as the body as sent.
-
-`http.strip_accept_encoding` (default false) removes `accept-encoding` from
-every request as roxy reads it, so origins answer uncompressed. Addons,
-rules and the flow log see the request without it.
+`http.strip_accept_encoding` (default false) removes `accept-encoding`
+from every request, so origins answer uncompressed.
 
 ## Deny responses
+
+Every refusal roxy makes has the same shape:
 
 ```
 HTTP/1.1 403 Forbidden
@@ -422,23 +226,18 @@ connection: close
 {"error":"blocked by roxy","rule":"<rule id>","flow":"<flow id>"}
 ```
 
-Every refusal roxy originates has this body:
-
 | refusal | status | `rule` |
 |---|---|---|
 | a rule denies | `403`, or the rule's `deny.status` | the rule id |
-| the process is quarantined | `403` | `_quarantined` |
+| roxy is quarantined | `403` | `_quarantined` |
 | address floor | `403` | `_address_policy` |
 | unavailable policy input | `503` | `_fail_closed` |
-| failed addon layer | `503` | `layer:<name>` |
+| failed addon | `503` | `layer:<name>` |
 | upstream failure | `502` (`504` for a timeout) | none |
 
-The body names the rule and the flow, never why: the reason code
-(`dns_failed`, `connect_failed`, `metric_table_full`, ...) is in the flow
-log only.
+The response never says why. The reason is in the flow log only.
 
-A request roxy cannot parse is refused with a different body, before any
-rule has seen it:
+A malformed request is refused before any rule sees it, with its reason:
 
 ```
 HTTP/1.1 400 Bad Request
@@ -448,16 +247,10 @@ connection: close
 {"error":"rejected by roxy","reason":"cl_and_te"}
 ```
 
-`reason` is the `parse_error` code ([rejection rules](/reference/http#rejection-rules)),
-which describes the request's syntax and says nothing about policy. The
-status is `400`, or the closer one the code has (`413`, `414`, `431`, ...);
-on HTTP/2 the stream is reset instead.
+The status is `400`, or a closer one for the reason (`413`, `414`,
+`431`). On HTTP/2 the stream is reset instead.
 
-A rule sets the status and message with `deny: { status: 451, message:
-"..." }`. After a deny the connection is closed (`connection: close` on
-HTTP/1.1, `GOAWAY` on HTTP/2) unless the rule says `deny: { close: false
-}`. On HTTP/1.1 a kept-alive connection discards up to 1 MiB of the
-refused body before the next request, and is closed instead beyond that; a
-closing response lingers for up to 1 s, discarding up to 1 MiB, so the
-client reads the response rather than a reset. After an upstream failure
-(`502`, `504`) the connection stays open on both versions.
+A rule sets the status and message with
+`deny: { status: 451, message: "..." }`. After a deny the connection is
+closed, unless the rule says `deny: { close: false }`. After an upstream
+failure the connection stays open.

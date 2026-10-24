@@ -1,12 +1,13 @@
 # Rule language
 
-The `when` / `where` expression language and the actions of `then`.
-Evaluation is in [policy evaluation](/design/policy-evaluation).
+The expressions used in a rule's `when` and a metric's `where`, and the
+actions of a rule's `then`. How rules are evaluated is in
+[policy evaluation](/design/policy-evaluation).
 
 ## Expressions
 
-Statically typed; no user-defined functions; linear-time matching (`regex`
-crate, no backtracking).
+Expressions are statically typed, and regular expressions run in linear
+time.
 
 ```
 expr        := or
@@ -29,39 +30,24 @@ unit        := kb | mb | gb | ms | s | m | h      ; sizes are 1024-based
 method      := [A-Z][A-Z_]*                       ; HTTP method names only
 ```
 
-* A rule without `when` matches every exchange; a metric without `where`
-  counts every one.
-* Strings: double-quoted, `\"` and `\\` escapes. `# ...` comments are
-  allowed in multi-line YAML block scalars.
-* Comparison is byte-exact, except: `host`, `tls.sni` and `scheme` operands
-  compare ASCII case-insensitively under every operator (`like`, `matches`,
-  `in` included); `under` is case-insensitive whatever its left operand;
-  `header["X-Y"]` names are case-insensitive, values not. A header value
-  with obs-text (bytes `0x80` and up, under `http.allow_obs_text`) reads as
-  one character per byte (ISO-8859-1), so the text a rule matches is the
-  bytes roxy forwards: the byte `0xE9` reads as `é`, while `é` sent in
-  UTF-8 (`0xC3 0xA9`) reads as the two characters `Ã©`. `method` is
-  exact: method `get` is forwarded as an extension method, may carry a
-  body, and matches neither `method == GET` nor `method in [GET, HEAD]`.
-* Compile errors: type mismatch (`host under 443`), a regex that does not
-  compile, a `like` pattern longer than 1 KiB, a bad CIDR mask, `metric.foo` with no such metric, an undefined
-  `@list`, a `${secret:name}` placeholder in a string (it would compare
-  against its own text; [secrets](/reference/secrets)), and a predicate
-  that can never match: `under` with an empty label (`"a..b"`,
-  `"example.com.."`), a `host` or `tls.sni` literal with a trailing dot
-  (`host == "evil.example."`, `host like "*.example.com."`), non-ASCII
-  characters, brackets (`"[::1]"`) or an IPv4-mapped address
-  (`"::ffff:10.0.0.1"`) ([fields](/reference/rule-language#fields)),
-  or `null` compared with a value that is never `null`
-  ([missing values](/reference/rule-language#missing-values-null)). `in`
-  takes a list of the operand's type, a CIDR, or an `@list` for ip fields.
+* A rule without `when` matches everything. So does a metric without
+  `where`.
+* Strings are double-quoted, with `\"` and `\\` escapes.
+* Comparison is exact, except that `host`, `tls.sni` and `scheme` compare
+  without regard to case, and so do header names. Header values are
+  compared exactly. `method` is case-sensitive: `get` does not match
+  `GET`.
+* Mistakes are compile errors: a type mismatch (`host under 443`), a
+  regex that does not compile, an unknown metric or `@list`, a
+  `${secret:name}` placeholder in a condition, or a comparison that can
+  never match, such as a `host` with a trailing dot or in upper case.
 
 ### Fields
 
-*Admission* fields are known at the forwarding decision; a rule reading only
-them is an admission rule. *In-flight* fields become known or change after the
-request is forwarded; a rule reading one is re-checked in flight
-([evaluation](/design/policy-evaluation#evaluation)).
+*Admission* fields are known when roxy decides whether to forward the
+request. *In-flight* fields become known later, and a rule that reads one
+is checked as the exchange streams
+([evaluation](/design/policy-evaluation#when-rules-run)).
 
 | field | type | known |
 |---|---|---|
@@ -71,52 +57,37 @@ request is forwarded; a rule reading one is re-checked in flight
 | `method`, `scheme`, `host`, `port`, `path`, `url` | string / int | admission |
 | `query["k"]`, `query.raw` | string | admission |
 | `header["name"]`, `header.all["name"]` | string, list | admission |
-| `body.size` | int: declared length, `null` if undeclared (chunked) | admission |
-| `body.text` | string: the buffered body, up to the cap | admission |
-| `metric.<id>` | int | admission; a `deny` or `quarantine` reading a byte metric is also re-checked in flight ([rate limits](/reference/rate-limits#metrics)) |
+| `body.size` | int: declared length, `null` if not declared | admission |
+| `body.text` | string: the buffered body | admission |
+| `metric.<id>` | int | admission ([rate limits](/reference/rate-limits#metrics)) |
 | `state["key"]`, `tag["name"]` | string, bool | admission |
 | `body.bytes` | int: request body bytes so far | in-flight |
 | `response.status`, `response.header["name"]`, `response.header.all["name"]` | int, string, list | in-flight |
-| `response.body.size` | int: declared length, `null` if undeclared | in-flight |
+| `response.body.size` | int: declared length, `null` if not declared | in-flight |
 | `response.body.text` | string: the buffered response body | in-flight |
 | `response.body.bytes` | int: response body bytes so far | in-flight |
-| `ws.direction`, `ws.opcode`, `ws.size`, `ws.text` | string, int, int, string: the WebSocket message being checked | in-flight, per message ([WebSockets](/reference/websockets#message-rules)) |
+| `ws.direction`, `ws.opcode`, `ws.size`, `ws.text` | string, int, int, string | in-flight, per WebSocket message ([WebSockets](/reference/websockets#message-rules)) |
 
-`client.ip` is the client as roxy establishes it: the TCP peer, or on a
-listener with `forwarded_for` the client `X-Forwarded-For` names at the
-trusted hop ([HTTP](/reference/http#clients-behind-a-load-balancer)).
-Either way it is canonical: an IPv4-mapped IPv6 address (`::ffff:10.0.0.1`,
-how an IPv4 client reaches a dual-stack `[::]` listener) is the IPv4 address
-it embeds, so `client.ip == 10.0.0.1` matches it.
-`path` is normalised ([HTTP](/reference/http#url-normalisation)). `host`
-and `tls.sni` are the name as roxy delivers it: lower-case, without a
-trailing dot, internationalised labels in A-label (`xn--`) form, and an IP
-literal as the bare address (`10.0.0.1`, `::1`; never `[::1]`), with an
-IPv4-mapped IPv6 literal (`[::ffff:10.0.0.1]`) delivered as the IPv4 address
-it embeds, since that is what gets dialled. A string literal compared with
-them in another form never matches and is a compile error. Any rule reading `ws.*` makes roxy decode every WebSocket message
-and strip WebSocket extensions.
+`client.ip` is the client's address, or behind a load balancer the one
+`X-Forwarded-For` names
+([HTTP](/reference/http#clients-behind-a-load-balancer)). `host` and
+`tls.sni` are lower-case, without a trailing dot, with internationalised
+names as `xn--` labels and IPv6 addresses without brackets. `path` is
+normalised ([URL normalisation](/reference/http#url-normalisation)).
 
-The normalised `path` is what roxy forwards, but an upstream may change it
-again before resolving it: decode `%2F` to `/`, merge empty segments
-(`//admin`), strip `;params`, or fold case. A `deny` keyed on a path prefix
-is therefore fragile: `/a/..%2Fsecret` does not start with `/secret`, yet an
-upstream that decodes `%2F` first serves `/a/../secret`. An `allow` keyed on
-a prefix has the same gap. Allow exact paths, or a prefix together with a
-guard against every form the upstream reinterprets, raw or encoded
-(`not path contains "%2F"`, likewise `"%5C"`, `"//"`, `";"` and `"%3B"`; hex
-is upper-cased before matching, so one case suffices), and treat a path
-`deny` as defence in depth
-([URL normalisation](/reference/http#url-normalisation)).
+**Path rules are fragile.** An upstream may interpret a path differently
+from roxy, for example by decoding `%2F` to `/` or merging `//`. Then
+`/a/..%2Fsecret` does not start with `/secret` for roxy, but reaches
+`/secret` upstream. Prefer allowing exact paths. If you allow a prefix,
+also exclude the forms the upstream reinterprets (`not path contains
+"%2F"`, and likewise `"%5C"`, `"//"`, `";"` and `"%3B"`). Treat a `deny`
+on a path as defence in depth.
 
 ### Missing values (`null`)
 
-An absent value is `null`: an unsent header or query parameter, an unset
-state key, `tls.sni` when none was sent, `body.size` for a chunked body.
-`tag["x"]` is never `null` (`false` until set), nor are `metric.<id>`,
-`body.text` and `response.body.text` (unavailable, they fail closed);
-comparing any of them with `null` is a compile error. `==`, `!=`, `in` and
-`not in` treat `null` as a value; any other operator on it fails closed.
+A value that is absent is `null`: a header or query parameter that was not
+sent, an unset state key, `tls.sni` when none was sent, `body.size` for a
+chunked body. Tags and metrics are never `null`.
 
 | expression, with `x` missing | result |
 |---|---|
@@ -124,21 +95,16 @@ comparing any of them with `null` is a compile error. `==`, `!=`, `in` and
 | `x != null` | false |
 | `x == "a"`, `x in [...]` | false |
 | `x != "a"`, `x not in [...]` | true |
-| `x > 10`, `x contains "a"`, `x matches "..."`, `x under "..."`, `x in 10.0.0.0/8`, `x in @list` | fails closed: `_fail_closed`, reason `missing_value`, naming the field |
+| any other operator, such as `x > 10` or `x contains "a"` | the exchange is denied: `_fail_closed`, reason `missing_value` |
 
-`and` and `or` short-circuit, and a failure in any branch they reach is
-final: `body.size != null and body.size > 10mb` is safe, `body.size > 1 or
-true` on a chunked body fails closed, so the null test goes first in an
-`or` as well (`body.size == null or body.size > 1`). `null` may appear only
-in `x == null` / `x != null`. A metric keyed on a nullable field
-needs the same guard in its `where` ([rate limits](/reference/rate-limits#metrics)).
+`and` and `or` stop as soon as the result is known, so test for `null`
+first: `body.size != null and body.size > 10mb`, or
+`body.size == null or body.size > 1`.
 
 ## Actions
 
-`then` is required: one action, or a list with at most one terminal action
-(`allow`, `deny` or `quarantine`), last. An action is a bare word or a single-key map of
-name to argument; a multi-key map, an unknown action, a wrong-shaped
-argument or anything after a terminal action is a compile error.
+`then` is one action, or a list ending with at most one of `allow`, `deny`
+or `quarantine`.
 
 ```yaml
 then: allow
@@ -150,48 +116,47 @@ then:
   - allow: { upgrade: websocket }
 ```
 
-Terminal:
+These decide the exchange:
 
 | action | where | effect |
 |---|---|---|
-| `allow` | admission rules | Forward. `upgrade: websocket` permits a WebSocket upgrade; `private_ok: true` lets the flow reach private addresses ([address floor](/reference/address-lists#address-floor)). |
-| `deny` | all rules | `deny: { status, message, close }`; status 403 by default, 4xx or 5xx. At admission: refuse ([deny responses](/reference/http#deny-responses)) and close unless `close: false`. In flight: stop the exchange ([evaluation](/design/policy-evaluation#evaluation)). On a WebSocket: close both sides, with a `1008` frame when rules read messages ([WebSockets](/reference/websockets#message-rules)). |
-| `quarantine` | all rules | A bare word, no argument. A `deny` with status 403 that closes, plus: the whole proxy is [quarantined](/guides/operations#quarantine), refusing every later exchange until released from outside. Any matching `quarantine` trips it, whichever deny decided the exchange, a fail-closed included. Needs `--state-dir`. |
+| `allow` | admission rules | Forward the request. `upgrade: websocket` allows a WebSocket upgrade. `private_ok: true` allows private addresses ([address floor](/reference/address-lists#address-floor)). |
+| `deny` | all rules | Refuse, with `status` (default 403), `message` and `close` ([deny responses](/reference/http#deny-responses)). In flight, it stops the exchange. On a WebSocket, it closes both sides. |
+| `quarantine` | all rules | Deny, and [quarantine](/guides/operations#quarantine) roxy so it refuses every later request. Needs `--state-dir`. |
 
-Non-terminal:
+These add effects:
 
 | action | where | effect |
 |---|---|---|
-| `set_header: { name: value }` | request: admission rules; response: in-flight rules | Set or replace. Request values may use `${secret:name}`; an invalid value denies the flow. A response rule may read only values known before the response head is sent (`response.status`, `response.header[..]`, `response.body.size`, `response.body.text`); `body.bytes`, `response.body.bytes`, `ws.*` or a byte metric is a compile error. |
-| `remove_header: [names]` | as `set_header` | |
-| `rewrite_path: { match, to }` | admission rules | Anchored regex (as `matches`), `$1` / `${name}` groups; `to` must start with `/`; result re-normalised. |
-| `set_query: { k: v }`, `remove_query: [k]` | admission rules | |
-| `redirect: { host, port, scheme?, rewrite_host? }` | admission rules | Change the upstream target. `host`: DNS name, dotted-quad IPv4 or bracketed IPv6 (`[::1]`); anything else, or port `0`, is a config error. The new IPs pass the address floor and deny lists. `Host` is unchanged unless `rewrite_host: true`, and while unchanged the request goes upstream over HTTP/1.1 (HTTP/2 needs `:authority` and `host` to agree). |
-| `tag: name` | all | Sets `tag["name"]` for later rules, addons and the log. |
-| `log: { level, message }` | all | Emits a `log` flow event. |
-| `set_state: { key, value, ttl? }` | all | Writes the [state store](/reference/rate-limits#state). |
-| `capture: request \| response \| both` | admission rules | Tees the exchange, as forwarded, to the [capture log](/reference/flow-log#capture). |
-| `digest: request \| response \| both` | admission rules | Hashes the selected bodies, as forwarded, into the flow record's [`body_sha256`](/reference/flow-log#flow-log). Nothing is hashed without it. |
-| `sign: { aws_sigv4: { service, region, access_key_id, secret_access_key, session_token?, unsigned_payload? } }` | admission rules | AWS Signature Version 4 over the forwarded request, after every other admission effect ([signing AWS requests](/reference/secrets#signing-aws-requests)). |
+| `set_header: { name: value }` | request: admission rules; response: in-flight rules | Set or replace a header. Request values may use `${secret:name}` ([secrets](/reference/secrets)). |
+| `remove_header: [names]` | as `set_header` | Remove headers. |
+| `rewrite_path: { match, to }` | admission rules | Rewrite the path with a regex; `$1` and `${name}` refer to groups. |
+| `set_query: { k: v }`, `remove_query: [k]` | admission rules | Change the query. |
+| `redirect: { host, port, scheme?, rewrite_host? }` | admission rules | Send the request to another upstream. `Host` is unchanged unless `rewrite_host: true`. The new address still passes the address floor. |
+| `tag: name` | all | Set `tag["name"]`, for later rules, addons and the log. |
+| `log: { level, message }` | all | Write a `log` event to the flow log. |
+| `set_state: { key, value, ttl? }` | all | Write to the [state store](/reference/rate-limits#state). |
+| `capture: request \| response \| both` | admission rules | Record the exchange in the [capture log](/reference/flow-log#capture). |
+| `digest: request \| response \| both` | admission rules | Record a SHA-256 of the bodies in the [flow log](/reference/flow-log#flow-log). |
+| `sign: { aws_sigv4: { ... } }` | admission rules | Sign the request for AWS ([signing AWS requests](/reference/secrets#signing-aws-requests)). |
 
-Anything richer is an addon. `call` and `passthrough` are rejected with a
-reason naming why.
+Anything more complex needs an addon.
 
 ## Body rules
 
-`body.text` and `response.body.text` are the only fields that buffer. If
-any rule reads `body.text`, roxy collects every request body up to
-`limits.max_inspect_body_bytes` (1 MiB) before the admission decision, then
-streams it on; `response.body.text` likewise for every response body. A
-body over the cap is unavailable: a rule reading it fails closed
-(`_fail_closed`, reason `body_too_large_to_inspect`). Raise the cap, or
-scope the rule (`body.size != null and body.size < 1mb and ...`) so it
-short-circuits before the text; that avoids the fail-closed, not the
-buffering. No body rule, no buffering.
+`body.text` and `response.body.text` are the only fields that make roxy
+buffer. If any rule reads `body.text`, roxy buffers every request body, up
+to `limits.max_inspect_body_bytes` (1 MiB), before deciding, then streams
+it on. `response.body.text` does the same for responses.
 
-The text is the body decoded by its `content-encoding`
-([content codings](/reference/http#content-codings)), as lossy UTF-8; the
-forwarded bytes are the bytes received. The cap applies to the decoded text
-too. An undecodable body fails closed: `body_decode_failed` (corrupt,
-truncated, or bytes after the end of the stream) or
-`unsupported_content_encoding`.
+A body over the cap cannot be inspected, and a rule that reads it denies
+the exchange (`body_too_large_to_inspect`). To let large bodies through,
+raise the cap, or check the size before the text:
+
+```yaml
+when: body.size != null and body.size < 1mb and body.text contains "secret"
+```
+
+The text is the body decoded from its `content-encoding`
+([content codings](/reference/http#content-codings)). A body that cannot
+be decoded also denies the exchange.
