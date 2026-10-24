@@ -167,7 +167,9 @@ of a captured head (URL, header names and values); nothing else is: the
 header-name redaction above is flow-log only, and bodies are captured
 **unredacted**, except that a response
 [`http.redact_response_secrets.bodies`](/reference/secrets#redacting-responses)
-masked is captured as masked: it is what was forwarded.
+masked is captured as masked, and a response decoded for the layers or
+for masking is captured decoded
+([content codings](/reference/http#content-codings)).
 
 ```yaml
 capture_dir: /var/lib/roxy/capture   # absent = capture disabled; restart to change

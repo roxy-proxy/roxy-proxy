@@ -306,14 +306,18 @@ event.
 ### Content codings
 
 On a flow some layer runs on and is subscribed to the body, roxy decodes
-the client's request body as the first such layer gets it and the response
-before it reaches the first subscribed layer on its way downstream, removing `content-encoding`;
-the body's length becomes unknown. A body no running layer is subscribed
-to is not decoded, and reaches the upstream or the client as sent.
+the client's request body as the first such layer gets it, and the
+response in the core, after the response rules, removing
+`content-encoding`; the body's length becomes unknown. A body no running
+layer is subscribed to is not decoded, and reaches the upstream or the
+client as sent.
 
-- The client gets an uncompressed response and the upstream an
-  uncompressed request body; the origin's response to roxy stays
-  compressed. Nothing re-encodes.
+- Each body is encoded again in its codings as it leaves the stack: the
+  request as it reaches the core, the response at the client end
+  ([HTTP](/reference/http#content-codings)). The client and the origin get
+  the coding they negotiated. A layer that sets a `content-encoding` of
+  its own has encoded the body itself, and it is left as it is; a layer's
+  own answer is not encoded.
 - The codings and their strictness are the rules'
   ([HTTP](/reference/http#content-codings)). Data that does not decode, or
   a decoded body over `limits.max_request_body_bytes` or
@@ -321,8 +325,9 @@ to is not decoded, and reaches the upstream or the client as sent.
   also on a flow only an observer runs on.
 - A body in a coding roxy does not know passes through as it is, with its
   `content-encoding`; so does a `206` or any response with `content-range`.
-- The rules upstream of the layers read the response first and decode it
-  for themselves ([body rules](/reference/rule-language#body-rules)).
+- The response rules read the response before it is decoded, and decode
+  it for themselves ([body rules](/reference/rule-language#body-rules)).
+  The in-flight body rules and the capture see it decoded.
 - No extension (`permessage-deflate` above all) is negotiated on a
   WebSocket a body-subscribed layer runs on ([WebSockets](/reference/websockets#extensions)).
 

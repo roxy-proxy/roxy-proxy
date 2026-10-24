@@ -59,6 +59,7 @@ pub mod listener;
 pub mod needles;
 mod pipeline;
 pub mod quarantine;
+mod recode;
 mod redact;
 pub mod secrets;
 pub mod server;

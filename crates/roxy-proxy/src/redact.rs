@@ -8,8 +8,8 @@
 //! sent them. The stage runs in the core, after the response rules and
 //! before the in-flight body checks, the capture tap and the addon layers,
 //! so everything downstream of the upstream sees the masked response. An
-//! encoded body is decoded, masked and encoded again in the same codings,
-//! so the client gets the coding it negotiated.
+//! encoded body is decoded for it by [`crate::recode`], and encoded again
+//! on its way to the client.
 //!
 //! Matching is literal, so this stops a verbatim echo only: a value the
 //! upstream transforms (base64, escaping, a change of case) passes.
@@ -20,28 +20,22 @@ use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
 use bytes::Bytes;
-use http::{HeaderMap, HeaderValue, StatusCode};
+use http::{HeaderMap, HeaderValue};
 use http_body::Frame;
-use roxy_http::{Body, BodyError, CanonicalResponse, Headers, coding};
+use roxy_http::{Body, BodyError, CanonicalResponse, Headers};
 
 use crate::config::ResponseRedaction;
 use crate::needles::{MASK, Needles};
-use crate::pipeline::{FlowCx, Refusal, response_known_empty};
+use crate::pipeline::{FlowCx, response_known_empty};
 use crate::quarantine::QuarantineCause;
 use crate::server::Shared;
 
-/// Flow-log `reason` of a response whose body cannot be scrubbed: its
-/// content coding is one roxy does not decode, or it is a range of an
-/// encoded body.
-const UNDECODABLE: &str = "unsupported_content_encoding";
-
-/// Scrubs `res` as `http.redact_response_secrets` asks, if this exchange
-/// injected a secret. A body that cannot be decoded is refused rather than
-/// passed unscrubbed.
-pub(crate) fn response(cx: &FlowCx, res: &mut CanonicalResponse) -> Result<(), Refusal> {
+/// The values this exchange's response is masked for: those its own
+/// `set_header` effects injected. `None` when nothing is to be masked.
+pub(crate) fn needles(cx: &FlowCx) -> Option<Arc<Needles>> {
     let switches = cx.snap.http.redact_response_secrets;
     if !(switches.headers || switches.bodies) {
-        return Ok(());
+        return None;
     }
     // A short value would mask unrelated bytes wherever it happens to
     // occur, so values under `min_length` are left alone.
@@ -53,10 +47,14 @@ pub(crate) fn response(cx: &FlowCx, res: &mut CanonicalResponse) -> Result<(), R
     {
         needles.add(value.clone());
     }
-    if needles.is_empty() {
-        return Ok(());
-    }
-    let needles = Arc::new(needles);
+    (!needles.is_empty()).then(|| Arc::new(needles))
+}
+
+/// Masks `needles` in `res` as `http.redact_response_secrets` asks. With
+/// `bodies` on, the body is plain bytes by now: [`crate::recode`] decoded
+/// it or refused it.
+pub(crate) fn response(cx: &FlowCx, res: &mut CanonicalResponse, needles: Arc<Needles>) {
+    let switches = cx.snap.http.redact_response_secrets;
     let alarm = Alarm {
         shared: switches.quarantine.then(|| cx.shared.clone()),
         flow: cx.flow.to_string(),
@@ -65,42 +63,10 @@ pub(crate) fn response(cx: &FlowCx, res: &mut CanonicalResponse) -> Result<(), R
         alarm.raise(Part::Headers);
     }
     if response_known_empty(cx, res) {
-        return Ok(());
+        return;
     }
-    let codings = if switches.bodies {
-        decode(cx, res)?
-    } else {
-        Vec::new()
-    };
     let body = std::mem::take(&mut res.body);
     res.body = MaskedBody::wrap(body, needles, switches, alarm);
-    if !codings.is_empty() {
-        let body = std::mem::take(&mut res.body);
-        res.body = coding::encode_body(body, &codings, cx.shared.window_meter());
-    }
-    Ok(())
-}
-
-/// Leaves `res`'s body as plain bytes, decoded by its `content-encoding`,
-/// and returns the codings to encode it in again; or refuses it when it
-/// cannot be decoded. A range of an encoded body cannot be decoded on its
-/// own; a range of a plain one is masked as it is.
-fn decode(cx: &FlowCx, res: &mut CanonicalResponse) -> Result<Vec<coding::Coding>, Refusal> {
-    let codings =
-        coding::content_codings(&res.headers).map_err(|_| Refusal::fail_closed(UNDECODABLE))?;
-    if codings.is_empty() {
-        return Ok(codings);
-    }
-    if res.status == StatusCode::PARTIAL_CONTENT || res.headers.contains("content-range") {
-        return Err(Refusal::fail_closed(UNDECODABLE));
-    }
-    res.body = coding::decode_body(
-        std::mem::take(&mut res.body),
-        &codings,
-        cx.snap.limits.max_response_body_bytes,
-        cx.shared.window_meter(),
-    );
-    Ok(codings)
 }
 
 /// Masks every value in `headers`; whether any held a secret.

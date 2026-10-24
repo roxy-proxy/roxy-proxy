@@ -145,6 +145,56 @@ async fn an_encoded_body_is_masked_and_re_encoded() {
     );
 }
 
+/// Masking and the layers share one decoding in each direction: the
+/// layer reads both bodies plain, the response masked, and each leaves in
+/// the coding it came in.
+#[tokio::test]
+async fn masking_and_a_reading_layer_share_the_decoding() {
+    // Upper case, so the layer's upper-casing leaves it as injected.
+    const LOUD: &str = "S3CR3T-TOKEN-VALUE-0123456789";
+    let kit = Kit::builder()
+        .secret("token", LOUD)
+        .rules(RULES)
+        .http(|h| h.redact_response_secrets = BOTH)
+        .addon(AddonDef::test_layer("a"))
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+    let a = post(
+        &mut c,
+        "/echo",
+        &[
+            ("content-encoding", "gzip"),
+            ("x-echo-encoding", "gzip"),
+            ("x-upper", "1"),
+        ],
+        gzip(format!("before {LOUD} after").as_bytes()),
+    )
+    .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let gunzip = |b: &[u8]| {
+        roxy_http::coding::decode(
+            &[roxy_http::coding::Coding::Gzip],
+            b,
+            1 << 20,
+            roxy_http::coding::unmetered(),
+        )
+        .unwrap()
+    };
+    // The layer upper-cased the request it read plain; it went on gzipped.
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].headers["content-encoding"], "gzip");
+    assert_eq!(
+        gunzip(&seen[0].body),
+        format!("BEFORE {LOUD} AFTER").as_bytes()
+    );
+    // The echo came back gzipped, was masked, read by the layer and gzipped
+    // again for the client.
+    assert_eq!(a.headers["content-encoding"], "gzip", "{a:?}");
+    let body = gunzip(a.body.as_ref().expect("a whole body"));
+    assert_eq!(body, format!("BEFORE {MASKED} AFTER").as_bytes());
+}
+
 /// A body roxy cannot decode is refused rather than passed unscrubbed: a coding it does not decode, or a range of an encoded body.
 #[tokio::test]
 async fn a_body_that_cannot_be_decoded_fails_closed() {

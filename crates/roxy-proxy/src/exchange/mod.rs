@@ -37,6 +37,7 @@ use crate::pipeline::{
     BodyIo, FlowCx, PerDir, Refusal, RefusalKind, ResponseVerdict, Verdict, body_failure, ms,
     request_steps, response_steps,
 };
+use crate::recode::{Leg, Need};
 use crate::server::Shared;
 use crate::upstream::{ConnectError, ConnectInfo, Protocols, UpstreamBody, classify, describe};
 use crate::view::host_text;
@@ -785,8 +786,20 @@ async fn forward<F: ClientTransport>(
     let res = from_upstream_response(res, &cx.snap.limits);
     match response_steps(cx, res, transport).await {
         ResponseVerdict::Continue(mut res) => {
-            if let Err(r) = crate::redact::response(cx, &mut res) {
-                return Outcome::Refuse(r);
+            let needles = crate::redact::needles(cx);
+            let need = if needles.is_some() && cx.snap.http.redact_response_secrets.bodies {
+                Need::Masking
+            } else if matches!(cx.response_leg, Leg::Stack { decode: true, .. }) {
+                Need::Layers
+            } else {
+                Need::None
+            };
+            let codings = match crate::recode::response(cx, &mut res, need) {
+                Ok(codings) => codings,
+                Err(r) => return Outcome::Refuse(r),
+            };
+            if let Some(needles) = needles {
+                crate::redact::response(cx, &mut res, needles);
             }
             let mut down_tap = down_tap;
             if let Some(t) = down_tap.as_mut() {
@@ -802,6 +815,11 @@ async fn forward<F: ClientTransport>(
             }
             let body = std::mem::take(&mut res.body);
             res.body = in_flight_body(body, in_flight, Dir::Response, down_tap);
+            // Encoded again at the client's end of the chain.
+            match &mut cx.response_leg {
+                Leg::Direct => crate::recode::encode_response(&cx.shared, &mut res, &codings),
+                Leg::Stack { codings: c, .. } => *c = codings,
+            }
             Outcome::Respond(res)
         }
         ResponseVerdict::Deny(r) => Outcome::Refuse(r),

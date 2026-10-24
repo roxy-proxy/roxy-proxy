@@ -382,14 +382,28 @@ the response and roxy builds a `CanonicalResponse`:
 
 ## Content codings
 
-roxy decodes `content-encoding` to inspect a body, never to forward it:
-`body.text` and `response.body.text` see the decoded text
+roxy decodes `content-encoding` to inspect a body: `body.text` and
+`response.body.text` see the decoded text
 ([body rules](/reference/rule-language#body-rules)); the bytes forwarded
-are the bytes received. Two things change that. Addons: bodies are decoded
-at the edge of the stack and forwarded decoded
-([content codings for addons](/reference/addon-configuration#content-codings)).
-A response [masked for secrets](/reference/secrets#redacting-responses):
-it is decoded, masked and encoded again in the codings it arrived in.
+are the bytes received. A body that addon layers read
+([content codings for addons](/reference/addon-configuration#content-codings))
+or that is [masked for secrets](/reference/secrets#redacting-responses) is
+decoded once, where it enters, and encoded again in the same codings where
+it leaves, so the client and the origin always get the coding they
+negotiated:
+
+- A response is decoded in the core, after the response rules, when a
+  layer that ran reads its body or it is masked. The in-flight body rules,
+  the capture and the layers see it decoded. It is encoded again for the
+  client: as the core hands it on, or at the client end of the addon
+  stack. A layer's own answer is not.
+- A request body is decoded as it enters the first layer that reads it,
+  and encoded again as it reaches the core, so the rules, the capture and
+  the origin see it in the client's coding.
+- A head that leaves with a `content-encoding` of its own was encoded by a
+  layer, and is left as it is.
+- An encoded body loses its declared length, since the new encoding has
+  its own.
 
 | coding | format |
 |---|---|
@@ -412,9 +426,10 @@ it is decoded, masked and encoded again in the codings it arrived in.
 every request as roxy reads it, so origins answer uncompressed. Addons,
 rules and the flow log see the request without it.
 
-Encoding again uses fast settings, flushed per chunk: `gzip` and
-`deflate` at level 1, `br` at quality 4 with a 256 KiB window, and
-`zstd` as one frame per chunk.
+Encoding again uses fast settings, each chunk flushed through the encoder
+as it comes so a stream is not held back: `gzip` and `deflate` at level 1,
+`br` at quality 4 with a 256 KiB window, and `zstd` as one frame per
+chunk.
 
 ## Deny responses
 

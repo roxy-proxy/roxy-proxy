@@ -578,6 +578,8 @@ pub(crate) struct FlowCx {
     /// An addon layer that ran on this request reads a body: on an upgrade,
     /// it is in the WebSocket's byte path.
     pub layer_reads_bytes: bool,
+    /// Where the core hands its response, and what it decoded it from.
+    pub response_leg: crate::recode::Leg,
     /// The exchange's share of the buffer budget, held until it ends: the
     /// buffered body text stays with the facts for as long as the flow.
     pub buffers: Vec<BufferLease>,
@@ -723,6 +725,7 @@ impl FlowCx {
             },
             stack: None,
             layer_reads_bytes: false,
+            response_leg: crate::recode::Leg::Direct,
             buffers: Vec::new(),
             logged: false,
         })

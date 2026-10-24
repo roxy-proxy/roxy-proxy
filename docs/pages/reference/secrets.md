@@ -68,11 +68,11 @@ http:
   else is buffered or delayed. A plain body keeps its declared length.
 - **Content codings:** the request keeps the client's `accept-encoding`,
   and the client gets the coding the upstream answered in. An encoded
-  body is decoded ([content codings](/reference/http#content-codings)),
-  masked and encoded again in the same codings, each chunk flushed
-  through the encoder as it is masked, so a stream is not held back. It
-  loses its declared length, since the new encoding has its own. One in
-  a coding roxy does not decode, or a `206` (or `content-range`) of an encoded body, is refused
+  body is decoded once, masked, and encoded again in the same codings on
+  its way to the client ([content codings](/reference/http#content-codings)),
+  sharing that decoding with any addon layer that reads it. One in a
+  coding roxy does not decode, or a `206` (or `content-range`) of an
+  encoded body, is refused
   `503` (`terminal_rule: _fail_closed`, `reason:
   unsupported_content_encoding`) instead of passed unmasked. A `206` of a
   plain body is masked range by range, its ranges unchanged: a secret
