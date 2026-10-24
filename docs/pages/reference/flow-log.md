@@ -132,10 +132,10 @@ with `capture: request | response | both`, or every exchange with
 batching, rotation and backpressure.
 
 Secret values are masked in captured headers and URLs. **Bodies are
-captured unredacted**, except a response that
-[`http.redact_response_secrets.bodies`](/reference/secrets#redacting-responses)
-masked. A body roxy decompressed for addons or for masking is captured
-compressed again, as sent.
+captured unredacted**, as they cross roxy's edge: a response is captured
+as the upstream sent it, before roxy decompresses it for addons or masks
+secrets in it
+([redacting responses](/reference/secrets#redacting-responses)).
 
 ```yaml
 capture_dir: /var/lib/roxy/capture   # absent = capture off; restart to change
@@ -164,7 +164,7 @@ One JSON object per line:
 |---|---|
 | `flow` | the exchange's id in the flow log |
 | `dir` | `request` or `response` |
-| `kind` | `head`, `data` (body bytes, base64), `truncated` (`max_capture_body_bytes` reached, or `reason: buffer_budget_exhausted` when the budget could not cover compressing a body again for the capture; nothing more is recorded) or `end` (with the total `bytes`, and `aborted: true` if the body did not complete) |
+| `kind` | `head`, `data` (body bytes, base64), `truncated` (`max_capture_body_bytes` reached; nothing more is recorded) or `end` (with the total `bytes`, and `aborted: true` if the body did not complete) |
 | `seq` | the record's position for this flow and direction |
 
 A body is its `data` records joined in `seq` order. Each `data` record

@@ -4,12 +4,11 @@
 //! An exchange scrubs the values its own `set_header` effects put into the
 //! request, and nothing else: those are what its upstream holds that the
 //! client was never given. Each occurrence is masked with [`MASK`] byte for
-//! byte, so lengths, `content-length` and byte ranges stay as the upstream
-//! sent them. The stage runs in the core, after the response rules and
-//! before the in-flight body checks, the capture tap and the addon layers,
-//! so everything downstream of the upstream sees the masked response. An
-//! encoded body is decoded for it by [`crate::recode`], and encoded again
-//! on its way to the client.
+//! byte, so a plain body keeps its length. The stage runs in the core,
+//! after the response rules, the in-flight byte counts and the capture
+//! tap, which all see the response as the upstream sent it, and before
+//! the addon layers and the client. An encoded body is decoded for it by
+//! [`crate::recode`], and encoded again on its way to the client.
 //!
 //! Matching is literal, so this stops a verbatim echo only: a value the
 //! upstream transforms (base64, escaping, a change of case) passes.

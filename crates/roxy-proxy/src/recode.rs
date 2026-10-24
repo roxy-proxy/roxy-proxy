@@ -56,12 +56,12 @@ pub(crate) enum Need {
     Masking,
 }
 
-/// Decodes `res`'s body if `need` asks for it, dropping `content-encoding`,
-/// and returns the codings to encode it in again on its way out (none when
-/// it was not decoded).
-pub(crate) fn response(
+/// The codings `res`'s body is to be decoded from for `need`: none when
+/// nothing needs it plain or it cannot be decoded for the layers, and a
+/// refusal when masking cannot read it whole.
+pub(crate) fn response_codings(
     cx: &FlowCx,
-    res: &mut CanonicalResponse,
+    res: &CanonicalResponse,
     need: Need,
 ) -> Result<Vec<Coding>, Refusal> {
     if need == Need::None || response_known_empty(cx, res) {
@@ -76,25 +76,27 @@ pub(crate) fn response(
     if need == Need::Masking && partial {
         return Err(Refusal::fail_closed(PARTIAL));
     }
-    let refuse = || match need {
-        Need::Masking => Err(Refusal::fail_closed(UNDECODABLE)),
-        Need::Layers | Need::None => Ok(Vec::new()),
-    };
-    let Ok(codings) = coding::content_codings(&res.headers) else {
-        return refuse();
-    };
-    // A range of an encoded body cannot be decoded on its own.
-    if codings.is_empty() || partial {
-        return Ok(Vec::new());
+    match coding::content_codings(&res.headers) {
+        // A range of an encoded body cannot be decoded on its own.
+        Ok(codings) if !partial => Ok(codings),
+        // Masking cannot pass a body it cannot read; a layer judges it.
+        Err(_) if need == Need::Masking => Err(Refusal::fail_closed(UNDECODABLE)),
+        Ok(_) | Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// Decodes `res`'s body from `codings`, dropping `content-encoding`.
+pub(crate) fn decode_response(cx: &FlowCx, res: &mut CanonicalResponse, codings: &[Coding]) {
+    if codings.is_empty() {
+        return;
     }
     res.headers.remove("content-encoding");
     res.body = coding::decode_body(
         std::mem::take(&mut res.body),
-        &codings,
+        codings,
         cx.snap.limits.max_response_body_bytes,
         cx.shared.window_meter(),
     );
-    Ok(codings)
 }
 
 /// Decodes `body` for a layer, dropping `content-encoding` from `headers`;

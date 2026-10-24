@@ -27,9 +27,7 @@
 //!     `data`; at most [`DATA_RECORD_MAX`] bytes, so a larger chunk spans
 //!     several records;
 //!   - `truncated`: `limits.max_capture_body_bytes` was reached; nothing
-//!     more of this direction is captured. The record carries the cap, or
-//!     `reason: buffer_budget_exhausted` when the budget could not cover
-//!     the encoder for a body passed on decoded ([`Tap::encode_as`]).
+//!     more of this direction is captured. The record carries the cap.
 //!   - `end`: the direction ended. It carries the total `bytes` forwarded,
 //!     and `aborted: true` if it did not complete (stopped by a rule, the
 //!     client or upstream went away, an error).
@@ -41,9 +39,9 @@
 //!
 //! Every string in a captured *head* passes through the exchange's
 //! redactor, so an injected secret value (which the agent never saw) is
-//! scrubbed wherever it appears. Bodies are captured as they are
-//! forwarded: unredacted, except a response body that
-//! `http.redact_response_secrets` masked on its way out.
+//! scrubbed wherever it appears. Bodies are captured as they cross
+//! roxy's edge, unredacted: a response body as the upstream sent it,
+//! before any decoding or the masking of secrets.
 
 use std::fmt::Write as _;
 use std::io;
@@ -53,7 +51,6 @@ use std::task::{Context, Poll};
 
 use base64::Engine as _;
 use base64::prelude::BASE64_STANDARD;
-use roxy_http::coding::{Coding, Encoder, Meter};
 use roxy_http::{CanonicalRequest, CanonicalResponse, Headers};
 use roxy_log::{LogWriter, RotateOptions, RotatingFile, WriterOptions};
 
@@ -192,17 +189,6 @@ pub(crate) struct Tap {
     bytes: u64,
     truncated: bool,
     ended: bool,
-    /// The body passes here decoded but leaves encoded: it is captured
-    /// encoded, as it travels.
-    encoding: Option<Encoding>,
-}
-
-/// How a body passed on decoded is captured encoded.
-#[derive(Debug)]
-enum Encoding {
-    Codings(String, Encoder),
-    /// The budget could not cover the encoder.
-    Refused(String),
 }
 
 impl Tap {
@@ -216,27 +202,7 @@ impl Tap {
             bytes: 0,
             truncated: false,
             ended: false,
-            encoding: None,
         }
-    }
-
-    /// The body passes here decoded, to leave encoded in `codings`: the
-    /// head is captured with its `content-encoding` and the body encoded,
-    /// so the capture shows it as it travels. The encoder's memory is
-    /// charged to `meter`.
-    pub(crate) fn encode_as(&mut self, codings: &[Coding], meter: Meter<'static>) {
-        if codings.is_empty() {
-            return;
-        }
-        let header = codings
-            .iter()
-            .map(|c| c.as_str())
-            .collect::<Vec<_>>()
-            .join(", ");
-        self.encoding = Some(match Encoder::new(codings, meter) {
-            Some(e) => Encoding::Codings(header, e),
-            None => Encoding::Refused(header),
-        });
     }
 
     pub(crate) fn log(&self) -> &Arc<CaptureLog> {
@@ -269,15 +235,12 @@ impl Tap {
         self.head(v);
     }
 
-    /// The canonical response head, as sent to the client.
+    /// The canonical response head, after the response rules' effects and
+    /// before anything decodes or masks the response.
     pub(crate) fn response_head(&mut self, res: &CanonicalResponse) {
-        let mut headers = header_pairs(&res.headers);
-        if let Some(Encoding::Codings(h, _) | Encoding::Refused(h)) = &self.encoding {
-            headers.push(["content-encoding".to_owned(), h.clone()]);
-        }
         let v = serde_json::json!({
             "status": res.status.as_u16(),
-            "headers": headers,
+            "headers": header_pairs(&res.headers),
         });
         self.head(v);
     }
@@ -294,26 +257,6 @@ impl Tap {
     /// Body bytes about to be forwarded. Past the cap, records one
     /// `truncated` record and nothing more.
     pub(crate) fn data(&mut self, d: &[u8]) {
-        match &mut self.encoding {
-            None => self.record_data(d),
-            Some(Encoding::Codings(_, e)) => {
-                let d = e.encode(d);
-                self.record_data(&d);
-            }
-            Some(Encoding::Refused(_)) => {
-                self.bytes += d.len() as u64;
-                if !self.truncated && !d.is_empty() {
-                    self.truncated = true;
-                    let seq = self.next_seq();
-                    let extra = ",\"reason\":\"buffer_budget_exhausted\"";
-                    self.log
-                        .record(&self.flow, self.dir, "truncated", seq, extra, Payload::None);
-                }
-            }
-        }
-    }
-
-    fn record_data(&mut self, d: &[u8]) {
         self.bytes += d.len() as u64;
         if self.truncated || d.is_empty() {
             return;
@@ -345,10 +288,6 @@ impl Tap {
     pub(crate) fn end(&mut self, aborted: bool) {
         if self.ended || self.seq == 0 {
             return;
-        }
-        if !aborted && let Some(Encoding::Codings(_, e)) = &mut self.encoding {
-            let tail = e.finish();
-            self.record_data(&tail);
         }
         self.ended = true;
         let seq = self.next_seq();

@@ -72,9 +72,10 @@ All three switches are off by default.
   response, and the client chooses where the range starts and ends. A
   partial response (`206`) that comes back anyway is refused with `503`
   and reason `partial_response`.
-- **Who sees it masked:** everything after the response rules: in-flight
-  rules, the capture, addons and the client. The response rules and
-  `response.body.text` see the response as the upstream sent it.
+- **Who sees it masked:** addons and the client. The response rules,
+  `response.body.text`, the in-flight byte counts and the capture see the
+  response as the upstream sent it, so a captured body holds an echoed
+  secret ([capture](/reference/flow-log#capture)).
 - **`quarantine: true`** quarantines roxy when a secret is found, with the
   cause `{"kind": "secret_in_response", "flow", "part"}`, where `part` is
   `headers`, `body` or `trailers` ([quarantine](/guides/operations#quarantine)).

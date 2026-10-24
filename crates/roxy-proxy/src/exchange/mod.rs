@@ -795,18 +795,23 @@ async fn forward<F: ClientTransport>(
             } else {
                 Need::None
             };
-            let codings = match crate::recode::response(cx, &mut res, need) {
+            let codings = match crate::recode::response_codings(cx, &res, need) {
                 Ok(codings) => codings,
                 Err(r) => return Outcome::Refuse(r),
             };
-            if let Some(needles) = needles {
-                crate::redact::response(cx, &mut res, needles);
-            }
+            // The capture and the in-flight byte counts see the response
+            // as the upstream sent it: decoding and masking come after.
             let mut down_tap = down_tap;
             if let Some(t) = down_tap.as_mut() {
-                // Captured as it travels, not as it is decoded here.
-                t.encode_as(&codings, cx.shared.window_meter());
                 t.response_head(&res);
+            }
+            if upgrade.is_none() {
+                let body = std::mem::take(&mut res.body);
+                res.body = in_flight_body(body, in_flight, Dir::Response, down_tap.take());
+            }
+            crate::recode::decode_response(cx, &mut res, &codings);
+            if let Some(needles) = needles {
+                crate::redact::response(cx, &mut res, needles);
             }
             if let Some((upstream, key)) = upgrade {
                 // The relay takes the taps after the `101`.
@@ -816,8 +821,6 @@ async fn forward<F: ClientTransport>(
                 };
                 return Outcome::Upgrade { res, upstream, key };
             }
-            let body = std::mem::take(&mut res.body);
-            res.body = in_flight_body(body, in_flight, Dir::Response, down_tap);
             // Encoded again at the client's end of the chain.
             match &mut cx.response_leg {
                 Leg::Direct => crate::recode::encode_response(&cx.shared, &mut res, &codings),

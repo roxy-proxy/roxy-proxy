@@ -211,8 +211,8 @@ bytes. For them, roxy decompresses a body once and compresses it again in
 the same coding before it leaves, so the client and the upstream always
 get the coding they asked for. Compression uses fast settings and sends
 each chunk as soon as it is ready, so streams are not delayed. A body
-compressed again has no `content-length`, and the capture records it
-compressed, as sent.
+compressed again has no `content-length`. The capture, `response.body.bytes`
+and the `response_bytes` metric see a response as the upstream sent it.
 
 roxy decodes `gzip`, `x-gzip`, `deflate`, `br` and `zstd`, stacked up to
 four deep. Decoding is strict: a truncated or corrupt body cannot be

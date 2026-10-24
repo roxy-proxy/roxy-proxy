@@ -37,12 +37,11 @@ fn memory(coding: Coding) -> u64 {
 /// A stack of encoders, fed plain bytes, each write flushed through every
 /// coding. It holds its memory's charge to the [`Meter`] for as long as it
 /// lives.
-pub struct Encoder {
+struct Encoder {
     /// `stages[0]` is the coding applied first.
     stages: Vec<Stage>,
-    /// Holds the charge. Behind a lock only so an encoder can sit in a
-    /// shared structure; it is never called again.
-    _meter: std::sync::Mutex<Meter<'static>>,
+    /// Holds the charge; it is never called again.
+    _meter: Meter<'static>,
 }
 
 impl std::fmt::Debug for Encoder {
@@ -56,7 +55,7 @@ impl std::fmt::Debug for Encoder {
 impl Encoder {
     /// Encoders for `codings` (in the order they are applied), their
     /// memory charged to `meter` first; `None` when it refuses.
-    pub fn new(codings: &[Coding], mut meter: Meter<'static>) -> Option<Self> {
+    fn new(codings: &[Coding], mut meter: Meter<'static>) -> Option<Self> {
         let mut held: u64 = 0;
         let mut stages = Vec::with_capacity(codings.len());
         for &c in codings {
@@ -68,13 +67,13 @@ impl Encoder {
         }
         Some(Self {
             stages,
-            _meter: std::sync::Mutex::new(meter),
+            _meter: meter,
         })
     }
 
     /// `data` through every stage, flushed: a decoder can read all of it
     /// from what has been returned so far.
-    pub fn encode(&mut self, data: &[u8]) -> Vec<u8> {
+    fn encode(&mut self, data: &[u8]) -> Vec<u8> {
         let mut buf = data.to_vec();
         for s in &mut self.stages {
             buf = s.flush(&buf);
@@ -84,7 +83,7 @@ impl Encoder {
 
     /// The end of every stage: each finishes its stream, which the stages
     /// after it encode in turn.
-    pub fn finish(&mut self) -> Vec<u8> {
+    fn finish(&mut self) -> Vec<u8> {
         let mut buf = Vec::new();
         for s in &mut self.stages {
             let mut out = s.flush(&buf);

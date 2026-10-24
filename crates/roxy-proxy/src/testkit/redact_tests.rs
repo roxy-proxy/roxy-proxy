@@ -195,10 +195,10 @@ async fn masking_and_a_reading_layer_share_the_decoding() {
     assert_eq!(body, format!("BEFORE {MASKED} AFTER").as_bytes());
 }
 
-/// The decoding is internal: the capture records the response masked, in
-/// the coding it travels in.
+/// The capture records traffic as it crosses roxy's edge: the response
+/// as the upstream sent it, in its coding and before masking.
 #[tokio::test]
-async fn a_decoded_response_is_captured_in_its_coding() {
+async fn the_capture_records_the_response_as_the_upstream_sent_it() {
     let kit = Kit::builder()
         .secret("token", SECRET)
         .rules(RULES)
@@ -207,11 +207,12 @@ async fn a_decoded_response_is_captured_in_its_coding() {
         .start()
         .await;
     let mut c = kit.h1().await;
+    let sent = gzip(format!("before {SECRET} after").as_bytes());
     let a = post(
         &mut c,
         "/echo",
         &[("x-echo-encoding", "gzip")],
-        gzip(format!("before {SECRET} after").as_bytes()),
+        sent.clone(),
     )
     .await;
     assert_eq!(a.status, 200, "{a:?}");
@@ -235,16 +236,48 @@ async fn a_decoded_response_is_captured_in_its_coding() {
         .filter(|(h, _)| h["kind"] == "data")
         .flat_map(|(_, d)| d.clone())
         .collect();
-    // What was captured is what the client got.
-    assert_eq!(&data, a.body.as_ref().unwrap());
-    let plain = roxy_http::coding::decode(
-        &[roxy_http::coding::Coding::Gzip],
-        &data,
-        1 << 20,
-        roxy_http::coding::unmetered(),
-    )
-    .unwrap();
-    assert_eq!(plain, format!("before {MASKED} after").as_bytes());
+    assert_eq!(data, sent, "the upstream's bytes");
+}
+
+/// `response.body.bytes` counts the bytes the upstream sent, whether or
+/// not roxy decodes the body for masking or a layer: a small gzip of a
+/// large body stays under a download cap.
+#[tokio::test]
+async fn in_flight_byte_counts_see_the_encoded_body() {
+    for (masking, layer) in [(false, false), (true, false), (false, true)] {
+        let mut b = Kit::builder().secret("token", SECRET).rules(
+            r#"
+- id: inject
+  when: host == "up.test"
+  then:
+    - set_header: { authorization: "Bearer ${secret:token}" }
+    - allow
+- id: download-cap
+  when: host == "up.test" and response.body.bytes > 10kb
+  then: deny
+"#,
+        );
+        if masking {
+            b = b.http(|h| h.redact_response_secrets = BOTH);
+        }
+        if layer {
+            b = b.addon(AddonDef::test_layer("a"));
+        }
+        let kit = b.start().await;
+        let sent = gzip(&vec![b'x'; 64 * 1024]);
+        let a = post(
+            &mut kit.h1().await,
+            "/echo",
+            &[("x-echo-encoding", "gzip")],
+            sent,
+        )
+        .await;
+        let case = format!("masking {masking}, layer {layer}");
+        assert_eq!(a.status, 200, "{case}: {a:?}");
+        assert!(a.body.is_ok(), "{case}: the body is whole: {a:?}");
+        let ev = kit.request_event().await;
+        assert_eq!(ev["decision"], "allow", "{case}: {ev:#}");
+    }
 }
 
 /// A body roxy cannot decode is refused rather than passed unmasked.
