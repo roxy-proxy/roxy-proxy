@@ -3,6 +3,7 @@ title: "Addon model"
 description: "What an addon is: a step every exchange it runs on streams through, in both directions. How addons are ordered, what they are held to, and what the modes mean."
 ---
 
+import addonStack from "../../assets/addon-stack.svg";
 import layerOrdering from "../../assets/layer-ordering.svg";
 
 # Addon model
@@ -24,15 +25,7 @@ Configuring addons is covered in
 
 ## The stack
 
-```
-                 request ↓                                   ↑ response
-         ┌─ CONNECT and TLS ─────────────────────────────────────────────┐
-         ├─ first addon listed                                           │
-         ├─ second addon listed                                          │
-         ├─ rules                                                        │
-         ├─ address floor                                                │
-         └─ connection to the origin ────────────────────────────────────┘
-```
+<img src={addonStack} alt="The stack, top to bottom: client, then CONNECT and TLS, the first addon listed, the second addon listed, the rules, the address floor, the connection to the origin, and the origin. The request runs down through every step and the response runs back up. The two addons are marked as the addons, in the order listed; the address floor and the connection to the origin always run, after the rules. A dotted line between the rules and the address floor marks where capture records what the rules allow, and a flow-log strip down the left is fed by every step." />
 
 Addons run in the order they are listed under `addons:`, between the
 client and the rules. Nothing configurable runs between the rules and the
@@ -88,7 +81,7 @@ write to finish before passing on the bytes B will read them with. A WASM
 addon's calls always finish before it carries on. A service layer waits
 for the `result` itself.
 
-<img src={layerOrdering} alt="Two enforce layers, A and B, in roxy's request path, left to right, then the rules. The client's head (a solid line) and body bytes (a dashed line) run through A, then B, then to the rules; the gap between A and B is labelled: a chunk reaches B only after A sends it. Part-way through the body, A calls state_put, drawn as an arrow down to a host services strip along the bottom with a result arrow back up, and the note awaits result, then sends on; A's body line is broken at that point. In B, on the chunk that followed, a state_get arrow goes down to the strip and a result comes back, with the note on that chunk: sees A's write. A dotted line between the two calls says ordered only by A's await. The strip reads host services (add_tag, state_put, state_get, record, quarantine, and more): beside the pipeline. Under it: each layer's calls run on their own worker, so A's put lands before B's get only because A awaited its result; a write for this exchange's admission lands before the request is forwarded; any other is seen by the next rule that reads it: a tag in flight on this exchange, state there or at a later exchange's admission." />
+<img src={layerOrdering} alt="Two enforce layers, A and B, in roxy's request path, left to right, then the rules. The client's head (a solid line) and body bytes (a dashed line) run through A, then B, then to the rules; between A and B, a chunk reaches B once A sends it. Part-way through the body, A calls state_put, drawn as an arrow down to a host services strip along the bottom with a result arrow back up, and the note awaits result, then sends on; A's body line is broken at that point. In B, on the chunk that followed, a state_get arrow goes down to the strip and a result comes back, with the note on that chunk: sees A's write. A dotted line between the two calls says ordered only by A's wait. The strip lists host services: add_tag, state_put, state_get, record, and more." />
 
 For the rules to see a tag or state write when they decide on the
 request, it must land before the addon passes the request on. A later
