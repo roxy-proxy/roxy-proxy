@@ -103,6 +103,10 @@
     <text x="610" y="625">private → _address_policy</text>
   </g>
 
+  <!-- capture: taps what crosses between the rules and the network -->
+  <path d="M 8 574 H 502" fill="none" stroke="#0f766e" stroke-width="1.5" stroke-dasharray="2 4"/>
+  <text x="504" y="579" fill="#0f766e" font-size="14" font-weight="600">capture: what crosses here</text>
+
   <!-- flow log: every stage and every exit feeds it -->
   <g stroke="#cfd4d2" stroke-dasharray="3 3">
     <line x1="472" y1="204" x2="740" y2="204"/>

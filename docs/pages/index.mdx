@@ -9,7 +9,7 @@ import gateway from "../assets/gateway.svg";
 
 # Overview
 
-<img src={exchange} alt="An exchange through roxy: TLS decryption, then an addon stack (here a service addon and a WASM addon), then the rules, then the upstream connector with its address floor; the response returns the same way; every stage writes to the flow log" />
+<img src={exchange} alt="An exchange through roxy: TLS decryption, then an addon stack (here a service addon and a WASM addon), then the rules, then the upstream connector with its address floor, with capture recording what crosses between the rules and the connector; the response returns the same way; every stage writes to the flow log" />
 
 roxy is a strict, programmable HTTP firewall. Requests and responses stream through addons that can rewrite, hold, answer or block them, then through rules that decide what is forwarded. Anything roxy cannot parse, verify or classify is denied ([how roxy works](/design/how-it-works)).
 

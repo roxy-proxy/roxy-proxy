@@ -56,6 +56,25 @@
   <text x="238" y="72" fill="#0f766e" font-size="14" font-weight="600" text-anchor="end">request</text>
   <text x="362" y="72" fill="#5f6b68" font-size="14" font-weight="600">response</text>
 
+  <!-- capture: taps what crosses between the rules and the network -->
+  <path d="M 100 356 H 520" fill="none" stroke="#0f766e" stroke-width="1.5" stroke-dasharray="2 4"/>
+  <g fill="#0f766e" font-size="14" font-weight="600">
+    <text x="536" y="342">capture: what</text>
+    <text x="536" y="360">crosses here</text>
+  </g>
+
+  <!-- flow log: every step feeds the exchange's one record -->
+  <g stroke="#cfd4d2" stroke-dasharray="3 3">
+    <line x1="60" y1="104" x2="100" y2="104"/>
+    <line x1="60" y1="176" x2="100" y2="176"/>
+    <line x1="60" y1="248" x2="100" y2="248"/>
+    <line x1="60" y1="320" x2="100" y2="320"/>
+    <line x1="60" y1="392" x2="100" y2="392"/>
+    <line x1="60" y1="464" x2="100" y2="464"/>
+  </g>
+  <rect x="12" y="80" width="48" height="408" rx="24" fill="#f8f9f8" stroke="#e6e8e7"/>
+  <text transform="translate(42 284) rotate(-90)" fill="#3d4846" font-size="16" text-anchor="middle">flow log: one record per exchange</text>
+
   <!-- what is configurable, and what is not -->
   <path d="M 516 156 h 8 V 268 h -8" fill="none" stroke="#7e8986" stroke-width="1.5"/>
   <g fill="#5f6b68" font-size="14">
