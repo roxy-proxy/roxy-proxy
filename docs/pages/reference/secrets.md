@@ -69,7 +69,8 @@ http:
 - **Content codings:** with `bodies` on, an injecting request goes out
   without `accept-encoding`, so the upstream answers uncompressed. A
   response that is encoded anyway is decoded
-  ([content codings](/reference/http#content-codings)) and sent without
+  ([content codings](/reference/http#content-codings)) and passed on,
+  to the addon layers and the client, as plain bytes without
   `content-encoding` or a declared length. One in a coding roxy does not
   decode, or a `206` (or `content-range`) of an encoded body, is refused
   `503` (`terminal_rule: _fail_closed`, `reason:
@@ -79,8 +80,7 @@ http:
   part.
 - **Downstream of the upstream:** the masking happens in the core, after
   the response rules. The in-flight rules on the response body, the
-  capture log, the addon layers (given the decoded body whatever
-  `http.decode_for_addons` says) and the client all see the masked
+  capture log, the addon layers and the client all see the masked
   response. The response rules, and `response.body.text`, see it as the
   upstream sent it.
 - **`quarantine: true`** quarantines the process when a masked part held
