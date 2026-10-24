@@ -6,7 +6,7 @@ come first. Each release's GitHub page lists every merged pull request.
 
 ## Unreleased
 
-The request trailers a service layer passes on are validated as a client's before they reach an origin.
+The request trailers a service layer passes on are validated as a client's before they reach an origin, and captures are written as JSON lines for line-oriented shippers.
 
 <details>
 <summary>Details</summary>
@@ -14,6 +14,7 @@ The request trailers a service layer passes on are validated as a client's befor
 ### Breaking
 
 - A raw backtick in an HTTP/1 request path is rejected with `invalid_path` instead of being percent-encoded; HTTP/2 already refused it. In a query it is still percent-encoded to `%60` ([#582](https://github.com/roxy-proxy/roxy-proxy/pull/582)).
+- Capture is written to `capture.jsonl` with one JSON object per line, in place of `capture.rxc` and its length-framed records: the head nested under `head`, body bytes base64 under `data`, and at most 48 KiB of body per line. A line-oriented shipper such as Vector or Fluent Bit can take the file as it is ([#527](https://github.com/roxy-proxy/roxy-proxy/issues/527)).
 
 ### Fixed
 

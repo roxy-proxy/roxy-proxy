@@ -800,7 +800,7 @@ pub struct CaptureLog {
     /// Unwritten capture bytes at which traffic is held back.
     #[serde(deserialize_with = "units::size")]
     pub high_water: ByteSize,
-    /// Rotate `capture.rxc` once it reaches this size; absent = never.
+    /// Rotate the capture file once it reaches this size; absent = never.
     #[serde(deserialize_with = "units::opt_size")]
     pub max_file_bytes: Option<ByteSize>,
     /// Keep at most this many rotated files; absent = keep all.

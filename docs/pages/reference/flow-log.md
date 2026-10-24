@@ -152,7 +152,7 @@ json|pretty` and `--log-level` (or `RUST_LOG`).
 ## Capture
 
 roxy tees the heads and bodies of exchanges, exactly as forwarded, to
-`<capture_dir>/capture.rxc`: those an admission rule selects with `capture:
+`<capture_dir>/capture.jsonl`: those an admission rule selects with `capture:
 request | response | both`, or every forwarded exchange with
 `log.capture.all: true`. Capture is decided at admission and covers
 the exchange from its first byte; the taps sit after the in-flight rules
@@ -183,20 +183,28 @@ settings given without it.
 
 ### Capture format
 
-A sequence of records, each one JSON header line, then `len` payload bytes,
-then `\n`:
+One JSON object per line, so a line-oriented shipper such as Vector or
+Fluent Bit can take the file as it is. Rotated files are
+`capture.jsonl.<UTC>-<seq>` (plus `.gz` with `compress`).
 
 ```text
-{"flow":"01J9…","dir":"request","kind":"head","seq":0,"len":187}
-{"method":"POST","url":"https://api.example.com/v1/x","headers":[["content-type","application/json"]]}
-{"flow":"01J9…","dir":"request","kind":"data","seq":1,"len":5}
-hello
-{"flow":"01J9…","dir":"request","kind":"end","seq":2,"len":0,"bytes":5}
+{"flow":"01J9…","dir":"request","kind":"head","seq":0,"head":{"headers":[["content-type","application/json"]],"method":"POST","url":"https://api.example.com/v1/x"}}
+{"flow":"01J9…","dir":"request","kind":"data","seq":1,"data":"aGVsbG8="}
+{"flow":"01J9…","dir":"request","kind":"end","seq":2,"bytes":5}
 ```
 
 | field | meaning |
 |---|---|
 | `flow` | joins records to the flow log |
 | `dir` | `request` (client to upstream) or `response` |
-| `kind` | `head` (the canonical head as JSON, as forwarded), `data` (forwarded bytes), `truncated` (`limits.max_capture_body_bytes` reached for this direction; nothing more is captured; carries `cap`), or `end` (carries the total forwarded `bytes`, and `aborted: true` if the direction did not complete) |
+| `kind` | `head` (the canonical head as forwarded, as an object under `head`), `data` (forwarded bytes, base64 under `data`), `truncated` (`limits.max_capture_body_bytes` reached for this direction; nothing more is captured; carries `cap`), or `end` (carries the total forwarded `bytes`, and `aborted: true` if the direction did not complete) |
 | `seq` | counts records per flow and direction |
+
+`data` is standard base64 with padding, which makes captured bodies about
+a third larger than the bytes forwarded. `limits.max_capture_body_bytes`
+counts body bytes, before encoding. A `data` record holds at most
+48 KiB of body, so a larger forwarded chunk spans several records with
+consecutive `seq`, and a body is its `data` records joined in `seq` order.
+A data line is therefore under 64 KiB plus about 100 bytes of fields. A
+head line is bounded by `limits.max_header_bytes`, plus JSON escaping. Set
+a shipper's line limit above both.
