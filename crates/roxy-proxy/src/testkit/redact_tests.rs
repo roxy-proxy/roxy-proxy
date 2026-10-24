@@ -94,6 +94,12 @@ async fn headers_and_bodies_switch_separately() {
         };
         assert_eq!(a.headers["x-reflect"], scrubbed(headers).as_str());
         assert_eq!(body(&a), scrubbed(bodies));
+        // Only a scrubbed body loses its declared length.
+        assert_eq!(
+            a.headers.contains_key("content-length"),
+            !bodies,
+            "{headers} {bodies}: {a:?}"
+        );
     }
 }
 

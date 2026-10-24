@@ -183,6 +183,12 @@ struct RedactedBody {
 impl RedactedBody {
     fn wrap(inner: Body, secrets: Arc<Secrets>, switches: ResponseRedaction, alarm: Alarm) -> Body {
         let keep = secrets.redactor().longest_secret().saturating_sub(1);
+        // Scrubbing only the trailers leaves the data, and its length, alone.
+        let length = if switches.bodies {
+            None
+        } else {
+            inner.known_length()
+        };
         Body::wrap_native(
             Self {
                 inner,
@@ -198,7 +204,7 @@ impl RedactedBody {
                 done: false,
             },
             u64::MAX,
-            None,
+            length,
         )
     }
 
