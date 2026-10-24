@@ -1,107 +1,102 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="880" height="362" viewBox="0 0 880 362" font-family="Inter, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13">
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="282" viewBox="0 52 800 282" font-family="Inter, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="17">
   <defs>
-    <marker id="req" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+    <marker id="req" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#0f766e"/>
     </marker>
-    <marker id="res" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+    <marker id="res" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
       <path d="M 0 0 L 10 5 L 0 10 z" fill="#5f6b68"/>
     </marker>
   </defs>
 
   <!-- client -->
-  <rect x="14" y="133" width="82" height="40" rx="20" fill="#f3f5f4" stroke="#cfd4d2"/>
-  <text x="55" y="158" fill="#16201e" font-weight="600" text-anchor="middle">client</text>
+  <rect x="4" y="150" width="82" height="44" rx="22" fill="#f3f5f4" stroke="#cfd4d2"/>
+  <text x="45" y="178" fill="#16201e" font-weight="600" text-anchor="middle">client</text>
 
   <!-- roxy -->
-  <rect x="118" y="60" width="650" height="290" rx="10" fill="#ffffff" stroke="#0f766e" stroke-width="1.5"/>
-  <text x="132" y="81" fill="#0f766e" font-weight="600">roxy</text>
+  <rect x="100" y="56" width="694" height="274" rx="10" fill="#ffffff" stroke="#0f766e" stroke-width="1.5"/>
+  <text x="114" y="80" fill="#0f766e" font-weight="600">roxy</text>
 
   <!-- legend -->
   <g stroke="#0f766e" stroke-width="2">
-    <line x1="520" y1="77" x2="548" y2="77"/>
-    <line x1="614" y1="77" x2="642" y2="77" stroke-dasharray="6 4"/>
+    <line x1="560" y1="76" x2="588" y2="76"/>
+    <line x1="660" y1="76" x2="688" y2="76" stroke-dasharray="6 4"/>
   </g>
-  <g fill="#7e8986" font-size="11">
-    <text x="554" y="81">head</text>
-    <text x="648" y="81">body bytes</text>
+  <g fill="#5f6b68" font-size="14">
+    <text x="594" y="81">head</text>
+    <text x="694" y="81">body bytes</text>
   </g>
 
   <!-- two enforce layers in the path, then the rules -->
   <g stroke="#cfd4d2" fill="#f3f5f4">
-    <rect x="140" y="100" width="190" height="124" rx="6"/>
-    <rect x="440" y="100" width="190" height="124" rx="6"/>
+    <rect x="114" y="104" width="204" height="140" rx="6"/>
+    <rect x="446" y="104" width="210" height="140" rx="6"/>
   </g>
-  <rect x="664" y="133" width="82" height="40" rx="20" fill="#f3f5f4" stroke="#cfd4d2"/>
+  <rect x="674" y="150" width="106" height="44" rx="22" fill="#f3f5f4" stroke="#cfd4d2"/>
   <g fill="#16201e" font-weight="600" text-anchor="middle">
-    <text x="235" y="120">layer A</text>
-    <text x="535" y="120">layer B</text>
-    <text x="705" y="158">rules</text>
+    <text x="216" y="130">layer A</text>
+    <text x="551" y="130">layer B</text>
+    <text x="727" y="178">rules</text>
   </g>
-  <g fill="#7e8986" font-size="11" text-anchor="middle">
-    <text x="235" y="134">enforce</text>
-    <text x="535" y="134">enforce</text>
+  <g fill="#5f6b68" font-size="13" text-anchor="middle">
+    <text x="216" y="148">enforce</text>
+    <text x="551" y="148">enforce</text>
   </g>
 
   <!-- the byte pipeline: head and body, client to A to B to the rules -->
   <g fill="none" stroke="#0f766e" stroke-width="2">
     <g marker-end="url(#req)">
-      <path d="M 96 146 H 138"/>
-      <path d="M 330 146 H 438"/>
-      <path d="M 630 146 H 662"/>
+      <path d="M 86 158 H 112"/>
+      <path d="M 318 158 H 444"/>
+      <path d="M 656 158 H 672"/>
     </g>
-    <path d="M 140 146 H 330"/>
-    <path d="M 440 146 H 630"/>
+    <path d="M 114 158 H 318"/>
+    <path d="M 446 158 H 656"/>
     <g stroke-dasharray="6 4" marker-end="url(#req)">
-      <path d="M 96 166 H 138"/>
-      <path d="M 330 166 H 438"/>
-      <path d="M 630 166 H 662"/>
+      <path d="M 86 186 H 112"/>
+      <path d="M 318 186 H 444"/>
+      <path d="M 656 186 H 672"/>
     </g>
     <g stroke-dasharray="6 4">
-      <path d="M 140 166 H 232"/>
-      <path d="M 258 166 H 330"/>
-      <path d="M 440 166 H 630"/>
+      <path d="M 114 186 H 192"/>
+      <path d="M 214 186 H 318"/>
+      <path d="M 446 186 H 656"/>
     </g>
   </g>
-  <g fill="#7e8986" font-size="10" text-anchor="middle">
-    <text x="385" y="128">a chunk reaches B</text>
-    <text x="385" y="140">only after A sends it</text>
+  <g fill="#5f6b68" font-size="13" text-anchor="middle">
+    <text x="382" y="134">a chunk reaches B</text>
+    <text x="382" y="150">once A sends it</text>
   </g>
 
   <!-- A: state_put mid-body, the chunk held until the result, then sent on -->
   <g stroke="#0f766e" stroke-width="2">
-    <line x1="239" y1="160" x2="239" y2="172"/>
-    <line x1="245" y1="160" x2="245" y2="172"/>
+    <line x1="200" y1="180" x2="200" y2="192"/>
+    <line x1="206" y1="180" x2="206" y2="192"/>
   </g>
-  <line x1="236" y1="176" x2="236" y2="258" stroke="#0f766e" stroke-width="1.5" marker-end="url(#req)"/>
-  <line x1="248" y1="258" x2="248" y2="176" stroke="#5f6b68" stroke-width="1.5" marker-end="url(#res)"/>
-  <text x="229" y="188" fill="#7e8986" font-size="10" text-anchor="end">state_put</text>
-  <text x="253" y="221" fill="#5f6b68" font-size="10">result</text>
-  <g fill="#7e8986" font-size="10">
-    <text x="256" y="201">awaits result,</text>
-    <text x="256" y="213">then sends on</text>
+  <line x1="196" y1="196" x2="196" y2="274" stroke="#0f766e" stroke-width="1.5" marker-end="url(#req)"/>
+  <line x1="210" y1="274" x2="210" y2="196" stroke="#5f6b68" stroke-width="1.5" marker-end="url(#res)"/>
+  <text x="190" y="216" fill="#0f766e" font-size="14" text-anchor="end">state_put</text>
+  <text x="216" y="264" fill="#5f6b68" font-size="14">result</text>
+  <g fill="#5f6b68" font-size="14">
+    <text x="218" y="216">awaits result,</text>
+    <text x="218" y="234">then sends on</text>
   </g>
 
   <!-- B: state_get on the chunk that followed A's call -->
-  <circle cx="530" cy="166" r="4" fill="#0f766e"/>
-  <line x1="527" y1="176" x2="527" y2="258" stroke="#0f766e" stroke-width="1.5" marker-end="url(#req)"/>
-  <line x1="539" y1="258" x2="539" y2="176" stroke="#5f6b68" stroke-width="1.5" marker-end="url(#res)"/>
-  <text x="520" y="188" fill="#7e8986" font-size="10" text-anchor="end">state_get</text>
-  <text x="544" y="221" fill="#5f6b68" font-size="10">result</text>
-  <g fill="#7e8986" font-size="10">
-    <text x="547" y="201">on that chunk:</text>
-    <text x="547" y="213">sees A's write</text>
+  <circle cx="535" cy="186" r="4.5" fill="#0f766e"/>
+  <line x1="528" y1="196" x2="528" y2="274" stroke="#0f766e" stroke-width="1.5" marker-end="url(#req)"/>
+  <line x1="542" y1="274" x2="542" y2="196" stroke="#5f6b68" stroke-width="1.5" marker-end="url(#res)"/>
+  <text x="522" y="216" fill="#0f766e" font-size="14" text-anchor="end">state_get</text>
+  <text x="548" y="264" fill="#5f6b68" font-size="14">result</text>
+  <g fill="#5f6b68" font-size="14">
+    <text x="550" y="216">on that chunk:</text>
+    <text x="550" y="234">sees A's write</text>
   </g>
 
   <!-- the two calls land side by side on the host -->
-  <line x1="260" y1="242" x2="515" y2="242" stroke="#7e8986" stroke-width="1" stroke-dasharray="2 3"/>
-  <text x="387" y="238" fill="#7e8986" font-size="10" text-anchor="middle">ordered only by A's await</text>
+  <line x1="270" y1="266" x2="518" y2="266" stroke="#7e8986" stroke-width="1" stroke-dasharray="2 3"/>
+  <text x="382" y="260" fill="#5f6b68" font-size="13" text-anchor="middle">ordered only by A's wait</text>
 
   <!-- host services -->
-  <rect x="140" y="262" width="608" height="30" rx="15" fill="#f8f9f8" stroke="#e6e8e7"/>
-  <text x="444" y="281" fill="#3d4846" font-size="12" text-anchor="middle">host services (add_tag · state_put · state_get · record · quarantine · …): beside the pipeline</text>
-  <g fill="#7e8986" font-size="10" text-anchor="middle">
-    <text x="444" y="310">a layer's calls run on their own worker: A's put lands before B's get only because A awaited its result</text>
-    <text x="444" y="324">a write for this exchange's admission lands before the request is forwarded;</text>
-    <text x="444" y="338">any other is seen by the next rule that reads it: a tag in flight on this exchange, state there or at a later exchange's admission</text>
-  </g>
+  <rect x="114" y="276" width="666" height="40" rx="20" fill="#f8f9f8" stroke="#e6e8e7"/>
+  <text x="447" y="302" fill="#3d4846" font-size="16" text-anchor="middle">host services: add_tag · state_put · state_get · record · …</text>
 </svg>
