@@ -52,8 +52,23 @@ class FakeRoxy:
         self.conn = _Conn(self.ws, handler)  # type: ignore[arg-type]
         self.task = asyncio.create_task(self.conn.run())
 
-    def open(self, stream: int, url: str = "https://example.test/", method: str = "POST", headers: Any = ()) -> None:
-        self.ws.control(stream, "open", flow=f"flow-{stream}", layer="sentinel", mode="enforce")
+    def open(
+        self,
+        stream: int,
+        url: str = "https://example.test/",
+        method: str = "POST",
+        headers: Any = (),
+        mode: str = "enforce",
+        subscribe: dict[str, str] | None = None,
+    ) -> None:
+        self.ws.control(
+            stream,
+            "open",
+            flow=f"flow-{stream}",
+            layer="sentinel",
+            mode=mode,
+            subscribe=subscribe or {"request": "full", "response": "full"},
+        )
         self.ws.control(stream, "request", method=method, url=url, headers=[list(h) for h in headers])
 
     async def until_closed(self, stream: int) -> None:

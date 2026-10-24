@@ -13,6 +13,7 @@ The request trailers a service layer passes on are validated as a client's befor
 
 ### Breaking
 
+- The service layer protocol is `roxy.layer.v7`, incompatible with `roxy.layer.v6`. A direction subscribed `head` is a head alone each way, with no end message after it, and an observe stream is one way: the service sends no heads, bytes or ends on it, and sends `close` when it is done. A WASM layer subscribed `head` passes on that direction's head alone: bytes or trailers in the body it gives fail the exchange closed. A service subscribed `head` no longer gets a `content-length` on that direction's head, as a WASM layer never did ([#592](https://github.com/roxy-proxy/roxy-proxy/issues/592)).
 - A raw backtick in an HTTP/1 request path is rejected with `invalid_path` instead of being percent-encoded; HTTP/2 already refused it. In a query it is still percent-encoded to `%60` ([#582](https://github.com/roxy-proxy/roxy-proxy/pull/582)).
 - Capture is written to `capture.jsonl` with one JSON object per line, in place of `capture.rxc` and its length-framed records: the head nested under `head`, body bytes base64 under `data`, and at most 48 KiB of body per line. A line-oriented shipper such as Vector or Fluent Bit can take the file as it is ([#527](https://github.com/roxy-proxy/roxy-proxy/issues/527)).
 

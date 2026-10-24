@@ -1211,7 +1211,7 @@ mod service {
     /// An observing service reads the whole response and only then
     /// records what it saw, as a WASM observer can: the stream is still
     /// open after roxy's `response_end`, so the call runs and is answered,
-    /// and the stream ends on the service's own `response_end`.
+    /// and the stream ends on the service's `close`.
     #[tokio::test]
     async fn an_observing_service_records_after_reading_the_response() {
         let kit = kit(
@@ -1253,7 +1253,7 @@ mod service {
     async fn an_observing_service_that_never_ends_its_stream_times_out() {
         let kit = kit(
             RULES,
-            // `hold` passes the response head back and never its end.
+            // `hold` never closes an observe stream.
             vec![addon("s", "hold", AddonMode::Observe, |s| {
                 s.first_byte_timeout = Duration::from_millis(300);
             })],
@@ -1773,36 +1773,10 @@ mod service {
         assert_eq!(ev["reason"], "layer_error", "{ev:#}");
     }
 
-    /// What a service sends on an observe stream is discarded and credited
-    /// back as it goes, so a service that keeps to its credit can send
-    /// several windows' worth while the stream is open.
+    /// An observe stream is one way: body bytes from the service fail the
+    /// stream, and the exchange goes on.
     #[tokio::test]
-    async fn an_observe_stream_credits_back_what_it_discards() {
-        let kit = kit(RULES, vec![addon("o", "talk", AddonMode::Observe, |_| {})]).await;
-        let mut c = kit.h1().await;
-        let (mut tx, body) = streaming_body();
-        let req = c.request("POST", "/x", &[]).body(body).unwrap();
-        let answer = c.start(req);
-        kit.upstream.service().until_talked(1).await;
-        tx.send_data(Bytes::from_static(b"body")).await.unwrap();
-        tx.finish().await.unwrap();
-        let a: Answer = answer.await.unwrap().unwrap();
-        assert_eq!(a.status, 200, "{a:?}");
-        kit.request_event().await;
-        assert!(
-            kit.sink
-                .events()
-                .iter()
-                .all(|e| e["event"] != "layer_error"),
-            "{:#?}",
-            kit.sink.events()
-        );
-    }
-
-    /// Body bytes on an observe stream are bounded by the window like any
-    /// body: a frame past it fails the stream, and the exchange goes on.
-    #[tokio::test]
-    async fn an_observe_stream_flooded_past_its_window_fails_on_its_own() {
+    async fn bytes_on_an_observe_stream_fail_it_on_its_own() {
         let kit = kit(RULES, vec![addon("o", "flood", AddonMode::Observe, |_| {})]).await;
         let mut c = kit.h1().await;
         let (mut tx, body) = streaming_body();
@@ -1824,7 +1798,7 @@ mod service {
         assert!(
             resets
                 .iter()
-                .any(|(_, m)| m.contains("past the body's credit")),
+                .any(|(_, m)| m.contains("body bytes on an observe stream")),
             "{resets:?}"
         );
     }
@@ -1979,10 +1953,10 @@ mod service {
         );
     }
 
-    /// A service subscribed to the heads only is sent each head with its
-    /// end and no bytes, is told so on `open`, and the bodies go through
-    /// it untouched; an observer so subscribed holds no copy, so one that
-    /// never reads is not lagging.
+    /// A service subscribed to the heads only is sent each head alone, is
+    /// told so on `open`, and the bodies go through it untouched; an
+    /// observer so subscribed holds no copy, so one that never reads is not
+    /// lagging.
     #[tokio::test]
     async fn a_head_only_service_gets_heads_and_the_bodies_bypass_it() {
         use crate::addons::Part;
@@ -2042,6 +2016,43 @@ mod service {
             .filter(|e| e["event"] == "observer_lagged")
             .collect();
         assert!(lagged.is_empty(), "{lagged:#?}");
+        no_layer_error(&kit);
+    }
+
+    /// A head-only service sees the head as a head-only WASM layer does:
+    /// the body's framing is roxy's, so no `content-length`, and the body
+    /// still arrives whole.
+    #[tokio::test]
+    async fn a_head_only_service_sees_no_content_length() {
+        use crate::addons::Part;
+        let kit = Kit::builder().rules(RULES).start().await;
+        reload(
+            &kit,
+            RULES,
+            &[],
+            vec![subscribed(
+                addon("s", "pass", AddonMode::Enforce, |_| {}),
+                Part::Head,
+                Part::Head,
+            )],
+        );
+        let a = kit.h1().await.call("POST", "/x", &[], b"hello").await;
+        assert_eq!(a.status, 200, "{a:?}");
+        assert_eq!(a.json()["body_len"], 5);
+        let opens = kit.upstream.service().until_opened(1).await;
+        let id = u32::try_from(opens[0]["stream"].as_u64().unwrap()).unwrap();
+        let controls = kit.upstream.service().controls(id);
+        for kind in ["request", "response"] {
+            let head = controls
+                .iter()
+                .find(|m| m["type"] == kind)
+                .unwrap_or_else(|| panic!("{kind} in {controls:#?}"));
+            let fields = head["headers"].as_array().unwrap();
+            assert!(
+                fields.iter().all(|f| f[0] != "content-length"),
+                "{kind}: {head:#}"
+            );
+        }
         no_layer_error(&kit);
     }
 
@@ -3238,9 +3249,12 @@ async fn upstream_body_failure_through_a_head_only_wasm_layer_keeps_its_cause() 
     }
 }
 
-/// A layer that passes on bytes of a body it is not subscribed to fails
-/// the exchange closed as its own: before the response head a refusal,
-/// after it a cut body.
+/// A layer that writes bytes for a body it is not subscribed to fails as
+/// its own (`unsubscribed:<direction>`), and none of those bytes reach
+/// either socket: the body that goes on is the one the layer did not see.
+/// Whether the client then gets a refusal or the bypassed body depends on
+/// how far the exchange has got when the bytes are found, so only the
+/// bytes and the fault are asserted.
 #[tokio::test]
 async fn bytes_on_an_unsubscribed_body_fail_the_layer() {
     use crate::addons::Part;
@@ -3250,14 +3264,14 @@ async fn bytes_on_an_unsubscribed_body_fail_the_layer() {
         .await
         .call("POST", "/x", &[("x-test-t", "inject-request")], b"original")
         .await;
-    assert_eq!(a.status, 503, "{a:?}");
-    let ev = kit.request_event().await;
-    assert_eq!(ev["terminal_rule"], "layer:t", "{ev:#}");
     let errs = kit.events("layer_error", 1).await;
     assert_eq!(errs[0]["kind"], "unsubscribed:request", "{errs:#?}");
     assert!(
-        kit.upstream.seen().iter().all(|s| s.complete != Some(true)),
-        "nothing complete reached the upstream"
+        kit.upstream
+            .seen()
+            .iter()
+            .all(|s| !s.body.windows(8).any(|w| w == b"injected")),
+        "nothing the layer wrote reached the upstream: {a:?}"
     );
 
     let kit = one(AddonDef::test_layer("t").subscribe(Part::Full, Part::Head)).await;
@@ -3271,16 +3285,14 @@ async fn bytes_on_an_unsubscribed_body_fail_the_layer() {
             b"original",
         )
         .await;
-    assert_eq!(a.status, 200, "{a:?}");
-    // The response declares no length while the layer's own body is open:
-    // with the upstream's `content-length` the client would have a complete
-    // body once the bypassed bytes were through, and the failure that
-    // follows nothing to cut.
-    assert!(!a.headers.contains_key("content-length"), "{a:?}");
-    assert_eq!(a.headers["transfer-encoding"], "chunked", "{a:?}");
-    assert!(a.body.is_err(), "the body is cut: {a:?}");
     let errs = kit.events("layer_error", 1).await;
     assert_eq!(errs[0]["kind"], "unsubscribed:response", "{errs:#?}");
+    if let Ok(body) = &a.body {
+        assert!(
+            !body.windows(8).any(|w| w == b"injected"),
+            "nothing the layer wrote reached the client: {a:?}"
+        );
+    }
 }
 
 /// A head-only layer that answers itself answers whole: there is no body

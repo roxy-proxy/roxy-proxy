@@ -82,8 +82,7 @@ async fn lone_stream_on(
     let lanes = (mode == AddonMode::Enforce).then(|| Lanes {
         req: layer.req_out,
         res: layer.res_out,
-        held_request: Arc::default(),
-        held_response: Arc::default(),
+        bypassed: Arc::default(),
     });
     let stream = Arc::new(Stream {
         id: 1,
@@ -96,8 +95,7 @@ async fn lone_stream_on(
         ended: CancellationToken::new(),
         answered: CancellationToken::new(),
         stop_in: [CancellationToken::new(), CancellationToken::new()],
-        held_request: Arc::default(),
-        held_response: Arc::default(),
+        bypassed: Arc::default(),
         wire: Arc::default(),
         calls: Mutex::new(None),
         draining: Mutex::new(None),
@@ -132,107 +130,96 @@ fn request_head() -> In {
     }
 }
 
-/// A head-only lane has two independent obligations: the service's end
-/// and the bypassed body's end. Neither may hide the other's missing end,
-/// and bypassed bytes must flow before the service ends (as on upgrades).
+/// A head-only lane is the service's head over the bypassed body: the
+/// bypassed bytes, trailers and end are the lane's, with no end owed by
+/// the service.
 #[tokio::test]
-async fn head_only_lanes_join_producer_and_bypass_completion() {
+async fn a_head_only_lane_is_the_head_over_the_bypassed_body() {
     use crate::addons::Part;
     use http_body_util::BodyExt as _;
 
     for dir in [Dir::Request, Dir::Response] {
-        for producer_first in [false, true] {
-            for with_trailers in [false, true] {
-                let addon = testing::subscribed(
-                    testing::addon("s", "pass", AddonMode::Enforce, |_| {}),
-                    Part::Head,
-                    Part::Head,
-                );
-                let (stream, mut around, _kit) = lone_stream_of(addon, None).await;
-                let (mut bypass, body) = Body::channel(u64::MAX, None);
-                let end = match dir {
-                    Dir::Request => {
-                        *lock(&stream.held_request) = Some(body);
-                        stream.control(request_head());
-                        In::RequestEnd { error: None }
-                    }
-                    Dir::Response => {
-                        *lock(&stream.held_response) = Some((http::StatusCode::OK, body));
-                        stream.control(In::Response {
-                            status: 200,
-                            headers: Vec::new(),
-                        });
-                        In::ResponseEnd { error: None }
-                    }
-                };
-                let (_, mut body) = match dir {
-                    Dir::Request => around.forward.head().await.unwrap(),
-                    Dir::Response => around.answer.head().await.unwrap(),
-                };
-                let mut end = Some(end);
-                if producer_first {
-                    stream.control(end.take().unwrap());
+        for with_trailers in [false, true] {
+            let addon = testing::subscribed(
+                testing::addon("s", "pass", AddonMode::Enforce, |_| {}),
+                Part::Head,
+                Part::Head,
+            );
+            let (stream, mut around, _kit) = lone_stream_of(addon, None).await;
+            let (mut bypass, body) = Body::channel(u64::MAX, None);
+            match dir {
+                Dir::Request => {
+                    stream.bypassed.hold_request(&mut http::Request::new(body));
+                    stream.control(request_head());
                 }
-                assert!(futures_util::poll!(body.frame()).is_pending());
-                bypass
-                    .send_data(bytes::Bytes::from_static(b"through"))
-                    .await
-                    .unwrap();
-                assert_eq!(
-                    body.frame().await.unwrap().unwrap().into_data().unwrap(),
-                    "through"
-                );
-                if with_trailers {
-                    let mut trailers = http::HeaderMap::new();
-                    trailers.insert("x-finished", http::HeaderValue::from_static("yes"));
-                    bypass.send_trailers(trailers).await.unwrap();
+                Dir::Response => {
+                    stream
+                        .bypassed
+                        .hold_response(&mut http::Response::new(body));
+                    stream.control(In::Response {
+                        status: 200,
+                        headers: Vec::new(),
+                    });
                 }
-                bypass.finish().await.unwrap();
-                if let Some(end) = end {
-                    assert!(
-                        futures_util::poll!(body.frame()).is_pending(),
-                        "neither EOF nor trailers may commit before the service's end"
-                    );
-                    stream.control(end);
-                }
-                if with_trailers {
-                    let trailers = body
-                        .frame()
-                        .await
-                        .unwrap()
-                        .unwrap()
-                        .into_trailers()
-                        .unwrap();
-                    assert_eq!(trailers["x-finished"], "yes");
-                }
-                assert!(body.frame().await.is_none());
-                assert!(stream.st.attribution.fault().is_none());
             }
+            let (_, mut body) = match dir {
+                Dir::Request => around.forward.head().await.unwrap(),
+                Dir::Response => around.answer.head().await.unwrap(),
+            };
+            bypass
+                .send_data(bytes::Bytes::from_static(b"through"))
+                .await
+                .unwrap();
+            assert_eq!(
+                body.frame().await.unwrap().unwrap().into_data().unwrap(),
+                "through"
+            );
+            if with_trailers {
+                let mut trailers = http::HeaderMap::new();
+                trailers.insert("x-finished", http::HeaderValue::from_static("yes"));
+                bypass.send_trailers(trailers).await.unwrap();
+            }
+            bypass.finish().await.unwrap();
+            if with_trailers {
+                let trailers = body
+                    .frame()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .into_trailers()
+                    .unwrap();
+                assert_eq!(trailers["x-finished"], "yes");
+            }
+            assert!(body.frame().await.is_none());
+            assert!(stream.st.attribution.fault().is_none());
         }
     }
 }
 
+/// An end after the head of a head-only lane is the service sending what
+/// it is not subscribed to, with or without an error on it.
 #[tokio::test]
-async fn head_only_end_errors_still_fail_the_service() {
+async fn an_end_after_a_head_only_head_fails_the_service() {
     use crate::addons::Part;
-    use http_body_util::BodyExt as _;
 
-    let addon = testing::subscribed(
-        testing::addon("s", "pass", AddonMode::Enforce, |_| {}),
-        Part::Head,
-        Part::Head,
-    );
-    let (stream, mut around, _kit) = lone_stream_of(addon, None).await;
-    stream.control(In::Response {
-        status: 200,
-        headers: Vec::new(),
-    });
-    let (_, mut body) = around.answer.head().await.unwrap();
-    stream.control(In::ResponseEnd {
-        error: Some("cut".to_owned()),
-    });
-    assert!(body.frame().await.unwrap().is_err());
-    assert!(matches!(service_fault(&stream), ServiceError::Protocol(_)));
+    for error in [None, Some("cut".to_owned())] {
+        let addon = testing::subscribed(
+            testing::addon("s", "pass", AddonMode::Enforce, |_| {}),
+            Part::Head,
+            Part::Head,
+        );
+        let (stream, mut around, _kit) = lone_stream_of(addon, None).await;
+        stream.control(In::Response {
+            status: 200,
+            headers: Vec::new(),
+        });
+        let _answer = around.answer.head().await.unwrap();
+        stream.control(In::ResponseEnd { error });
+        assert!(matches!(
+            service_fault(&stream),
+            ServiceError::Unsubscribed("response")
+        ));
+    }
 }
 
 /// A transport whose queue is drained explicitly by the test.
@@ -460,7 +447,7 @@ async fn a_stopped_forward_upload_keeps_the_upstream_response_input() {
 async fn a_headless_forward_end_releases_the_held_upload_before_the_answer_ends() {
     let (stream, _around, _kit) = lone_stream().await;
     let (upload, body) = Body::channel(u64::MAX, None);
-    *lock(&stream.held_request) = Some(body);
+    stream.bypassed.hold_request(&mut http::Request::new(body));
     stream.control(In::Response {
         status: 200,
         headers: Vec::new(),
@@ -473,7 +460,7 @@ async fn a_headless_forward_end_releases_the_held_upload_before_the_answer_ends(
 }
 
 #[tokio::test]
-async fn accepted_calls_receive_results_after_all_four_lanes_end() {
+async fn accepted_calls_receive_results_after_the_observers_close() {
     let (ctl, _ctl_rx) = mpsc::unbounded_channel();
     let (refusals, mut refused) = mpsc::channel(4);
     let (data, mut sent) = mpsc::channel(4);
@@ -501,8 +488,7 @@ async fn accepted_calls_receive_results_after_all_four_lanes_end() {
     }));
     stream.input_done(Dir::Request);
     stream.input_done(Dir::Response);
-    stream.control(In::RequestEnd { error: None });
-    stream.control(In::ResponseEnd { error: None });
+    stream.control(In::Close);
     assert!(
         !lock(&stream.state).ended(),
         "the accepted call retains the stream"

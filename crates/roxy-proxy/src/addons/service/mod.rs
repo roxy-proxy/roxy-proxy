@@ -38,7 +38,7 @@
 mod host;
 mod mux;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use http::{HeaderMap, HeaderName, HeaderValue};
@@ -50,8 +50,9 @@ use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 
 use super::chain::{Head, Headless, LaneRx, LaneTx, StageHandle};
+use super::subscribe::Bypassed;
 use super::tee::CopyCut;
-use super::{AddonMode, Part, StackError, StackFlow, Subscription, lock};
+use super::{AddonMode, Part, StackError, StackFlow, Subscription};
 use crate::in_flight::Dir;
 
 pub(crate) use mux::Pools;
@@ -242,6 +243,9 @@ enum In {
         #[serde(default)]
         message: Option<String>,
     },
+    /// An observe stream's service is done with the stream: it makes no
+    /// more calls.
+    Close,
     /// A host-service call, run beside the stream rather than in it.
     #[serde(skip)]
     Call(Call),
@@ -472,24 +476,21 @@ pub(super) async fn run(
     } = ends;
     let torn_down = stage.torn_down();
     let subscribe = st.snap.addons[index].subscribe;
-    let (parts, body) = req.into_parts();
-    let head = request_head(&parts, &body);
     // A service may forward as soon as it sees open. Park the bypassed
     // body before publishing the stream, so that forward cannot miss it.
-    let (kept, body) = if subscribe.request == Part::Head {
-        (Some(body), Body::empty())
-    } else {
-        (None, body)
-    };
-    let held_request = Arc::new(Mutex::new(kept));
-    let held_response = Arc::new(Mutex::new(None));
+    let bypassed = Arc::new(Bypassed::default());
+    let mut req = req;
+    if subscribe.request == Part::Head {
+        bypassed.hold_request(&mut req);
+    }
+    let (parts, body) = req.into_parts();
+    let head = request_head(&parts, &body);
     // The lanes stay here until the stream takes them: a stream that
     // never opens leaves them to the fault recorded for it.
     let mut lanes = Some(mux::Lanes {
         req: forward,
         res: answer,
-        held_request: held_request.clone(),
-        held_response: held_response.clone(),
+        bypassed: bypassed.clone(),
     });
     let opened = tokio::select! {
         biased;
@@ -519,8 +520,7 @@ pub(super) async fn run(
     let response = st.chain().spawn(pump_response(
         stream.clone(),
         res_in,
-        subscribe.response == Part::Head,
-        held_response,
+        (subscribe.response == Part::Head).then_some(bypassed),
         clock.clone(),
     ));
     let answered = stream.answered();
@@ -548,22 +548,22 @@ pub(super) async fn run(
 async fn pump_response(
     stream: Arc<mux::Stream>,
     mut res_in: LaneRx,
-    head_only: bool,
-    kept: Arc<Mutex<Option<(http::StatusCode, Body)>>>,
+    head_only: Option<Arc<Bypassed>>,
     clock: Clock,
 ) {
     let pump = async {
         match res_in.head().await {
             Ok((Head::Response(parts), body)) => {
                 clock.restart();
-                let head = response_head(&parts, &body);
-                if head_only {
-                    *lock(&kept) = Some((parts.status, body));
-                    if stream.send(&head).await {
-                        stream.send(&Out::ResponseEnd { error: None }).await;
-                    }
+                if let Some(bypassed) = head_only {
+                    let mut res = http::Response::from_parts(parts, body);
+                    bypassed.hold_response(&mut res);
+                    let (parts, body) = res.into_parts();
+                    stream.send(&response_head(&parts, &body)).await;
                 } else {
-                    stream.pump(Dir::Response, head, body).await;
+                    stream
+                        .pump(Dir::Response, response_head(&parts, &body), body)
+                        .await;
                 }
             }
             Ok((Head::Request(_), _)) => unreachable!("a response lane carries responses"),
@@ -672,9 +672,9 @@ impl Clock {
 }
 
 /// Runs observe-mode service layer `index`: the copies go to the service
-/// on a stream of their own. What it sends back goes nowhere, but it ends
-/// the stream as it does an enforce one: both inputs consumed or stopped,
-/// both outputs ended, and accepted host-service calls answered.
+/// on a stream of their own, one way. The stream ends once both copies are
+/// sent or stopped, the service has sent `close`, and its accepted
+/// host-service calls are answered.
 pub(super) async fn observe(
     st: &Arc<StackFlow>,
     index: usize,

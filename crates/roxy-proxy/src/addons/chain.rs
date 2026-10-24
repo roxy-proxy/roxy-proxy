@@ -385,6 +385,11 @@ impl Chain {
         self.stages[layer + 1].torn_why.get().is_some()
     }
 
+    /// Cancelled when layer `layer` is torn down.
+    pub(crate) fn layer_torn_down(&self, layer: usize) -> CancellationToken {
+        self.stages[layer + 1].torn.clone()
+    }
+
     /// Why layer `layer` was torn down, once it has been.
     pub(crate) fn layer_torn_down_why(&self, layer: usize) -> &'static str {
         self.stages[layer + 1]
@@ -397,21 +402,6 @@ impl Chain {
     /// Layer `layer` faults with `err`.
     pub(crate) fn fail_layer(self: &Arc<Self>, layer: usize, err: StackError) {
         self.fail(layer + 1, err);
-    }
-
-    /// Attribute a failure in the layer's own portion of a spliced body.
-    pub(super) fn body_aborted(&self, layer: usize, dir: crate::in_flight::Dir, why: String) {
-        let lane = match dir {
-            crate::in_flight::Dir::Request => LaneId {
-                hop: layer + 1,
-                dir: Dir::Req,
-            },
-            crate::in_flight::Dir::Response => LaneId {
-                hop: layer,
-                dir: Dir::Res,
-            },
-        };
-        self.cut(lane, why, true);
     }
 
     /// Every lane has been consumed or abandoned, and all drivers have exited.
