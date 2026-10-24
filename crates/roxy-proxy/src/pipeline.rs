@@ -1119,7 +1119,7 @@ async fn inspect_request_body(
 
 /// A body that carries no bytes needs no inspection buffer; the rules see
 /// it as empty text.
-fn known_empty(body: &Body) -> bool {
+pub(crate) fn known_empty(body: &Body) -> bool {
     body.known_length() == Some(0) || http_body::Body::is_end_stream(body)
 }
 

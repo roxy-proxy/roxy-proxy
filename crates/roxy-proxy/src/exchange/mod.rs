@@ -809,7 +809,7 @@ async fn forward<F: ClientTransport>(
                 let body = std::mem::take(&mut res.body);
                 res.body = in_flight_body(body, in_flight, Dir::Response, down_tap.take());
             }
-            crate::recode::decode_response(cx, &mut res, &codings);
+            crate::recode::decode_response(cx, &mut res, codings);
             if let Some(needles) = needles {
                 crate::redact::response(cx, &mut res, needles);
             }
@@ -821,10 +821,10 @@ async fn forward<F: ClientTransport>(
                 };
                 return Outcome::Upgrade { res, upstream, key };
             }
-            // Encoded again at the client's end of the chain.
-            match &mut cx.response_leg {
-                Leg::Direct => crate::recode::encode_response(&cx.shared, &mut res, &codings),
-                Leg::Stack { codings: c, .. } => *c = codings,
+            // Encoded again at the client's end of the chain: here, or at
+            // the stack's client edge.
+            if matches!(cx.response_leg, Leg::Direct) {
+                crate::recode::encode_response(&cx.shared, &mut res);
             }
             Outcome::Respond(res)
         }

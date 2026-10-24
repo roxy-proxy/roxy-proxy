@@ -54,7 +54,6 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
     cx.response_leg = crate::recode::Leg::Stack {
         decode: st.snap.http.decode_for_addons
             && st.body_subscribed(crate::in_flight::Dir::Response),
-        codings: Vec::new(),
     };
     cx.facts.request = Some(crate::pipeline::request_facts(&creq));
     st.set_facts(&cx.facts);
@@ -72,11 +71,11 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
     };
     let cx = lease.cx();
     st.set_facts(&cx.facts);
-    if let crate::recode::Leg::Stack { codings, .. } = &mut cx.response_leg {
-        *lock(&st.response_codings) = std::mem::take(codings);
-    }
     match outcome {
         Outcome::Respond(mut res) => {
+            // The layers' response carries no meta: what the core decoded
+            // it from waits for the client edge on the flow.
+            *lock(&st.response_codings) = std::mem::take(&mut res.meta.decoded_from);
             res.body = attributed(&st, Side::Upstream, std::mem::take(&mut res.body));
             answer(res_out, res);
             if let Some(delivery) = lease.cx().request_delivery.take() {
