@@ -297,6 +297,14 @@ fn node_state_quarantine_is_a_report_or_null() {
         validate("NodeState", &state).is_err(),
         "a layer cause names the layer"
     );
+    state["quarantine"]["cause"] =
+        json!({"kind": "secret_in_response", "flow": "01J", "part": "body"});
+    assert!(validate("NodeState", &state).is_ok());
+    state["quarantine"]["cause"]["part"] = json!("cookie");
+    assert!(
+        validate("NodeState", &state).is_err(),
+        "a secret's part is one roxy scrubs"
+    );
     state["quarantine"] = json!({"id": "q-1"});
     assert!(validate("NodeState", &state).is_err());
     state["quarantine"] = json!("q-1");

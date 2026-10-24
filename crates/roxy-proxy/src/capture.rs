@@ -39,8 +39,9 @@
 //!
 //! Every string in a captured *head* passes through the exchange's
 //! redactor, so an injected secret value (which the agent never saw) is
-//! scrubbed wherever it appears. Bodies are captured as they are,
-//! unredacted.
+//! scrubbed wherever it appears. Bodies are captured as they are
+//! forwarded: unredacted, except a response body that
+//! `http.redact_response_secrets` scrubbed on its way out.
 
 use std::fmt::Write as _;
 use std::io;

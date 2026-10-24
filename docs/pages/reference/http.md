@@ -410,6 +410,10 @@ the edge of the stack and forwarded decoded
 every request as roxy reads it, so origins answer uncompressed. Addons,
 rules and the flow log see the request without it.
 
+`http.redact_response_secrets.bodies` also removes `accept-encoding`, from
+the requests a secret was injected into, after the admission rules
+([secrets](/reference/secrets#redacting-responses)).
+
 ## Deny responses
 
 ```

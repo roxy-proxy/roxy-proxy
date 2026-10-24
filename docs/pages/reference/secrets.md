@@ -25,10 +25,71 @@ rules:
   fatal. `roxy check` and `roxy rule test` do not resolve secrets.
 - At evaluation, a missing secret fails closed (`_fail_closed`, reason
   `secret_missing`); one that is not a valid header value, `secret_invalid`.
-- Injected values are redacted from the flow log and capture heads.
+- Injected values are redacted from the flow log and capture heads, and,
+  with `http.redact_response_secrets`, from the responses of the exchanges
+  that injected them ([below](#redacting-responses)).
 - A `redirect` in a matching rule sends the request, injected values
   included, to the redirect target: a secret's `set_header` rule should
   not match a request another rule redirects elsewhere.
+
+## Redacting responses
+
+An upstream that echoes an injected value back (an error page quoting
+`authorization`, a debug endpoint, a redirect carrying a key in its
+`location`) hands the client the real value. `http.redact_response_secrets`
+scrubs it from the response on its way out:
+
+```yaml
+http:
+  redact_response_secrets:
+    headers: true      # the response head's field values, and its trailers
+    bodies: true       # the response body, as it streams
+    quarantine: false  # quarantine the process when a scrubbed part held a secret
+```
+
+- **Which exchanges:** only those whose admission effects injected a
+  secret: a `set_header` value from `${secret:..}`, or `sign`. Every value
+  of the exchange's secret generation (and the one it replaced) is
+  scrubbed, each occurrence replaced by `[REDACTED]`, overlapping ones
+  merged into one marker, as in the flow log. All three switches are off
+  by default.
+- **Headers:** every field value of the response head, a `101`'s
+  included, and every trailer value. Names are left as they are.
+- **Bodies:** scrubbed as they stream. roxy holds back the last `longest
+  secret - 1` bytes of each chunk until the next shows whether a secret
+  straddles them; nothing else is buffered. The scrubbed body has no
+  declared length.
+- **Content codings:** with `bodies` on, an injecting request goes out
+  without `accept-encoding`, so the upstream answers uncompressed. A
+  response that is encoded anyway is decoded
+  ([content codings](/reference/http#content-codings)) and sent without
+  `content-encoding`. One in a coding roxy does not decode, or a `206` (or
+  `content-range`) of an encoded body, is refused `503` (`terminal_rule:
+  _fail_closed`, `reason: unsupported_content_encoding`) instead of passed
+  unscrubbed. A `206` of a plain body is scrubbed range by range: a secret
+  split across two ranges is in neither whole, so each range passes its
+  part.
+- **Downstream of the upstream:** the scrubbing happens in the core, after
+  the response rules. The in-flight rules on the response body, the
+  capture log, the addon layers and the client all see the scrubbed
+  response. The response rules, and `response.body.text`, see it as the
+  upstream sent it.
+- **`quarantine: true`** quarantines the process when a scrubbed part held
+  a secret: the `quarantined` event's cause is `{"kind":
+  "secret_in_response", "flow", "part"}`, `part` being `headers`, `body` or
+  `trailers` ([quarantine](/guides/operations#quarantine)). A secret in the
+  head refuses that exchange `_quarantined`; one in the body is scrubbed
+  from what is sent, and the connection is cut a second later with every
+  other. It needs `headers` or `bodies` on (a config error otherwise) and
+  `roxy run --state-dir`, as any quarantine does. Without it, a found
+  secret is logged as a warning on the operational log, with the flow and
+  the part.
+- **Limits:** the match is on the exact bytes. An upstream that transforms
+  the value (base64, JSON or URL escaping, a change of case) gets past it,
+  so this stops careless echoes, not a hostile upstream; which hosts a
+  secret is injected into is the real control. A short or common value
+  replaces unrelated body bytes wherever it occurs. WebSocket messages
+  after a `101` are not scrubbed.
 
 ## Signing AWS requests
 

@@ -125,7 +125,7 @@ until something outside the process lifts it. It is for a workload that has
 shown itself hostile: once tripped, the proxy stays shut across reloads and
 restarts, and the client cannot talk its way out.
 
-Three things trip it:
+Four things trip it:
 
 - a rule's `quarantine` action ([actions](/reference/rule-language#actions)):
   the exchange is refused, by whichever deny wins, and the proxy is
@@ -145,6 +145,10 @@ Three things trip it:
   `leaf_mint_failed`, `invalid_state`). Off unless
   set; set it on a sandbox's listener, not a gateway's, where one client
   would shut the proxy for every other.
+- an injected secret found in a response, under
+  `http.redact_response_secrets.quarantine`
+  ([secrets](/reference/secrets#redacting-responses)): the value is
+  scrubbed from what is sent, and the proxy is quarantined.
 
 While quarantined, every request is refused with `403`, `terminal_rule:
 _quarantined` and reason `quarantined`, before the addons and the rules, and
@@ -159,7 +163,8 @@ tripped and why ([flow log](/reference/flow-log#events)). `/healthz` stays
 keeps working.
 
 A config that can quarantine (a `quarantine` action, `quarantine_on` on a
-listener, or an addon holding the `quarantine` capability) needs `roxy run
+listener, an addon holding the `quarantine` capability, or
+`http.redact_response_secrets.quarantine`) needs `roxy run
 --state-dir DIR`: roxy refuses to start, or to
 reload into such a config, without it. The trip writes `DIR/quarantine`
 (the incident as JSON, mode `0600`), and a start that finds the file starts
