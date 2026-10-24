@@ -1,7 +1,9 @@
 //! Which exchanges a layer runs on: its `when`, judged on the request as
 //! it reaches the layer, and its `sample`.
 
-use roxy_http::layer::{from_layer_request, to_layer_request};
+use std::sync::Arc;
+
+use roxy_http::layer::to_layer_request;
 use roxy_wasm::{LayerError, LayerRequest};
 use ulid::Ulid;
 
@@ -16,7 +18,7 @@ use crate::view::ProxyView;
 /// A `when` sees the request re-validated as the core would, so a layer
 /// downstream that passed on something invalid fails here, attributed to it.
 pub(super) fn selects(
-    st: &StackFlow,
+    st: &Arc<StackFlow>,
     index: usize,
     addon: &AddonSpec,
     req: LayerRequest,
@@ -24,9 +26,8 @@ pub(super) fn selects(
     let Some(when) = &addon.when else {
         return Ok((sampled(st.flow, index, addon.sample), req));
     };
-    let snap = &st.snap;
     let (req, stream) = split_upgrade_stream(st, req);
-    let creq = match from_layer_request(req, st.client_meta.clone(), &snap.limits, &snap.flags) {
+    let creq = match st.validate_request(index, req) {
         Ok(r) => r,
         Err(e) => {
             // A request no layer passed on is the client's, already
@@ -42,7 +43,7 @@ pub(super) fn selects(
         &facts,
         &*st.shared.metrics,
         &*st.shared.state,
-        &snap.address_lists,
+        &st.snap.address_lists,
     );
     let matched = when.matches(&view, &st.tags());
     let metric_err = view.take_metric_error();

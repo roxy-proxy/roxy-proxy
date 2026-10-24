@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use roxy_http::layer::{from_layer_request, to_layer_response};
+use roxy_http::layer::to_layer_response;
 use roxy_http::{Body, CanonicalRequest};
 use roxy_wasm::{LayerError, LayerRequest};
 
@@ -93,11 +93,8 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
             drop(lease);
             refuse(&st, res_out, &refusal, res);
         }
-        // The request body failed on its way in. If a fault was recorded
-        // for it (the client's broken upload, a layer's failure, the
-        // budget), the corresponding HTTP error response is the answer. If none was,
-        // the lane was cut by a layer of its own accord: nothing answers
-        // that, and the response lane is cut as the request lane was.
+        // A recorded body fault determines the refusal. A layer's
+        // deliberate lane cut has no fault and cuts the response too.
         Outcome::Close(_) => {
             drop(lease);
             if let LaneState::Cut(why) = st.chain().state(forward)
@@ -178,14 +175,16 @@ async fn relay_upgrade(
 /// The request the last layer passed on, re-validated as a client's would
 /// be, and the stream after its head on an upgrade. `None` when it does
 /// not validate: the fault of the nearest enforcing layer that ran.
-pub(super) fn admit(st: &StackFlow, req: LayerRequest) -> Option<(CanonicalRequest, Option<Body>)> {
-    let snap = &st.snap;
-    let last = snap.addons.len() - 1;
-    let layer = st.passed_on_by(last + 1).unwrap_or(last);
+pub(super) fn admit(
+    st: &Arc<StackFlow>,
+    req: LayerRequest,
+) -> Option<(CanonicalRequest, Option<Body>)> {
     let (req, stream) = ws::split_upgrade_stream(st, req);
-    match from_layer_request(req, st.client_meta.clone(), &snap.limits, &snap.flags) {
+    match st.validate_request(st.snap.addons.len(), req) {
         Ok(creq) => Some((creq, stream)),
         Err(e) => {
+            let last = st.snap.addons.len() - 1;
+            let layer = st.passed_on_by(last + 1).unwrap_or(last);
             st.layer_failed(layer, LayerError::InvalidRequest(e.to_string()));
             None
         }
@@ -255,6 +254,7 @@ impl ClientTransport for LaneTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use roxy_http::layer::from_layer_request;
 
     #[tokio::test]
     async fn cancelling_upload_after_response_head_records_abandonment() {

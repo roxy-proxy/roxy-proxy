@@ -103,14 +103,44 @@ fn try_write_all(out: &OutputStream, mut bytes: &[u8]) -> bool {
     true
 }
 
+/// What `pass` does to each byte it relays.
+#[derive(Clone, Copy)]
+enum Transform {
+    Keep,
+    /// `x-upper`: idempotent, so it shows which direction the layer is in.
+    Upper,
+    /// `x-shift`: each byte goes up by one. A second pass shows, where
+    /// upper-casing hides it, and the length is kept, so a reader that
+    /// waits for as many bytes as it sent still reads them back.
+    Shift,
+}
+
+impl Transform {
+    fn of(req: &RequestHead) -> Self {
+        if header(req, "x-shift").is_some() {
+            Self::Shift
+        } else if header(req, "x-upper").is_some() {
+            Self::Upper
+        } else {
+            Self::Keep
+        }
+    }
+
+    fn apply(self, bytes: &mut [u8]) {
+        match self {
+            Self::Keep => {}
+            Self::Upper => bytes.make_ascii_uppercase(),
+            Self::Shift => bytes.iter_mut().for_each(|b| *b = b.wrapping_add(1)),
+        }
+    }
+}
+
 /// Copies `input` to `out`, chunk by chunk, transforming each chunk.
-fn pump(input: &InputStream, out: &OutputStream, upper: bool) {
+fn pump(input: &InputStream, out: &OutputStream, transform: Transform) {
     loop {
         match input.blocking_read(64 * 1024) {
             Ok(mut chunk) => {
-                if upper {
-                    chunk.make_ascii_uppercase();
-                }
+                transform.apply(&mut chunk);
                 write_all(out, &chunk);
             }
             Err(StreamError::Closed) => break,
@@ -178,9 +208,9 @@ fn await_response(pending: PendingResponse) -> Answer {
 }
 
 /// Streams `resp` back to the client.
-fn answer_with((below, body): Answer, upper: bool) {
+fn answer_with((below, body): Answer, transform: Transform) {
     let out = respond_streaming(&below);
-    pump(&body, &out, upper);
+    pump(&body, &out, transform);
     drop(body);
     types::finish(out);
 }
@@ -230,22 +260,23 @@ fn sse_approval(req: &RequestHead, body: InputStream, response: bool) {
     };
     if response {
         write_all(&out, &held);
-        pump(&input, &out, false);
+        pump(&input, &out, Transform::Keep);
         drop(input);
     } else {
         let (pending, forward) = next_streaming(&forward_head(req));
         write_all(&forward, &held);
-        pump(&input, &forward, false);
+        pump(&input, &forward, Transform::Keep);
         drop(input);
         types::finish(forward);
         let (_, input) = await_response(pending);
-        pump(&input, &out, false);
+        pump(&input, &out, Transform::Keep);
     }
     types::finish(out);
 }
 
 /// The default: pass the exchange through, streaming both bodies, chunk by
-/// chunk (upper-cased when `x-upper` is set). With `x-hold`, neither body
+/// chunk (upper-cased when `x-upper` is set, each byte shifted up by one
+/// when `x-shift` is). With `x-hold`, neither body
 /// it passes on is ended until the client's request body goes away; with
 /// `x-keep-request`, the request body is relayed until it ends even after
 /// the response from below has, as the SDK's pump does.
@@ -253,9 +284,9 @@ fn sse_approval(req: &RequestHead, body: InputStream, response: bool) {
 /// status, if set. `x-delay-request-ms` holds the request head before
 /// `next`; buffered, `x-delay-response-ms` holds the response head after it.
 fn pass(req: &RequestHead, body: InputStream, buffer_first: bool) {
-    let upper = header(req, "x-upper").is_some();
+    let transform = Transform::of(req);
     let tweaks = Tweaks {
-        upper,
+        transform,
         hold: header(req, "x-hold").is_some(),
         keep_request: header(req, "x-keep-request").is_some(),
         status: header(req, "x-status").map(|v| v.parse().expect("x-status")),
@@ -273,13 +304,13 @@ fn pass(req: &RequestHead, body: InputStream, buffer_first: bool) {
     drop(body);
     let resp = await_response(pending);
     hold(req, "delay-response");
-    answer_with(resp, upper);
+    answer_with(resp, transform);
 }
 
 /// What `pass` does to the exchange besides passing it on, from the
 /// request's `x-*` headers.
 struct Tweaks {
-    upper: bool,
+    transform: Transform,
     hold: bool,
     keep_request: bool,
     status: Option<u16>,
@@ -291,15 +322,13 @@ fn copy_ready(
     input: &InputStream,
     output: &OutputStream,
     bytes: &mut Vec<u8>,
-    upper: bool,
+    transform: Transform,
 ) -> bool {
     if bytes.is_empty() {
         match input.read(64 * 1024) {
             Ok(chunk) => {
                 *bytes = chunk;
-                if upper {
-                    bytes.make_ascii_uppercase();
-                }
+                transform.apply(bytes);
             }
             Err(StreamError::Closed) => return false,
             Err(StreamError::LastOperationFailed(e)) => {
@@ -317,7 +346,15 @@ fn copy_ready(
         };
         let n = capacity.min(bytes.len());
         if n > 0 {
-            output.write(&bytes[..n]).expect("write");
+            // The reader can go between `check_write` and the write, as
+            // when the stack below refuses and drops the body.
+            match output.write(&bytes[..n]) {
+                Ok(()) => {}
+                Err(StreamError::Closed) => return false,
+                Err(StreamError::LastOperationFailed(e)) => {
+                    panic!("body write failed: {}", e.to_debug_string())
+                }
+            }
             bytes.drain(..n);
         }
     }
@@ -334,7 +371,7 @@ fn duplex(
     req_out: OutputStream,
     pending: PendingResponse,
     Tweaks {
-        upper,
+        transform,
         hold,
         keep_request,
         status,
@@ -353,7 +390,7 @@ fn duplex(
                 &req_in,
                 req_out.as_ref().expect("open"),
                 &mut req_bytes,
-                upper,
+                transform,
             )
         {
             req_open = false;
@@ -372,7 +409,7 @@ fn duplex(
         }
         let mut resp_open = resp.is_none();
         if let Some((input, output)) = &resp {
-            resp_open = copy_ready(input, output, &mut resp_bytes, upper);
+            resp_open = copy_ready(input, output, &mut resp_bytes, transform);
         }
         if !resp_open && resp.is_some() {
             // The response from below ended: end ours.
@@ -484,7 +521,7 @@ fn relay(req: &RequestHead, body: InputStream) {
         drop(body);
         await_response(pending)
     };
-    answer_with(resp, false);
+    answer_with(resp, Transform::Keep);
 }
 
 fn call_capability(req: &RequestHead) -> String {
@@ -735,7 +772,7 @@ impl Handler for Layer {
                 // reaches the client first, and the forward still completes.
                 respond(200, b"answered before forwarding");
                 let (pending, output) = next_streaming(&forward_head(&req));
-                pump(&body, &output, false);
+                pump(&body, &output, Transform::Keep);
                 drop(body);
                 types::finish(output);
                 let (_below, from_below) = await_response(pending);
@@ -749,7 +786,7 @@ impl Handler for Layer {
                 // still run to the end of its forward.
                 respond(204, b"");
                 let (pending, output) = next_streaming(&forward_head(&req));
-                pump(&body, &output, false);
+                pump(&body, &output, Transform::Keep);
                 drop(body);
                 types::finish(output);
                 let (_below, from_below) = await_response(pending);
@@ -795,7 +832,7 @@ impl Handler for Layer {
                 // response, then give up on it and answer locally: a
                 // forward abandoned while it is upstream whole.
                 let (pending, output) = next_streaming(&forward_head(&req));
-                pump(&body, &output, false);
+                pump(&body, &output, Transform::Keep);
                 drop(body);
                 types::finish(output);
                 hold(&req, "delay");
@@ -807,7 +844,7 @@ impl Handler for Layer {
                 // below arrives: a failure with a response open at the
                 // layer.
                 let (pending, output) = next_streaming(&forward_head(&req));
-                pump(&body, &output, false);
+                pump(&body, &output, Transform::Keep);
                 drop(body);
                 types::finish(output);
                 let _below = await_response(pending);
@@ -822,7 +859,7 @@ impl Handler for Layer {
                 write_all(&output, &read_at_least(&body, n));
                 drop(output);
                 match PendingResponse::wait(pending) {
-                    Ok(resp) => answer_with(resp, false),
+                    Ok(resp) => answer_with(resp, Transform::Keep),
                     Err(_) => respond(200, b"answered after next failed"),
                 }
             }
@@ -937,7 +974,7 @@ impl Handler for Layer {
                 let _ = out.blocking_write_and_flush(b"replaced");
                 types::finish(out);
                 drop(body);
-                answer_with(await_response(pending), false);
+                answer_with(await_response(pending), Transform::Keep);
             }
             "elsewhere-then-metric" => {
                 // Send the request (bodiless) to `x-to`'s host, wait for the
@@ -994,13 +1031,13 @@ impl Handler for Layer {
                 let _ = out.blocking_write_and_flush(b"injected");
                 types::finish(out);
                 drop(body);
-                answer_with(await_response(pending), false);
+                answer_with(await_response(pending), Transform::Keep);
             }
             "inject-response" => {
                 // Pass the request on, then answer with the response's head
                 // over a body of this layer's own.
                 let (pending, out) = next_streaming(&forward_head(&req));
-                pump(&body, &out, false);
+                pump(&body, &out, Transform::Keep);
                 types::finish(out);
                 drop(body);
                 let (below, below_body) = await_response(pending);

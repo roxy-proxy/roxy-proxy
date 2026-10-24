@@ -126,6 +126,44 @@ GET /a?x={} HTTP/1.1\r\n
 Host: example.com\r\n
 \r\n
 
+=== backtick_in_absolute_path
+expect: error invalid_path
+---
+GET http://example.com/a`b HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== backtick_in_origin_path
+role: origin
+expect: error invalid_path
+---
+GET /a`b HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== backtick_before_dotdot
+role: tunnel https example.com:443
+expect: error invalid_path
+---
+GET /`/../ HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== encoded_backtick_in_path
+expect: request GET http://example.com:80/a%60b
+---
+GET http://example.com/a%60b HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
+=== backtick_in_query_encoded
+role: tunnel https example.com:443
+expect: request GET https://example.com:443/a?x=%60
+---
+GET /a?x=` HTTP/1.1\r\n
+Host: example.com\r\n
+\r\n
+
 === pipe_caret_in_path_encoded
 role: tunnel https example.com:443
 expect: request GET https://example.com:443/a%7Cb%5Ec?ids=1%7C2

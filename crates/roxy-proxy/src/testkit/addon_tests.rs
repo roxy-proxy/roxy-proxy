@@ -9,7 +9,8 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use bytes::Bytes;
 
 use super::{AddonDef, Answer, Kit, MemState, no_layer_error, streaming_body, strs};
-use crate::addons::{EndpointPath, Part};
+use crate::addons::service::testing;
+use crate::addons::{AddonMode, EndpointPath, Part};
 
 const RULES: &str = r#"
 - id: no-rewritten
@@ -1022,6 +1023,7 @@ mod service {
     use std::time::Duration;
 
     use bytes::Bytes;
+    use chrono::{TimeDelta, Utc};
 
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -1307,6 +1309,74 @@ mod service {
             kit.upstream.seen().is_empty(),
             "nothing reached the upstream"
         );
+    }
+
+    /// The lease is re-checked when the core admits the request a layer
+    /// forwards: a request a service held across `valid_until` is denied
+    /// `_expired`, as the same request sent after the instant would be, and
+    /// nothing reaches the upstream. The current lease applies even when
+    /// a reload replaced the snapshot the service started under.
+    #[tokio::test]
+    async fn a_request_held_by_a_service_across_the_lease_is_denied() {
+        for reload_policy in [false, true] {
+            let kit = kit_with(
+                RULES,
+                vec![addon("s", "patient", AddonMode::Enforce, |_| {})],
+                |b| b.metric_defs(BY_HOST),
+            )
+            .await;
+            kit.server
+                .handle()
+                .extend_valid_until(Utc::now() + TimeDelta::hours(1));
+            let mut c = kit.h1().await;
+            let (mut tx, body) = streaming_body();
+            let req = c.request("POST", "/x", &[]).body(body).unwrap();
+            let answer = c.start(req);
+            tx.send_data(Bytes::from_static(b"body")).await.unwrap();
+            // `patient` holds the request until its end, so the lease runs out
+            // while the service has the head and the body.
+            let open = &kit.upstream.service().until_opened(1).await[0];
+            kit.upstream
+                .service()
+                .until_received(stream_id(open), 4)
+                .await;
+            let until = Utc::now() - TimeDelta::seconds(1);
+            if reload_policy {
+                kit.reload_lease(RULES, Some(until));
+            } else {
+                kit.server.handle().extend_valid_until(until);
+            }
+            tx.finish().await.unwrap();
+            let a: Answer = tokio::time::timeout(Duration::from_secs(5), answer)
+                .await
+                .expect("the held request is answered")
+                .unwrap()
+                .unwrap();
+            assert_eq!(a.status, 403, "reload_policy={reload_policy}: {a:?}");
+            assert_eq!(a.headers["x-roxy-rule"], "_expired");
+            assert_eq!(a.json()["rule"], "_expired");
+            assert!(
+                kit.upstream.seen().is_empty(),
+                "nothing reached the upstream"
+            );
+            let ev = kit.request_event().await;
+            assert_eq!(ev["decision"], "deny", "{ev:#}");
+            assert_eq!(ev["terminal_rule"], "_expired", "{ev:#}");
+            assert_eq!(ev["reason"], "policy_expired", "{ev:#}");
+            assert_eq!(ev["stage"], "head", "{ev:#}");
+            assert_eq!(ev["rules"], serde_json::json!([]), "{ev:#}");
+            assert_eq!(strs(&ev["addons"]), ["s"], "{ev:#}");
+            assert_eq!(kit.events("policy_expired", 1).await.len(), 1);
+            let samples = kit.samples.lock().unwrap();
+            let admissions: Vec<_> = samples.iter().filter(|s| s.admission).collect();
+            assert_eq!(admissions.len(), 1, "{samples:?}");
+            assert!(admissions[0].denied, "{samples:?}");
+            assert_eq!(
+                samples.iter().filter(|s| s.denied).count(),
+                1,
+                "{samples:?}"
+            );
+        }
     }
 
     /// A service that quarantines on the response head, after `next`:
@@ -3368,29 +3438,32 @@ async fn a_head_only_layer_stays_out_of_a_websockets_bytes() {
 /// A layer subscribed to one body of an upgrade is in that direction's
 /// byte path and out of the other's: the bytes it is not subscribed to
 /// flow past it while its handler lives on with the socket, relaying the
-/// body it is subscribed to (`x-keep-request`, as the SDK does). The
-/// upper-casing tells the directions apart at the upstream: it sees
-/// upper case only when the layer is on the request side.
+/// body it is subscribed to (`x-keep-request`, as the SDK does). The layer
+/// shifts each byte up by one (`x-shift`), which shows every pass: the
+/// client gets its bytes back shifted exactly once, so the bypassed
+/// direction did not go through the layer as well, and the upstream sees
+/// them shifted only when the layer is on the request side.
 #[tokio::test]
 async fn a_layer_subscribed_to_one_body_is_in_one_direction_of_a_websocket() {
     use crate::addons::Part;
+    let shifted = |m: &[u8]| m.iter().map(|b| b + 1).collect::<Vec<u8>>();
     for (request, response) in [(Part::Full, Part::Head), (Part::Head, Part::Full)] {
         let kit = stack(&[AddonDef::test_layer("t").subscribe(request, response)]).await;
         let (status, io) = kit
-            .websocket("/ws", &[("x-upper", "1"), ("x-keep-request", "1")])
+            .websocket("/ws", &[("x-shift", "1"), ("x-keep-request", "1")])
             .await;
         assert_eq!(status, 101, "{request:?}/{response:?}");
         let mut io = io.unwrap();
         for msg in [&b"hello"[..], b"again"] {
             assert_eq!(
                 echo(&mut io, msg).await,
-                msg.to_ascii_uppercase(),
+                shifted(msg),
                 "{request:?}/{response:?}"
             );
         }
         let at_upstream: Vec<u8> = kit.upstream.ws_received().concat();
         let expected = if request == Part::Full {
-            b"HELLOAGAIN".to_vec()
+            shifted(b"helloagain")
         } else {
             b"helloagain".to_vec()
         };
@@ -3479,4 +3552,239 @@ async fn a_failure_below_arrives_as_a_response_the_layer_above_may_reshape() {
     assert_eq!(ev["decision"], "deny", "{ev:#}");
     assert_eq!(ev["terminal_rule"], "layer:b");
     assert_eq!(ev["res"]["status"], 200);
+}
+
+/// A service layer's request trailers are held to the client edge's rules
+/// on their way to an h2 origin: refused without
+/// `http.allow_request_trailers`, and never a forbidden field. The section
+/// is the layer's invalid request, with the `trailers` reason a client's
+/// own would draw, and the origin never sees the request complete.
+#[tokio::test]
+async fn service_request_trailers_are_validated_like_a_clients() {
+    for (allow, path) in [(false, "/x"), (true, "/forbidden")] {
+        let kit = testing::kit_with(
+            super::ALLOW_UP,
+            vec![testing::addon(
+                "s",
+                "request-trailers",
+                AddonMode::Enforce,
+                |_| {},
+            )],
+            |b| b.flags(|f| f.allow_request_trailers = allow),
+        )
+        .await;
+        let a = kit
+            .tunnel("up.test", true)
+            .await
+            .call("POST", path, &[], b"abc")
+            .await;
+        assert_eq!(a.status, 503, "allow={allow} {path}: {a:?}");
+        let ev = kit.request_event().await;
+        assert_eq!(
+            ev["terminal_rule"], "layer:s",
+            "allow={allow} {path}: {ev:#}"
+        );
+        let errs = kit.events("layer_error", 1).await;
+        assert_eq!(
+            errs[0]["kind"], "invalid_request",
+            "allow={allow} {path}: {errs:#?}"
+        );
+        let message = errs[0]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("trailer"),
+            "allow={allow} {path}: {errs:#?}"
+        );
+        let seen = kit.upstream.seen();
+        assert!(
+            seen.iter()
+                .all(|s| s.complete != Some(true) && s.trailers.is_none()),
+            "allow={allow} {path}: {seen:#?}"
+        );
+    }
+}
+
+/// With `http.allow_request_trailers`, a service layer's allowed trailers
+/// reach the h2 origin as the client's would.
+#[tokio::test]
+async fn service_request_trailers_reach_an_h2_origin_when_allowed() {
+    let kit = testing::kit_with(
+        super::ALLOW_UP,
+        vec![testing::addon(
+            "s",
+            "request-trailers",
+            AddonMode::Enforce,
+            |_| {},
+        )],
+        |b| b.flags(|f| f.allow_request_trailers = true),
+    )
+    .await;
+    let a = kit
+        .tunnel("up.test", true)
+        .await
+        .call("POST", "/x", &[], b"abc")
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].body, b"abc");
+    let trailers = seen[0]
+        .trailers
+        .as_ref()
+        .unwrap_or_else(|| panic!("{:?}", seen[0]));
+    assert_eq!(trailers["x-checksum"], "abc");
+}
+
+#[tokio::test]
+async fn service_request_trailers_are_validated_before_body_inspection() {
+    let rules = r#"
+- id: no-secret
+  when: host == "up.test" and body.text contains "SECRET"
+  then: deny
+- id: up
+  when: host == "up.test"
+  then: allow
+"#;
+    for (allow, data) in [
+        (false, b"".as_slice()),
+        (false, b"abc"),
+        (true, b""),
+        (true, b"abc"),
+    ] {
+        let kit = testing::kit_with(
+            rules,
+            vec![testing::addon(
+                "s",
+                "request-trailers",
+                AddonMode::Enforce,
+                |_| {},
+            )],
+            |b| b.flags(|f| f.allow_request_trailers = allow),
+        )
+        .await;
+        let answer = kit
+            .tunnel("up.test", true)
+            .await
+            .call("POST", "/x", &[], data)
+            .await;
+        assert_eq!(
+            answer.status,
+            if allow { 200 } else { 503 },
+            "allow={allow}, data={data:?}: {answer:?}"
+        );
+        let event = kit.request_event().await;
+        if allow {
+            let seen = kit.upstream.wait_seen(1).await;
+            assert_eq!(seen[0].body, data);
+            assert_eq!(seen[0].trailers.as_ref().unwrap()["x-checksum"], "abc");
+            no_layer_error(&kit);
+        } else {
+            assert_eq!(event["terminal_rule"], "layer:s", "{event:#}");
+            let errors = kit.events("layer_error", 1).await;
+            assert_eq!(errors[0]["kind"], "invalid_request", "{errors:#?}");
+            assert!(errors[0]["message"].as_str().unwrap().contains("trailer"));
+            assert!(
+                kit.upstream.seen().is_empty(),
+                "inspection fails before connecting to the origin"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn service_request_trailers_keep_client_byte_limit_errors_at_the_edge() {
+    for last_value_bytes in [37, 38] {
+        let kit = testing::kit_with(
+            super::ALLOW_UP,
+            vec![testing::addon("s", "pass", AddonMode::Enforce, |_| {})],
+            |b| {
+                b.flags(|f| f.allow_request_trailers = true)
+                    .limits(|l| l.max_header_bytes = 128)
+            },
+        )
+        .await;
+        let value = "a".repeat(38);
+        let last = "a".repeat(last_value_bytes);
+        // Both raw sections fit. Their canonical fields occupy 128 and
+        // 129 bytes respectively once the spaces after colons are counted.
+        let request = format!(
+            "POST /x HTTP/1.1\r\nhost: up.test\r\ntransfer-encoding: chunked\r\n\r\n0\r\nx:{value}\r\nx:{value}\r\nx:{last}\r\n\r\n"
+        );
+        let mut io = super::http_tests::h1_in_tunnel(&kit).await;
+        io.write_all(request.as_bytes()).await.unwrap();
+        let (head, _) = super::read_response(&mut io).await;
+        if last_value_bytes == 37 {
+            assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+            let seen = kit.upstream.wait_seen(1).await;
+            let trailers = seen[0].trailers.as_ref().unwrap();
+            let values: Vec<_> = trailers.get_all("x").iter().collect();
+            assert_eq!(values, [value.as_str(), value.as_str(), last.as_str()]);
+        } else {
+            assert!(head.starts_with("HTTP/1.1 431"), "{head}");
+            let errors = kit.events("parse_error", 1).await;
+            assert_eq!(errors[0]["reason"], "head_too_large", "{errors:#?}");
+            assert!(kit.upstream.seen().iter().all(|s| s.complete != Some(true)));
+        }
+        let _ = kit.request_event().await;
+        no_layer_error(&kit);
+    }
+}
+
+#[tokio::test]
+async fn service_request_trailers_keep_their_producer_through_a_conditional_layer() {
+    for mode in [AddonMode::Enforce, AddonMode::Observe] {
+        let kit = testing::kit(
+            super::ALLOW_UP,
+            vec![
+                testing::addon("producer", "request-trailers", AddonMode::Enforce, |_| {}),
+                testing::only_when(
+                    testing::addon("conditional", "pass", mode, |_| {}),
+                    r#"path == "/x""#,
+                ),
+            ],
+        )
+        .await;
+        let a = kit
+            .tunnel("up.test", true)
+            .await
+            .call("POST", "/x", &[], b"abc")
+            .await;
+        assert_eq!(a.status, 503, "{mode:?}: {a:?}");
+        let ev = kit.request_event().await;
+        assert_eq!(ev["terminal_rule"], "layer:producer", "{mode:?}: {ev:#}");
+        let errors = kit.events("layer_error", 1).await;
+        assert_eq!(errors[0]["kind"], "invalid_request", "{errors:#?}");
+        assert!(errors[0]["message"].as_str().unwrap().contains("trailer"));
+        assert!(kit.upstream.seen().iter().all(|s| s.complete != Some(true)));
+    }
+}
+
+#[tokio::test]
+async fn service_request_trailers_are_attributed_after_an_early_origin_answer() {
+    let kit = testing::kit(
+        super::ALLOW_UP,
+        vec![testing::addon(
+            "s",
+            "request-trailers",
+            AddonMode::Enforce,
+            |_| {},
+        )],
+    )
+    .await;
+    let mut client = kit.tunnel("up.test", true).await;
+    let (mut tx, body) = streaming_body();
+    let pending = client.start(client.request("POST", "/early", &[]).body(body).unwrap());
+    tx.send_data(Bytes::from_static(b"abc")).await.unwrap();
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(10), pending)
+        .await
+        .expect("the origin answers while the upload is open")
+        .unwrap()
+        .unwrap();
+    assert_eq!(answer.status, 200, "{answer:?}");
+    tx.finish().await.unwrap();
+    let _ = kit.request_event().await;
+    let errors = kit.events("layer_error", 1).await;
+    assert_eq!(errors[0]["kind"], "invalid_request", "{errors:#?}");
+    assert!(errors[0]["message"].as_str().unwrap().contains("trailer"));
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].complete, Some(false), "{seen:#?}");
+    assert!(seen[0].trailers.is_none());
 }

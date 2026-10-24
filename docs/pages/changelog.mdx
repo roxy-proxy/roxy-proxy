@@ -4,6 +4,28 @@ User-facing changes in each release, newest first. Each release has a
 short summary; expand it for the itemised entries, where breaking changes
 come first. Each release's GitHub page lists every merged pull request.
 
+## Unreleased
+
+The request trailers a service layer passes on are validated as a client's before they reach an origin.
+
+<details>
+<summary>Details</summary>
+
+### Breaking
+
+- A raw backtick in an HTTP/1 request path is rejected with `invalid_path` instead of being percent-encoded; HTTP/2 already refused it. In a query it is still percent-encoded to `%60` ([#582](https://github.com/roxy-proxy/roxy-proxy/pull/582)).
+
+### Fixed
+
+- A service layer's request trailers are held to a client's rules on their way to an origin: refused without `http.allow_request_trailers`, held to `limits.max_header_bytes`, and never a framing, routing, authentication or `content-*` field. A section that breaks them is the layer's `invalid_request`: the exchange is refused `503` `layer_error`, or the error is logged if the origin has already answered, and the origin never sees the request complete. More than `limits.max_headers` fields is a service protocol violation ([#581](https://github.com/roxy-proxy/roxy-proxy/pull/581)).
+- An HTTP/2 client's request trailer section is held to `limits.max_header_bytes`, as an HTTP/1.1 client's chunked trailer section is; one over it is a stream reset, `parse_error` reason `head_too_large` ([#581](https://github.com/roxy-proxy/roxy-proxy/pull/581)).
+- HTTP/1.1 request trailers also meet the byte limit after normalisation, so a pass-through layer is not blamed for the client's oversized section (`431`, `parse_error` reason `head_too_large`).
+- A request held across the policy's `valid_until`, by an addon or while its body is buffered for inspection, is denied `_expired` when it reaches the rules, as a request sent after the instant is ([#568](https://github.com/roxy-proxy/roxy-proxy/issues/568)).
+- Without `forwarded_for`, `client.ip` is the canonical TCP peer address: an IPv4 client on a dual-stack `[::]` listener is `a.b.c.d`, not `::ffff:a.b.c.d`, in metric keys, the flow log and the addon principal. Rule comparisons already treated the two as one address. `client.peer.ip` in the flow log keeps the socket's form ([#579](https://github.com/roxy-proxy/roxy-proxy/pull/579)).
+- JSON the node cannot parse, whether the `node.token` record, an enrolment or renewal response, a lease or a flow upload's acknowledgement, is reported by the kind of fault and its line and column, never by quoting the input, which could put a token or a lease secret in the log ([#532](https://github.com/roxy-proxy/roxy-proxy/issues/532)).
+
+</details>
+
 ## [0.3.0 (2026-10-15)](https://github.com/roxy-proxy/roxy-proxy/releases/tag/v0.3.0)
 
 Addons can now answer early and hold a request or response for approval, with the request and response lanes of an exchange living independent lives. This is a breaking change for addons: the service protocol is `roxy.layer.v6` and the WASM interface is `roxy:addon@0.3.0`.

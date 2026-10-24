@@ -243,6 +243,11 @@ impl ChunkedDecoder {
             raw.push((name, value));
         }
         let checked = Headers::try_from_raw(raw, &self.limits, &self.flags)?;
+        // Canonical spacing can enlarge a section sent without OWS. It
+        // must still fit when a layer passes these fields on unchanged.
+        if checked.wire_len() > max_bytes {
+            return reject(Reason::HeadTooLarge, "trailer section too large");
+        }
         Ok(Some(checked.to_header_map()))
     }
 }
@@ -392,6 +397,38 @@ mod tests {
         let mut d = ChunkedDecoder::new(&few, &f);
         let mut buf = BytesMut::from(&b"0\r\nX-A: 1\r\n\r\n"[..]);
         assert!(matches!(d.decode(&mut buf).unwrap(), Decoded::Trailers(_)));
+    }
+
+    #[test]
+    fn trailer_limit_also_bounds_the_canonical_fields() {
+        let flags = HttpFlags {
+            allow_request_trailers: true,
+            ..HttpFlags::default()
+        };
+        // Three fields without OWS occupy 29 wire bytes including the
+        // final CRLF, but 30 in the canonical `name: value\r\n` form.
+        let input = b"0\r\nx-t:abc\r\nx-t:def\r\nx-t:ghi\r\n\r\n";
+        for max_header_bytes in [29, 30] {
+            let limits = Limits {
+                max_header_bytes,
+                ..Limits::default()
+            };
+            let mut decoder = ChunkedDecoder::new(&limits, &flags);
+            let result = decoder.decode(&mut BytesMut::from(input.as_slice()));
+            if max_header_bytes == 29 {
+                assert_eq!(result.unwrap_err().reason, Reason::HeadTooLarge);
+            } else {
+                let Decoded::Trailers(trailers) = result.unwrap() else {
+                    panic!("the trailer section should pass at the limit");
+                };
+                assert_eq!(trailers.len(), 3);
+                assert_eq!(
+                    crate::validate_request_trailers(&trailers, &limits, &flags).unwrap(),
+                    trailers,
+                    "accepted client trailers must survive a layer's re-validation"
+                );
+            }
+        }
     }
 
     #[test]

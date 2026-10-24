@@ -85,8 +85,9 @@ order). Entries to its left are the client's own and are never read.
   connection closed, counted by `quarantine_on.parse_errors`. It is never
   attributed to the peer: a bypassed or misconfigured load balancer must
   neither let a client choose its address nor fold every client into one.
-- An IPv4-mapped IPv6 entry (`::ffff:a.b.c.d`) is the IPv4 address it
-  embeds, as a host literal is.
+- An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`), as an entry or as the
+  peer of a dual-stack `[::]` listener, is the IPv4 address it embeds, as a
+  host literal is.
 - The header goes upstream as received; roxy neither appends the peer nor
   strips it.
 - `limits.max_connections_per_client` is applied when the connection is
@@ -161,7 +162,12 @@ trailer section may not carry framing, routing, authentication or
 `content-*` fields (`authorization`, `cookie`, `set-cookie`, `range`,
 `max-forwards`, `cache-control`, every hop-by-hop name): on a request that
 is a rejection, on a response the body is cut before the client sees it
-complete. A body a rule or addon buffers to read keeps its trailers.
+complete. A body a rule or addon buffers to read keeps its trailers, and
+the trailers a layer attaches to the request it passes on are held to the
+same rules as a client's. A request trailer section is held to
+`limits.max_headers` and `limits.max_header_bytes`, as a head is. The byte
+limit counts each decoded field as `name: value\r\n`; HTTP/1.1 also checks
+the raw section, including its final CRLF.
 
 Request trailers reach an origin only over `h2`: HTTP/1.1 needs the names
 in a `Trailer` header before the body. Trailers to an HTTP/1.1 origin fail
@@ -174,7 +180,8 @@ HTTP/1.1.
 ## Canonical request
 
 The client-facing HTTP/1.1 codec is roxy's own (on `httparse` for
-tokenising): ambiguities RFC 9112 lets a server resolve are rejected.
+tokenising): ambiguities RFC 9112 lets a server resolve are rejected
+([why roxy parses HTTP/1.1 itself](/reference/architecture#why-roxy-parses-http11-itself)).
 
 ```rust
 pub struct CanonicalRequest {
@@ -290,10 +297,13 @@ the others refuse for the same reason.
   `transfer-encoding`, `upgrade`, `proxy-connection`) reset the stream
   (RFC 9113 §8.2.2). `te` is accepted only as `trailers`.
 - `:path` goes through the same normaliser and `limits.max_url_bytes` cap
-  once the `h2` crate has accepted it: a raw space, backtick, `<` or `>` in
-  `:path` resets the stream before roxy sees it, with no `parse_error`
-  event. `:authority` must equal the CONNECT authority; a `host` header, if
-  present, must equal `:authority`.
+  once the `h2` crate has accepted it. The entire `:path` must be UTF-8;
+  invalid UTF-8 closes the connection. In the path or query, a raw space or
+  control byte, `<` or `>` resets the stream; so does a backtick in the path
+  or `"` in the query. A fragment is discarded after UTF-8 validation.
+  These failures happen before roxy sees the request, with no `parse_error`
+  event. `:authority` must equal the CONNECT authority; a `host` header,
+  if present, must equal `:authority`.
 - `limits.h2_max_concurrent_streams` and `limits.h2_max_header_list_bytes`
   cap streams per connection and header bytes per stream.
   CONTINUATION-flood and rapid-reset defences come from the `h2` crate.
@@ -305,9 +315,9 @@ the others refuse for the same reason.
 Applied to the request target, for matching and forwarding alike.
 
 1. The path starts with `/` and contains `pchar` and `/`, with well-formed
-   percent-encodings. `[ ] { } | ^` and `` ` `` are percent-encoded rather
-   than rejected (`/a|b` becomes `/a%7Cb`). Space, control bytes, `"`,
-   `<`, `>`, `\` and non-ASCII are rejected.
+   percent-encodings. `[ ] { } | ^` are percent-encoded rather than
+   rejected (`/a|b` becomes `/a%7Cb`). Space, control bytes, `"`,
+   `<`, `>`, `\`, a raw backtick and non-ASCII are rejected.
 2. Percent-encoded unreserved characters (`A–Z a–z 0–9 - . _ ~`) are
    decoded; other encodings stay (`%2F` stays `%2F`).
 3. Hex digits in the remaining encodings are upper-cased.

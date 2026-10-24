@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use reqwest::header::{CONTENT_ENCODING, CONTENT_TYPE};
 use reqwest::{StatusCode, Url};
 
+use crate::json::JsonFault;
 use crate::protocol::{
     EnrolRequest, EnrolResponse, ErrorBody, FlowAck, Lease, NodeState, PREFIX, PROTOCOL_VERSION,
 };
@@ -43,6 +44,10 @@ pub struct Transient(String);
 impl Transient {
     fn status(status: StatusCode, body: &[u8], secrets: &[&str]) -> Self {
         Self(format!("{status}: {}", excerpt(body, secrets)))
+    }
+
+    fn json(what: &str, e: serde_json::Error) -> Self {
+        Self(format!("{what}: {}", JsonFault::from(e)))
     }
 }
 
@@ -282,7 +287,7 @@ impl ControlPlane {
         let (status, body) = send(req).await.map_err(EnrolError::Failed)?;
         if status.is_success() {
             let res: EnrolResponse = serde_json::from_slice(&body)
-                .map_err(|e| EnrolError::Failed(Transient(format!("enrol response: {e}"))))?;
+                .map_err(|e| EnrolError::Failed(Transient::json("enrol response", e)))?;
             // A token the header cannot carry is the server's bug, not a
             // reason to give up on it.
             NodeToken::from_response(&res)
@@ -322,7 +327,7 @@ impl ControlPlane {
         match status {
             StatusCode::OK => match serde_json::from_slice::<Lease>(&body) {
                 Ok(lease) => LeaseFetch::Lease(Box::new(lease)),
-                Err(e) => LeaseFetch::Failed(Transient(format!("lease body: {e}"))),
+                Err(e) => LeaseFetch::Failed(Transient::json("lease body", e)),
             },
             StatusCode::GONE => LeaseFetch::Revoked,
             StatusCode::UPGRADE_REQUIRED => LeaseFetch::Unsupported(error_body(&body, &secrets)),
@@ -355,7 +360,7 @@ impl ControlPlane {
         match status {
             StatusCode::OK => match serde_json::from_slice::<FlowAck>(&body) {
                 Ok(ack) => ShipOutcome::Acked(ack),
-                Err(e) => ShipOutcome::Failed(Transient(format!("flow ack body: {e}"))),
+                Err(e) => ShipOutcome::Failed(Transient::json("flow ack body", e)),
             },
             StatusCode::INSUFFICIENT_STORAGE => ShipOutcome::QuotaExhausted,
             StatusCode::GONE => ShipOutcome::Revoked,
@@ -643,6 +648,65 @@ pub(crate) mod tests {
         }
     }
 
+    /// A response that does not deserialise is reported by where it went
+    /// wrong, not by what it held: serde quotes the value it choked on.
+    #[tokio::test]
+    async fn malformed_enrol_and_renewal_responses_are_not_echoed() {
+        let mock = MockServer::start().await;
+        let anon = anon(&mock);
+        let (cp, _) = enrolled(&mock).await;
+        for (body, diagnostic) in [
+            (
+                "\n\"SHOULD\\u002dNOT\\u002dLEAK\"",
+                "missing or unexpected value at line 2 column 27",
+            ),
+            (
+                r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK","not_after":"2026-11-05T10:12:00Z","renew_after_seconds":"SHOULD-NOT-LEAK"}"#,
+                "missing or unexpected value at line 1 column 116",
+            ),
+            (
+                r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK","not_after":918273,"renew_after_seconds":1}"#,
+                "missing or unexpected value at line 1 column 60",
+            ),
+            (
+                r#"{
+"node_id":"n1","token":"SHOULD-NOT-LEAK","#,
+                "unexpected end of input at line 2 column 41",
+            ),
+            (
+                r#"{"node_id":"n1","token":"SHOULD-NOT-LEAK",,}"#,
+                "syntax error at line 1 column 43",
+            ),
+        ] {
+            for renew in [false, true] {
+                let path = if renew {
+                    "/roxy/v1/renew"
+                } else {
+                    "/roxy/v1/enrol"
+                };
+                mock.push(
+                    path,
+                    Reply::Status {
+                        status: 200,
+                        headers: vec![],
+                        body: body.as_bytes().to_vec(),
+                    },
+                );
+                let err = if renew {
+                    cp.renew().await
+                } else {
+                    anon.enrol("tok").await
+                }
+                .unwrap_err();
+                assert!(matches!(err, EnrolError::Failed(_)), "{err}");
+                assert_eq!(err.to_string(), format!("enrol response: {diagnostic}"));
+                let debug = format!("{err:?}");
+                assert!(!debug.contains("SHOULD-NOT-LEAK"), "{debug}");
+                assert!(!debug.contains("918273"), "{debug}");
+            }
+        }
+    }
+
     /// A server that echoes the credential it was shown, in a body or an
     /// error message, does not get it into the node's diagnostics.
     #[tokio::test]
@@ -704,6 +768,49 @@ pub(crate) mod tests {
             panic!("400 is a rejection");
         };
         assert!(!e.to_string().contains(token), "{e}");
+    }
+
+    /// A lease body carries the lease secrets and a flow ack is read on
+    /// every upload, so neither parse failure may quote the document.
+    #[tokio::test]
+    async fn malformed_lease_and_flow_ack_bodies_are_not_echoed() {
+        let mock = MockServer::start().await;
+        let (cp, _) = enrolled(&mock).await;
+        let lease = r#"{"lease_id":"L1","valid_for_seconds":"SHOULD-NOT-LEAK","refresh_after_seconds":1,"config":"","secrets":{"k":"SHOULD-NOT-LEAK"},"state_epoch":"e","flow":{}}"#;
+        mock.push(
+            "/roxy/v1/lease",
+            Reply::Status {
+                status: 200,
+                headers: vec![],
+                body: lease.as_bytes().to_vec(),
+            },
+        );
+        let LeaseFetch::Failed(e) = cp.fetch_lease(&state()).await else {
+            panic!("a lease that does not parse is a transient failure");
+        };
+        assert!(!e.to_string().contains("SHOULD-NOT-LEAK"), "{e}");
+        assert_eq!(
+            e.to_string(),
+            "lease body: missing or unexpected value at line 1 column 54"
+        );
+
+        mock.push(
+            "/roxy/v1/flows",
+            Reply::Status {
+                status: 200,
+                headers: vec![],
+                body: br#"{"acked_through":"SHOULD-NOT-LEAK"}"#.to_vec(),
+            },
+        );
+        let batch = crate::protocol::encode_flow_batch("node-1", "L1", 1, [r#"{"seq":1}"#]);
+        let ShipOutcome::Failed(e) = cp.ship_flows(&batch).await else {
+            panic!("an ack that does not parse is a transient failure");
+        };
+        assert!(!e.to_string().contains("SHOULD-NOT-LEAK"), "{e}");
+        assert_eq!(
+            e.to_string(),
+            "flow ack body: missing or unexpected value at line 1 column 34"
+        );
     }
 
     #[tokio::test]

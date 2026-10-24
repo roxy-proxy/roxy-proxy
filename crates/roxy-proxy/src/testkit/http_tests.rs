@@ -695,6 +695,41 @@ async fn h2_request_trailers_are_reset_by_default() {
     assert!(seen.iter().all(|s| s.complete != Some(true)), "{seen:#?}");
 }
 
+#[tokio::test]
+async fn h2_request_trailers_obey_the_header_byte_limit() {
+    for value_bytes in [121, 122] {
+        let kit = Kit::builder()
+            .flags(|f| f.allow_request_trailers = true)
+            .limits(|l| l.max_header_bytes = 128)
+            .start()
+            .await;
+        let (send, _conn) = super::h2_client(&kit).await;
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert(
+            "x-t",
+            http::HeaderValue::from_str(&"a".repeat(value_bytes)).unwrap(),
+        );
+        let result = h2_exchange(&send, "POST", "/t", &[], b"abc", Some(trailers.clone())).await;
+        // The field's wire size is its name, value, colon, space and CRLF.
+        if value_bytes == 121 {
+            assert_eq!(result.unwrap().0.status, 200);
+            let seen = kit.upstream.wait_seen(1).await;
+            assert_eq!(seen[0].trailers.as_ref(), Some(&trailers));
+        } else {
+            let err = result.expect_err("a trailer section over the byte limit resets the stream");
+            assert!(err.is_reset(), "{err}");
+            let events = kit.events("parse_error", 1).await;
+            assert_eq!(events[0]["reason"], "head_too_large", "{events:#?}");
+            let seen = kit.upstream.seen();
+            assert!(
+                seen.iter()
+                    .all(|s| s.complete != Some(true) && s.trailers.is_none()),
+                "{seen:#?}"
+            );
+        }
+    }
+}
+
 /// Rules that read the body, so the exchange buffers it in both directions.
 const BODY_RULES: &str = r#"
 - id: no-secret-out
