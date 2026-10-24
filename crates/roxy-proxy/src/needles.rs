@@ -1,6 +1,7 @@
-//! Secret values to find and mask: the one matcher behind the flow log's
-//! redaction and the masking of responses. Each byte of an occurrence
-//! becomes [`MASK`], so a masked string keeps its length.
+//! Secret values to find: the one matcher behind the flow log's redaction
+//! and the masking of responses. A response is masked byte for byte with
+//! [`MASK`], so it keeps its length; the log replaces each occurrence with
+//! a marker ([`Needles::replace_str`]).
 
 use std::borrow::Cow;
 
@@ -92,16 +93,23 @@ impl Needles {
         Cow::Owned(out)
     }
 
-    /// `s` with every occurrence masked.
-    pub fn mask_str<'a>(&self, s: &'a str) -> Cow<'a, str> {
-        match self.mask_bytes(s.as_bytes()) {
-            Cow::Borrowed(_) => Cow::Borrowed(s),
-            // A value is whole UTF-8, so in UTF-8 text it matches only on
-            // char boundaries, and the mask is ASCII.
-            Cow::Owned(b) => Cow::Owned(
-                String::from_utf8(b).expect("masking UTF-8 on char boundaries keeps it UTF-8"),
-            ),
+    /// `s` with every occurrence replaced by `with`, overlapping and
+    /// adjoining occurrences by one. A value is whole UTF-8, so in UTF-8
+    /// text it matches only on char boundaries.
+    pub fn replace_str<'a>(&self, s: &'a str, with: &str) -> Cow<'a, str> {
+        let ranges = self.ranges(s.as_bytes());
+        if ranges.is_empty() {
+            return Cow::Borrowed(s);
         }
+        let mut out = String::with_capacity(s.len());
+        let mut pos = 0;
+        for (start, end) in ranges {
+            out.push_str(&s[pos..start]);
+            out.push_str(with);
+            pos = end;
+        }
+        out.push_str(&s[pos..]);
+        Cow::Owned(out)
     }
 }
 
@@ -127,19 +135,20 @@ mod tests {
     #[test]
     fn masks_every_occurrence_byte_for_byte() {
         let n = needles(&["sk-live-123", ""]);
-        assert!(matches!(n.mask_str("nothing here"), Cow::Borrowed(_)));
+        assert!(matches!(n.mask_bytes(b"nothing here"), Cow::Borrowed(_)));
         assert_eq!(
-            n.mask_str("Bearer sk-live-123 and sk-live-123!"),
-            "Bearer *********** and ***********!"
+            &*n.mask_bytes(b"Bearer sk-live-123 and sk-live-123!"),
+            b"Bearer *********** and ***********!"
         );
     }
 
     #[test]
     fn overlapping_occurrences_are_one_run() {
         let n = needles(&["abcd", "cdef", "aa"]);
-        assert_eq!(n.mask_str("xabcdefx"), "x******x");
-        assert_eq!(n.mask_str("aaa"), "***");
-        assert_eq!(n.mask_str("é-abcd-é"), "é-****-é");
+        assert_eq!(&*n.mask_bytes(b"xabcdefx"), b"x******x");
+        assert_eq!(&*n.mask_bytes(b"aaa"), b"***");
+        assert_eq!(n.replace_str("xabcdefx", "#"), "x#x");
+        assert_eq!(n.replace_str("é-abcd-é", "#"), "é-#-é");
     }
 
     #[test]

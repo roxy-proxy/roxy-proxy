@@ -105,7 +105,7 @@ async fn sign_replaces_the_client_credentials_and_leaves_framing_fields_unsigned
     let muts = ev["mutations"].as_array().unwrap();
     assert!(muts.contains(&"sign:aws_sigv4".into()), "{ev:#}");
     // The capture head records the signed request's headers: the key id
-    // and the session token in them are masked.
+    // and the session token in them are redacted.
     let flow = ev["flow"].as_str().unwrap();
     let records = kit.captured();
     let (_, head) = records
@@ -119,13 +119,11 @@ async fn sign_replaces_the_client_credentials_and_leaves_framing_fields_unsigned
         .iter()
         .map(|p| (p[0].as_str().unwrap(), p[1].as_str().unwrap()))
         .collect();
-    let mask = |v: &str| "*".repeat(v.len());
     assert!(
-        headers["authorization"]
-            .starts_with(&format!("AWS4-HMAC-SHA256 Credential={}/", mask(AKID))),
+        headers["authorization"].starts_with("AWS4-HMAC-SHA256 Credential=[REDACTED]/"),
         "{head:#}"
     );
-    assert_eq!(headers["x-amz-security-token"], mask(TOKEN), "{head:#}");
+    assert_eq!(headers["x-amz-security-token"], "[REDACTED]", "{head:#}");
 }
 
 /// A header value with obs-text cannot go into the canonical request. The

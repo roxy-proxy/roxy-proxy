@@ -808,6 +808,7 @@ pub(crate) fn ca_conn_slot(shared: &Shared, ip: IpAddr) -> Result<ConnSlot, &'st
 
 #[cfg(test)]
 mod tests {
+    use crate::flowlog::REDACTED;
     use crate::listener::ListenerMode;
     use crate::testkit::{Kit, capture_logs, client_conn};
 
@@ -825,8 +826,8 @@ mod tests {
         });
         assert!(logged.contains("client protocol error"), "{logged}");
         assert!(!logged.contains(secret), "{logged}");
-        assert!(logged.contains("sni ***********"), "{logged}");
+        assert!(logged.contains(REDACTED), "{logged}");
         let ev = kit.events("parse_error", 1).await;
-        assert_eq!(ev[0]["detail"], "sni ***********");
+        assert_eq!(ev[0]["detail"], format!("sni {REDACTED}"));
     }
 }

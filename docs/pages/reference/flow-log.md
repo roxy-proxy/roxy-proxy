@@ -79,11 +79,10 @@ Common reasons, by `terminal_rule`:
 
 ### Redaction
 
-Secret values that roxy injects are masked in everything it logs: each
-byte becomes `*`, so the text keeps its length. The values of
-`authorization`, `proxy-authorization`, `cookie`, `set-cookie` and
-`x-api-key` are never logged, and `log.redact_headers` adds more. These
-values, and query values, are logged as `******`.
+Secret values that roxy injects are removed from everything it logs. The
+values of `authorization`, `proxy-authorization`, `cookie`, `set-cookie`
+and `x-api-key` are never logged, and `log.redact_headers` adds more.
+Query values are redacted. Each is logged as `[REDACTED]`.
 
 ### Writing
 

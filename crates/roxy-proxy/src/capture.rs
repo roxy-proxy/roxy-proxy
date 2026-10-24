@@ -325,7 +325,7 @@ pub(crate) mod tests {
     use roxy_http::{Body, HttpFlags, Limits, Method, RequestMeta, Scheme, TargetForm, Version};
 
     use super::*;
-    use crate::flowlog::Redactor;
+    use crate::flowlog::{REDACTED, Redactor};
     use crate::secrets::SecretStore;
 
     /// Parses a capture file into `(header, payload)` records: the payload
@@ -457,18 +457,17 @@ pub(crate) mod tests {
             let text = std::str::from_utf8(payload).unwrap();
             assert!(!text.contains(secret), "{text}");
         }
-        let masked = "*".repeat(secret.len());
         let head: serde_json::Value = serde_json::from_slice(&records[0].1).unwrap();
         assert_eq!(
             head["url"],
-            format!("https://api.example.com/v1/{masked}/x?k={masked}&plain=1")
+            format!("https://api.example.com/v1/{REDACTED}/x?k={REDACTED}&plain=1")
         );
         assert_eq!(
             head["headers"],
-            serde_json::json!([["x-token", masked], [format!("x-{masked}"), "v"]])
+            serde_json::json!([["x-token", REDACTED], [format!("x-{REDACTED}"), "v"]])
         );
         let head: serde_json::Value = serde_json::from_slice(&records[1].1).unwrap();
-        assert_eq!(head["headers"], serde_json::json!([["x-echo", masked]]));
+        assert_eq!(head["headers"], serde_json::json!([["x-echo", REDACTED]]));
     }
 
     /// The line shape, pinned: a redacted head, data with a newline and a
@@ -491,8 +490,9 @@ pub(crate) mod tests {
         assert!(log.flush());
         let text = String::from_utf8(std::fs::read(log.path()).unwrap()).unwrap();
         let expected = [
-            r#"{"flow":"F1","dir":"response","kind":"head","seq":0,"head":{"headers":[["x-echo","****"]],"status":200}}"#
-                .to_owned(),
+            format!(
+                r#"{{"flow":"F1","dir":"response","kind":"head","seq":0,"head":{{"headers":[["x-echo","{REDACTED}"]],"status":200}}}}"#
+            ),
             r#"{"flow":"F1","dir":"response","kind":"data","seq":1,"data":"YQpi/w=="}"#.to_owned(),
             r#"{"flow":"F1","dir":"response","kind":"data","seq":2,"data":"Y2RlZg=="}"#.to_owned(),
             r#"{"flow":"F1","dir":"response","kind":"truncated","seq":3,"cap":8}"#.to_owned(),

@@ -27,9 +27,10 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use serde::ser::SerializeSeq;
 use serde::{Serialize, Serializer};
 
-/// Replacement text for a value hidden whole: a redacted header's. Its
-/// width is fixed, so it says nothing of the value's length.
-pub const REDACTED: &str = "******";
+/// Replacement text for redacted values: a secret, or the whole value of a
+/// redacted header. Unlike the masking of a response, which must keep
+/// lengths, it says nothing of the value's length.
+pub const REDACTED: &str = "[REDACTED]";
 
 /// Header names whose values are never logged. `log.redact_headers`
 /// extends this set.
@@ -789,8 +790,7 @@ impl FlowSink for MemorySink {
 // Redaction
 // ---------------------------------------------------------------------------
 
-/// Masks secret values in logged strings and hides the values of
-/// sensitive headers.
+/// Scrubs secret values and sensitive headers from logged strings.
 #[derive(Debug, Clone)]
 pub struct Redactor {
     needles: Needles,
@@ -830,14 +830,14 @@ impl Redactor {
         self.headers.contains(&name.to_ascii_lowercase())
     }
 
-    /// `s` with every registered secret masked
-    /// ([`Needles::mask_str`]).
+    /// Replace every occurrence of a registered secret in `s` with
+    /// [`REDACTED`]. Overlapping occurrences are merged into one marker.
     pub fn redact_str<'a>(&self, s: &'a str) -> Cow<'a, str> {
-        self.needles.mask_str(s)
+        self.needles.replace_str(s, REDACTED)
     }
 
     /// The loggable form of a header value: [`REDACTED`] for redacted header
-    /// names, otherwise the value with secrets masked.
+    /// names, otherwise the value with secrets scrubbed.
     pub fn redact_header<'a>(&self, name: &str, value: &'a str) -> Cow<'a, str> {
         if self.is_redacted_header(name) {
             Cow::Borrowed(REDACTED)
@@ -846,7 +846,7 @@ impl Redactor {
         }
     }
 
-    /// Every string in `v`, object keys included, with secrets masked.
+    /// Every string in `v`, object keys included, with secrets scrubbed.
     pub fn redact_json(&self, v: serde_json::Value) -> serde_json::Value {
         use serde_json::Value;
         match v {
@@ -1120,6 +1120,29 @@ mod tests {
     }
 
     #[test]
+    fn redact_str_replaces_secrets() {
+        let mut r = Redactor::new();
+        r.add_secret("sk-live-123");
+        r.add_secret("");
+        assert!(matches!(r.redact_str("nothing here"), Cow::Borrowed(_)));
+        assert_eq!(
+            r.redact_str("Bearer sk-live-123 and sk-live-123!"),
+            "Bearer [REDACTED] and [REDACTED]!"
+        );
+    }
+
+    #[test]
+    fn redact_str_handles_overlaps() {
+        let mut r = Redactor::new();
+        r.add_secret("abcd");
+        r.add_secret("cdef");
+        r.add_secret("aa");
+        assert_eq!(r.redact_str("xabcdefx"), "x[REDACTED]x");
+        assert_eq!(r.redact_str("aaa"), "[REDACTED]");
+        assert_eq!(r.redact_str("é-abcd-é"), "é-[REDACTED]-é");
+    }
+
+    #[test]
     fn redact_json_scrubs_keys_as_well_as_values() {
         let mut r = Redactor::new();
         r.add_secret("hunter2");
@@ -1139,6 +1162,6 @@ mod tests {
         r.add_header("X-Custom");
         assert_eq!(r.redact_header("x-custom", "visible"), REDACTED);
         r.add_secret("tok");
-        assert_eq!(r.redact_header("x-other", "a tok b"), "a *** b");
+        assert_eq!(r.redact_header("x-other", "a tok b"), "a [REDACTED] b");
     }
 }

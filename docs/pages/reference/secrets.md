@@ -23,8 +23,7 @@ rules:
 - `env` and `file` are read at startup and on reload. A missing or empty
   value stops roxy starting, or fails a reload. `roxy check` and
   `roxy rule test` do not read them.
-- Injected values are masked in the flow log and in captured headers:
-  each byte becomes `*`.
+- Injected values are removed from the flow log and from captured headers.
 - A `redirect` sends the request, injected values included, to the new
   target. Make sure a rule that injects a secret cannot match a request
   that another rule redirects elsewhere.
