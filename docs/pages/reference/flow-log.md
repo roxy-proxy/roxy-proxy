@@ -119,8 +119,13 @@ Rotation needs `path`, since stdout cannot be rotated.
 
 ## Capture
 
-Capture records whole requests and responses, as forwarded, to
-`<capture_dir>/capture.jsonl`. It records the exchanges a rule selects
+Capture records whole requests and responses to
+`<capture_dir>/capture.jsonl`. It sits between the rules and the address
+floor. It records the request once the rules allow it, with their
+changes, and the response as it arrives from the upstream, before any
+addon changes it. If the address floor or the connection then fails, the
+capture holds the request head and an `end` with `aborted: true`, and no
+body. It records the exchanges a rule selects
 with `capture: request | response | both`, or every exchange with
 `log.capture.all: true`. It is written like the flow log, with the same
 batching, rotation and backpressure.
