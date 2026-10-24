@@ -36,20 +36,26 @@ with the same reason.
 ## Trialling a rule on live traffic
 
 To find out what a new `deny` rule would block before you turn it on, give
-it the same `when` but only `tag` and `log` actions:
+it the same `when` but only a `tag`:
 
 ```yaml
   - id: trial-no-gists
     when: host == "gist.github.com"
-    then:
-      - tag: trial-no-gists
-      - log: { level: warn, message: "trial-no-gists would deny" }
+    then: { tag: trial-no-gists }
 ```
 
 A rule with no `allow`, `deny` or `quarantine` does not change the
-decision: other rules still decide the request. When the trial rule
-matches, the request's flow log entry lists it under `rules` and `tags`,
-and a `log` event is written beside it. Because a matching `deny` always
-wins, every request the trial rule matches is one the real rule would have
-refused. When you are happy with what it catches, replace the `tag` and
-`log` with `deny`.
+decision: other rules still decide the request. The tag is there so you
+can find the requests it matched. Each one's `request` event in the
+[flow log](/reference/flow-log) carries it:
+
+```json
+{"event":"request","req":{"method":"GET","host":"gist.github.com","path":"/x"},
+ "decision":"allow","rules":["github-reads","trial-no-gists"],
+ "tags":["trial-no-gists"],"terminal_rule":"github-reads"}
+```
+
+so `grep '"trial-no-gists"' flow.jsonl` lists them. Because a matching
+`deny` always wins, each of these is a request the real rule would have
+refused. When you are happy with what it catches, replace the `tag` with
+`deny`.
