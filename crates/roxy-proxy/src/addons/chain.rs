@@ -28,8 +28,8 @@
 //!   an HTTP error response is put on its response lane if that lane
 //!   has no head yet, so the layer downstream sees a response it may
 //!   reshape.
-//! - A layer answered if the response lane it consumes had no head when it
-//!   put its own head on the lane it produces, decided then.
+//! - A layer answered if it put its head on the lane it produces before it
+//!   had taken the head of the response lane it consumes, decided then.
 //! - A layer cutting a lane it produces is an abort, except a headless
 //!   response cut, which is the same `no_response` fault as a headless end.
 //! - A producer ending a lane does not acknowledge consumption of queued
@@ -73,7 +73,6 @@ pub(crate) enum Head {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Publication {
     Forwarded,
-    Produced,
     Failure,
 }
 
@@ -127,23 +126,6 @@ pub(crate) enum Dir {
     Res,
 }
 
-/// Transport cancellation is stronger evidence than abandonment inferred
-/// from a cancelled upstream worker. Keep the two facts separate.
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Cancellation {
-    ClientGone,
-    UpstreamAbandoned,
-}
-
-impl Cancellation {
-    pub(crate) fn reason(self) -> &'static str {
-        match self {
-            Self::ClientGone => "client_gone",
-            Self::UpstreamAbandoned => "upstream_aborted",
-        }
-    }
-}
-
 /// One lane of one hop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LaneId {
@@ -176,6 +158,10 @@ pub(crate) trait Recorder: Send + Sync + 'static {
     /// Build the HTTP response for the first recorded failure. `None`
     /// means the exchange must close without a response.
     fn failure_response(&self, layer: usize) -> BoxFuture<Option<(http::response::Parts, Body)>>;
+    /// An enforcing layer cut a lane it produces.
+    fn aborted(&self);
+    /// The client went: noted before anything is cut for it.
+    fn client_gone(&self);
 }
 
 struct LaneSlot {
@@ -211,8 +197,11 @@ struct StageState {
     /// the lanes through as it found them.
     enforcing: AtomicBool,
     failed: AtomicBool,
-    /// For a layer: whether its answer was its own (the lane it consumes
-    /// was headless when it answered). Set when it answers.
+    /// For a layer: it has taken the head of the response lane it
+    /// consumes, the upstream's answer to its forward.
+    took_answer: AtomicBool,
+    /// For a layer: whether its answer was its own (it had not taken the
+    /// upstream's when it answered). Set when it answers.
     answered: OnceLock<bool>,
 }
 
@@ -227,11 +216,6 @@ pub(crate) struct Chain {
     /// torn down, for `why`.
     torn: CancellationToken,
     torn_why: OnceLock<&'static str>,
-    /// The first lane a layer cut of its own accord: the record's reason.
-    abort: OnceLock<&'static str>,
-    client_gone: AtomicBool,
-    /// Provisional fallback; a later observed client loss takes precedence.
-    upstream_abandoned: AtomicBool,
 }
 
 /// The client edge's ends: it produces `req[0]` and consumes `res[0]`.
@@ -283,6 +267,7 @@ impl Chain {
                 torn_why: OnceLock::new(),
                 enforcing: AtomicBool::new(false),
                 failed: AtomicBool::new(false),
+                took_answer: AtomicBool::new(false),
                 answered: OnceLock::new(),
             })
             .collect();
@@ -296,9 +281,6 @@ impl Chain {
             tasks,
             torn: CancellationToken::new(),
             torn_why: OnceLock::new(),
-            abort: OnceLock::new(),
-            client_gone: AtomicBool::new(false),
-            upstream_abandoned: AtomicBool::new(false),
         });
         let ends = |dir| -> (Vec<Option<LaneTx>>, Vec<Option<LaneRx>>) {
             (0..=layers)
@@ -426,26 +408,15 @@ impl Chain {
         self.tasks.spawn(future)
     }
 
-    /// The first layer-initiated request or response abort, if any.
-    pub(crate) fn abort_reason(&self) -> Option<&'static str> {
-        self.abort.get().copied()
-    }
-
-    pub(super) fn upstream_abandoned(&self) {
-        self.upstream_abandoned.store(true, Ordering::Relaxed);
-    }
-
-    /// Observed cancellation, falling back to upstream abandonment only
-    /// when no transport cancellation explains the unfinished work.
-    pub(super) fn cancellation(&self) -> Option<Cancellation> {
-        self.client_gone
-            .load(Ordering::Acquire)
-            .then_some(Cancellation::ClientGone)
-            .or_else(|| {
-                self.upstream_abandoned
-                    .load(Ordering::Relaxed)
-                    .then_some(Cancellation::UpstreamAbandoned)
-            })
+    /// The consumer of `id` has its head. For a layer's response lane, an
+    /// answer it gives from now on is the upstream's, passed on.
+    fn took_head(&self, id: LaneId) {
+        let consumer = id.consumer();
+        if id.dir == Dir::Res && self.is_layer(consumer) {
+            self.stages[consumer]
+                .took_answer
+                .store(true, Ordering::Release);
+        }
     }
 
     /// The layer whose own answer reached the client, if a layer's did.
@@ -457,18 +428,20 @@ impl Chain {
 
     /// Moves `id` to the terminal state `to` unless it is terminal already.
     fn settle(&self, id: LaneId, to: LaneState) -> bool {
-        self.settle_recorded(id, to, None)
+        self.settle_recorded(id, to, false)
     }
 
-    fn settle_recorded(&self, id: LaneId, to: LaneState, abort: Option<&'static str>) -> bool {
+    /// As [`Chain::settle`]; `abort` notes the producer's abort if the
+    /// lane moves.
+    fn settle_recorded(&self, id: LaneId, to: LaneState, abort: bool) -> bool {
         let lane = self.lane(id);
         {
             let mut slot = lock(&lane.slot);
             if slot.state.is_terminal() {
                 return false;
             }
-            if let Some(why) = abort {
-                let _ = self.abort.set(why);
+            if abort {
+                self.recorder.aborted();
             }
             slot.state = to;
         }
@@ -504,11 +477,6 @@ impl Chain {
         if complete {
             drop(std::mem::take(&mut body));
         }
-        // Capture attribution and publish the head under the same pair of
-        // locks. An upstream head cannot arrive between these two events.
-        // When two lanes are locked, acquire the upstream one first.
-        let upstream = (id.dir == Dir::Res && self.is_layer(producer))
-            .then(|| lock(&self.hops[producer].res.slot));
         let tx = {
             let mut slot = lock(&self.lane(id).slot);
             if slot.state.is_terminal()
@@ -522,24 +490,20 @@ impl Chain {
             slot.state = LaneState::Open;
             slot.head = true;
             slot.consumed = complete;
-            if let Some(upstream) = &upstream {
-                let _ = self.stages[producer].answered.set(!upstream.head);
+            if id.dir == Dir::Res && self.is_layer(producer) {
+                let st = &self.stages[producer];
+                let _ = st.answered.set(!st.took_answer.load(Ordering::Acquire));
             }
             lock(&self.lane(id).head_tx)
                 .take()
                 .expect("a lane takes one head")
         };
-        drop(upstream);
         let body = if complete {
             body
         } else {
             // Even the last declared byte can precede a cut. Only a clean
             // lane end commits this body on the wire.
-            Body::wrap_native(
-                Reading::new(self, id, body, publication == Publication::Produced),
-                u64::MAX,
-                None,
-            )
+            Body::wrap_native(Reading::new(self, id, body), u64::MAX, None)
         };
         // The consumer may have let go already: the body then drops here,
         // which is a stop on a lane that is stopped.
@@ -574,11 +538,17 @@ impl Chain {
         if abort && self.producer_closed(id) {
             return;
         }
-        let reason = (abort && self.enforcing(id.producer())).then_some(match id.dir {
-            Dir::Req => "forward_aborted",
-            Dir::Res => "answer_aborted",
-        });
-        self.settle_recorded(id, LaneState::Cut(why), reason);
+        let abort = abort && self.enforcing(id.producer());
+        self.settle_recorded(id, LaneState::Cut(why), abort);
+    }
+
+    /// `id`'s consumer read an error from its body: the lane is cut
+    /// whoever the producer is, and it is the producer's abort only while
+    /// the producer still holds the lane (`abort`: the error is not the
+    /// fail-closed cut of a producer that failed).
+    fn read_cut(&self, id: LaneId, why: String, abort: bool) {
+        let abort = abort && !self.producer_closed(id) && self.enforcing(id.producer());
+        self.settle_recorded(id, LaneState::Cut(why), abort);
     }
 
     /// `id`'s consumer lets go of it before the end.
@@ -718,7 +688,7 @@ impl Chain {
     /// are cut or stopped. Driver cancellation does not depend on either.
     pub(crate) fn tear_down(&self, why: &'static str) {
         if why == super::CLIENT_GONE {
-            self.client_gone.store(true, Ordering::Release);
+            self.recorder.client_gone();
         }
         let _ = self.torn_why.set(why);
         self.torn.cancel();
@@ -834,25 +804,15 @@ impl LaneTx {
     }
 
     /// Puts `head` on the lane with a body made elsewhere (an upstream's,
-    /// a refusal's, the body of the lane this one is bound to): the lane
-    /// ends or cuts as its consumer reads the body to its end. An error
-    /// read from the body is a cut by whoever made the body, not by this
-    /// producer.
+    /// a refusal's, a guest's stream): the lane ends or cuts as its
+    /// consumer reads the body to its end. An error read from it is this
+    /// producer's abort unless an earlier fault or client loss explains it;
+    /// [`BodyError::Stopped`] is how a failed producer's body is cut for
+    /// it, never an abort.
     pub(crate) fn whole(mut self, head: Head, body: Body) {
         self.used = true;
         self.chain
             .head(self.lane, head, body, Publication::Forwarded);
-    }
-
-    /// Puts `head` on the lane with a body the producer makes itself (a
-    /// guest's stream): an error read from it is the producer's own cut.
-    /// [`BodyError::Stopped`] is the exception: that is how a failed
-    /// producer's body is cut for it, and the failure is recorded where it
-    /// happened.
-    pub(crate) fn produced(mut self, head: Head, body: Body) {
-        self.used = true;
-        self.chain
-            .head(self.lane, head, body, Publication::Produced);
     }
 
     /// Nothing goes on the lane.
@@ -999,6 +959,7 @@ impl LaneRx {
         };
         if let Some(arrived) = arrived {
             self.spent = true;
+            self.chain.took_head(self.lane);
             return Ok(arrived);
         }
         terminal.cancelled().await;
@@ -1012,6 +973,7 @@ impl LaneRx {
     pub(crate) fn try_head(&mut self) -> Option<Result<(Head, Body), Headless>> {
         if let Ok(arrived) = self.rx.try_recv() {
             self.spent = true;
+            self.chain.took_head(self.lane);
             return Some(Ok(arrived));
         }
         if !self.chain.lane(self.lane).terminal.is_cancelled() {
@@ -1047,8 +1009,6 @@ struct Reading {
     inner: Body,
     chain: Arc<Chain>,
     lane: LaneId,
-    /// The producer made the body itself: an error in it is its own cut.
-    own: bool,
     done: AtomicBool,
     /// HTTP trailers commit successful completion. Keep them private
     /// until the producer's clean end and length checks have arrived.
@@ -1059,12 +1019,11 @@ struct Reading {
 }
 
 impl Reading {
-    fn new(chain: &Arc<Chain>, lane: LaneId, inner: Body, own: bool) -> Self {
+    fn new(chain: &Arc<Chain>, lane: LaneId, inner: Body) -> Self {
         Self {
             inner,
             chain: chain.clone(),
             lane,
-            own,
             done: AtomicBool::new(false),
             trailers: None,
             terminal: Box::pin(chain.lane(lane).terminal.clone().cancelled_owned()),
@@ -1084,13 +1043,13 @@ impl Reading {
         self.chain.consumed(self.lane);
     }
 
-    /// The body's error reached the reader: the lane is cut. It is the
-    /// producer's own abort when the producer made the body and the error
-    /// is not the fail-closed cut of a producer that failed.
+    /// The body's error reached the reader: the lane is cut, by its
+    /// producer unless this is the fail-closed cut of a producer that
+    /// failed.
     fn cut(&mut self, e: &BodyError) {
         if !self.done.swap(true, Ordering::AcqRel) {
-            let abort = self.own && *e != BodyError::Stopped;
-            self.chain.cut(self.lane, e.to_string(), abort);
+            let abort = *e != BodyError::Stopped;
+            self.chain.read_cut(self.lane, e.to_string(), abort);
             self.consumed();
         }
     }
@@ -1189,8 +1148,12 @@ mod tests {
     #[derive(Default)]
     struct Record {
         faults: Mutex<Vec<(usize, String)>>,
+        /// Aborts reported.
+        aborts: Mutex<usize>,
         /// The generated failure response, if one can be sent.
         response: Option<(u16, &'static str)>,
+        /// Its body fails as it is read.
+        broken: bool,
         release: Option<CancellationToken>,
     }
 
@@ -1204,15 +1167,27 @@ mod tests {
             _layer: usize,
         ) -> BoxFuture<Option<(http::response::Parts, Body)>> {
             let configured = self.response;
+            let broken = self.broken;
             let release = self.release.clone();
             Box::pin(async move {
                 if let Some(release) = release {
                     release.cancelled().await;
                 }
                 let (status, body) = configured?;
+                if broken {
+                    let (sender, body) = Body::channel(u64::MAX, None);
+                    sender.abort(BodyError::Incomplete);
+                    return Some((response(status), body));
+                }
                 Some((response(status), Body::from_bytes(body)))
             })
         }
+
+        fn aborted(&self) {
+            *lock(&self.aborts) += 1;
+        }
+
+        fn client_gone(&self) {}
     }
 
     fn chain(layers: usize) -> (Arc<Chain>, EdgeIo, Vec<LayerIo>, CoreIo, Arc<Record>) {
@@ -1400,7 +1375,7 @@ mod tests {
         // The core's producer end learns its answer is not wanted.
         settles(answer.closed()).await;
         // A teardown's cuts are nobody's abort, and nobody's fault.
-        assert_eq!(c.abort_reason(), None);
+        assert_eq!(*lock(&record.aborts), 0);
         assert!(lock(&record.faults).is_empty());
         // L1 let go of the upload as it went: the edge's writer learns, and
         // nothing is left to move.
@@ -1673,7 +1648,7 @@ mod tests {
             } else {
                 layer
                     .res_out
-                    .produced(Head::Response(response(200)), Body::empty());
+                    .whole(Head::Response(response(200)), Body::empty());
             }
             assert_eq!(c.state(res(0)), LaneState::PendingFailure);
             let (head, body) = edge.res_in.head().await.unwrap();
@@ -1701,7 +1676,7 @@ mod tests {
         assert!(futures_util::poll!(received.as_mut()).is_pending());
         layer
             .res_out
-            .produced(Head::Response(response(200)), Body::empty());
+            .whole(Head::Response(response(200)), Body::empty());
         assert_eq!(c.state(res(0)), LaneState::PendingFailure);
         release.cancel();
         let (head, body) = received.await.unwrap();
@@ -1807,13 +1782,13 @@ mod tests {
     #[tokio::test]
     async fn a_layer_that_does_not_run_passes_headless_lanes_through() {
         let record = Arc::new(Record::default());
-        let (c, mut edge, mut layers, core) = Chain::new(1, record.clone());
+        let (_c, mut edge, mut layers, core) = Chain::new(1, record.clone());
         let l1 = layers.pop().unwrap();
         drop(core);
         // Not enforcing: its own ends are nobody's events.
         l1.res_out.cut_headless("passed on");
         l1.req_out.end_headless();
-        assert_eq!(c.abort_reason(), None);
+        assert_eq!(*lock(&record.aborts), 0);
         assert!(lock(&record.faults).is_empty());
         assert_eq!(
             edge.res_in.head().await.unwrap_err(),
@@ -1822,23 +1797,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_answer_is_the_layers_own_only_while_its_response_lane_is_headless() {
-        let (c, _edge, mut layers, core, _) = chain(2);
+    async fn an_answer_is_the_layers_own_until_it_takes_the_upstreams() {
+        let (c, _edge, mut layers, core, _) = chain(3);
+        let mut l3 = layers.pop().unwrap();
         let l2 = layers.pop().unwrap();
-        let l1 = layers.pop().unwrap();
-        // L2 answers before anything is on res[2]: its own.
+        let mut l1 = layers.pop().unwrap();
+        // L3 answers before anything is on res[3]: its own.
+        let _a3 = l3
+            .res_out
+            .head(Head::Response(response(403)), None, u64::MAX);
+        assert_eq!(l3.stage.answered(), Some(true));
+        // L2 answers with L3's answer on res[2], untaken: its own too.
         let _a2 = l2
             .res_out
             .head(Head::Response(response(403)), None, u64::MAX);
         assert_eq!(l2.stage.answered(), Some(true));
-        // L1 passes a head on while L2's is on res[1]: not its own, even
-        // unread.
+        // L1 takes L2's answer, then passes a head on: not its own.
+        let _ = l1.res_in.head().await.unwrap();
         let _a1 = l1
             .res_out
             .head(Head::Response(response(403)), None, u64::MAX);
         assert_eq!(l1.stage.answered(), Some(false));
         assert_eq!(c.answered_by(), Some(1));
-        drop(core);
+        drop((core, l3.res_in.try_head()));
     }
 
     #[tokio::test]
@@ -1857,6 +1838,27 @@ mod tests {
         assert_eq!(c.answered_by(), Some(0));
     }
 
+    /// A refusal whose body fails as it is read still cuts its lane, so
+    /// the exchange completes, and the failed layer has not aborted it.
+    #[tokio::test]
+    async fn a_refusal_body_that_fails_still_cuts_its_lane() {
+        let record = Arc::new(Record {
+            response: Some((503, "failure")),
+            broken: true,
+            ..Record::default()
+        });
+        let (c, mut edge, mut layers, core) = Chain::new(1, record.clone());
+        let l1 = layers.pop().unwrap();
+        l1.stage.enforcing();
+        l1.stage.fail(LayerError::NoResponse);
+        let (_, body) = edge.res_in.head().await.unwrap();
+        assert!(body.collect().await.is_err());
+        assert!(matches!(c.state(res(0)), LaneState::Cut(_)));
+        assert_eq!(*lock(&record.aborts), 0);
+        drop((edge, l1, core));
+        settles(c.until_over()).await;
+    }
+
     #[tokio::test]
     async fn a_layer_cutting_its_own_lane_is_an_abort_not_a_fault() {
         let (c, _edge, mut layers, mut core, record) = chain(1);
@@ -1869,20 +1871,14 @@ mod tests {
             LaneState::Cut("changed my mind".to_owned())
         );
         assert!(body.collect().await.is_err());
-        assert_eq!(c.abort_reason(), Some("forward_aborted"));
+        assert_eq!(*lock(&record.aborts), 1);
         assert!(lock(&record.faults).is_empty());
         assert!(!l1.stage.torn_down().is_cancelled());
-        // The first abort stands.
-        let answer = l1
-            .res_out
-            .head(Head::Response(response(200)), None, u64::MAX);
-        drop(answer);
-        assert_eq!(c.abort_reason(), Some("forward_aborted"));
 
         let (c, mut edge, mut layers, _core, record) = chain(1);
         let l1 = layers.pop().unwrap();
         l1.res_out.cut_headless("no");
-        assert_eq!(c.abort_reason(), None);
+        assert_eq!(*lock(&record.aborts), 0);
         assert_eq!(c.state(res(0)), LaneState::PendingFailure);
         assert_eq!(lock(&record.faults).len(), 1);
         let (head, body) = edge.res_in.head().await.unwrap();

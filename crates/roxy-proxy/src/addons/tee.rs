@@ -470,7 +470,7 @@ async fn forward(
     real_req: LayerRequest,
     tx: oneshot::Sender<Result<LayerResponse, HostError>>,
 ) -> Result<LayerResponse, Headless> {
-    match super::layer::forward_lanes(&st, index, Ok(real_req), false).await {
+    match super::layer::forward_lanes(&st, index, Ok(real_req)).await {
         Ok(resp) => {
             let (parts, body) = resp.into_parts();
             let (real_body, copy_body, _lag, cut) = copy_for(&st, addon, Dir::Response, body);

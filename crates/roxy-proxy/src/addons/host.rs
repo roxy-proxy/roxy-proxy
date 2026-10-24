@@ -129,8 +129,7 @@ impl LayerHost for StackHost {
         } else {
             req
         };
-        let own = req.extensions().get::<GuestBody>().is_some();
-        match super::layer::forward_lanes(&self.st, self.index, Ok(req), own).await {
+        match super::layer::forward_lanes(&self.st, self.index, Ok(req)).await {
             Ok(mut res) => {
                 if subscribe.response == Part::Head {
                     self.bypassed.hold_response(&mut res);
@@ -162,13 +161,8 @@ impl LayerHost for StackHost {
             }
             None => res,
         };
-        let own = res.extensions().get::<GuestBody>().is_some();
         let (parts, body) = res.into_parts();
-        if own {
-            answer.produced(Head::Response(parts), body);
-        } else {
-            answer.whole(Head::Response(parts), body);
-        }
+        answer.whole(Head::Response(parts), body);
     }
 
     async fn endpoint_permit(&self) -> Result<EndpointPermit, EndpointError> {

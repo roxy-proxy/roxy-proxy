@@ -91,7 +91,7 @@ async fn held_upgrade_ends(end: UpgradeEnd) {
         }
         UpgradeEnd::Cut => {
             assert_eq!(message["message"], crate::addons::ENDED, "{message}");
-            "answer_aborted"
+            "layer_aborted"
         }
         UpgradeEnd::Fault => {
             assert!(

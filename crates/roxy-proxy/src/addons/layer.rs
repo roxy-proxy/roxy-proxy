@@ -69,7 +69,7 @@ pub(super) async fn run(st: Arc<StackFlow>, index: usize, io: LayerIo) {
         // Nothing reached the layer: nothing leaves it, and what comes
         // back from upstream for that nothing is passed on.
         Some(Err(headless)) => Some(Entered::Through(
-            forward_lanes(&st, index, Err(headless), false).await,
+            forward_lanes(&st, index, Err(headless)).await,
         )),
     };
     match entered {
@@ -124,7 +124,7 @@ async fn enter(
         Ok((true, req)) => req,
         // Skipped: as if the layer passed both directions on unchanged.
         Ok((false, req)) => {
-            return Entered::Through(forward_lanes(st, index, Ok(req), false).await);
+            return Entered::Through(forward_lanes(st, index, Ok(req)).await);
         }
         Err(e) => return Entered::Fault(e),
     };
@@ -179,14 +179,11 @@ async fn enter(
 /// any response. A lane that ends without a head is the one case nothing
 /// answers: the forward was cut, the client's own request failed, or a
 /// stage was torn down. `Err` forwards nothing: the lane upstream is ended
-/// as it was found. `own` says the request's body is the layer's own
-/// making (a guest's stream), so an error in it is the layer's cut rather
-/// than one it passed through.
+/// as it was found.
 pub(super) async fn forward_lanes(
     st: &Arc<StackFlow>,
     index: usize,
     req: Result<LayerRequest, Headless>,
-    own: bool,
 ) -> Result<LayerResponse, Headless> {
     let Some(Forward {
         req_out,
@@ -197,10 +194,6 @@ pub(super) async fn forward_lanes(
         return Err(Headless::Cut("next called twice".to_owned()));
     };
     match req {
-        Ok(req) if own => {
-            let (parts, body) = req.into_parts();
-            req_out.produced(Head::Request(parts), body);
-        }
         Ok(req) => {
             let (parts, body) = req.into_parts();
             req_out.whole(Head::Request(parts), body);
