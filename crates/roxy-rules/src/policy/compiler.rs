@@ -1095,7 +1095,7 @@ impl RuleShape {
     fn forwarded_why(&self) -> String {
         format!(
             "this rule reads {}, which is known only after the request was forwarded \
-             (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation)",
+             (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#when-rules-run)",
             self.reads_quoted()
         )
     }

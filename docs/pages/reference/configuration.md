@@ -1,7 +1,7 @@
 # Configuration
 
-One YAML file, `version: 1`. Each section is described on the page the
-table names.
+One YAML file, starting `version: 1`. Each section is described on the
+page the table names.
 
 | key | page |
 |---|---|
@@ -17,26 +17,15 @@ table names.
 | `log`, `capture_dir` | [flow log](/reference/flow-log) |
 | `valid_until` | [lease](/guides/operations#lease) |
 
-- Strict parsing: an unknown key anywhere, or a key repeated in one map (a
-  setting, a secret, a `static_hosts` name, an endpoint header, an addon
-  endpoint), is an error naming the key, not a last-wins override.
-- Only `true` and `false` are booleans: `yes`, `no`, `on` and `off` are
-  refused where a boolean is expected. Merge keys (`<<`) and custom tags
-  (`!reset`) are errors. Anchors and aliases work. A file holds one YAML
-  document.
-- Relative paths (`ca_dir`, `ca_cert`, `ca_key`, secret, list and addon
-  files, log and capture paths) resolve against the working directory.
-- `roxy check` refuses zero for the `limits` that would otherwise refuse
-  every request, hold no connections or fail every metric and state rule
-  closed: `max_headers`, `max_header_bytes`, `max_url_bytes`,
-  `max_connections`, `max_connections_per_client`,
-  `h2_max_concurrent_streams`, `h2_max_header_list_bytes`,
-  `max_metric_keys`, `max_metric_bytes`, `max_state_entries`,
-  `max_observer_lag_bytes`, `max_address_list_bytes`; and for a metric's
-  `max_keys`, which also may not exceed `limits.max_metric_keys`
-  ([rate limits](/reference/rate-limits#key-cardinality)). The body,
-  message and capture caps and the timeouts accept zero and mean it
-  ([resource limits](/reference/limits#limits)).
+- Parsing is strict. An unknown key, or a key repeated in one map, is an
+  error.
+- Only `true` and `false` are booleans; `yes`, `no`, `on` and `off` are
+  refused. Anchors and aliases work; merge keys (`<<`) and custom tags do
+  not. A file holds one YAML document.
+- Relative paths resolve against the working directory.
+- `roxy check` refuses zero for a limit where zero would refuse every
+  request. Body, message and capture caps and timeouts accept zero and
+  mean it ([resource limits](/reference/limits#limits)).
 
 ```yaml
 version: 1

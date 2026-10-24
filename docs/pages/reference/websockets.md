@@ -1,82 +1,52 @@
 # WebSockets
 
-An upgrade is honoured only when the allowing rule says
-`allow: { upgrade: websocket }`. Under a plain `allow`, roxy drops `Upgrade`
-and `Connection: upgrade`, forwards the request as plain HTTP and emits
-`upgrade_stripped`; the client gets whatever the upstream answers (typically
-`200`, `400` or `426`) and its WebSocket library reports a failed
-handshake. Upgrades to anything other than `websocket` (`h2c`, say) are
-always stripped.
+roxy only allows a WebSocket upgrade when the allowing rule says
+`allow: { upgrade: websocket }`. Under a plain `allow`, roxy removes the
+upgrade headers and forwards the request as ordinary HTTP, so the
+client's WebSocket library reports a failed handshake. Upgrades to other
+protocols are always removed.
 
 ## Relay
 
-roxy forwards the upgrade request over HTTP/1.1 after the usual header
-canonicalisation; `Sec-WebSocket-*` headers pass through. Connecting, the
-upgrade request and taking over the upgraded connection share one
-`limits.response_header_timeout`; the client gets the `101` only once roxy
-holds the upstream side, so a failed upgrade is an error response, never a
-`101` followed by a close:
+roxy forwards the upgrade over HTTP/1.1 and sends the client the `101`
+only once the upstream has accepted, so a failed upgrade is always an
+error response.
 
 | failure | result |
 |---|---|
-| the client's upgrade is not a valid handshake (not `GET`, not HTTP/1.1, a body, `Sec-WebSocket-Version` other than 13, a `Sec-WebSocket-Key` missing, repeated or not the base64 of 16 bytes) | `400`, `terminal_rule: _websocket`, reason `ws_bad_handshake` |
-| `response_header_timeout` runs out | `504` |
-| the upstream answers anything other than `101` | relayed as it is |
-| a `101` with a wrong `Sec-WebSocket-Accept`, or accepting an extension when none may be negotiated ([below](/reference/websockets#extensions)) | `502`, `upstream_error`, reason `protocol_error` |
+| the client's upgrade request is not a valid WebSocket handshake | `400`, `terminal_rule: _websocket`, reason `ws_bad_handshake` |
+| the upstream does not answer within `limits.response_header_timeout` | `504` |
+| the upstream answers something other than `101` | passed to the client as it is |
+| the upstream's `101` is invalid | `502` |
 
-Through an `http_proxy` listener a `ws://` URL means a `CONNECT` tunnel
-with a plaintext upgrade inside it, which roxy refuses unless
-`http.allow_plain_in_connect` is on (the tunnel is closed, `parse_error`
-reason `non_http_in_connect`; [CONNECT](/reference/http#connect)). Use
-`wss://`. For WSS, roxy establishes the CONNECT tunnel and terminates TLS
-before processing the HTTP/1.1 upgrade. Addon layers receive that upgrade
-and carry the WebSocket bytes in both directions; the outer CONNECT is
-handled by the listener. On an `http` listener the upgrade arrives as
-plain HTTP and needs nothing.
+Through a proxy listener, use `wss://`. A `ws://` URL means plain HTTP
+inside a CONNECT tunnel, which roxy refuses unless
+`http.allow_plain_in_connect` is on. WebSockets over HTTP/2 are not
+supported, so clients use HTTP/1.1 for them.
 
-If no rule reads a `ws.*` field, roxy splices bytes: no frame parsing,
-re-masking or reassembly; subprotocols and extensions pass end to end. If
-any rule reads `ws.*`, every message is checked
-([message rules](/reference/websockets#message-rules)). Either way:
+If no rule reads a `ws.*` field, roxy passes the bytes through as they
+are. Either way:
 
-- Relayed bytes count towards `request_bytes` and `response_bytes` metrics
-  as they flow; a byte-budget deny closes a WebSocket mid-stream (the byte
-  splice at the transport, message rules with a `1008` close frame first).
-- Each chunk waits for the flow log ([audit backpressure](/reference/flow-log#writing));
-  capture records both directions as relayed.
-- [Addon layers](/reference/addon-configuration#websockets) sit between the
-  client and the relay, so message rules and capture see what the layers
-  pass on, not what a layer changes on the way to the client.
-- A relayed WebSocket with no traffic either way for `limits.idle_timeout`
-  (1 h) is closed with a `1001` close frame to both sides (`close_reason`
-  `idle timeout`).
-- The flow log gets one `ws_open` (naming the `host`) and one `ws_close`
-  with `bytes_c2s` and `bytes_s2c`, plus `close_code` and `close_reason`
-  when roxy ended it with a close frame. The exchange's `request` event
-  follows, with `res.status: 101` and the relayed byte totals as its
-  `body_bytes`.
-
-WebSockets over HTTP/2 (RFC 8441 extended CONNECT) are not supported;
-clients must use a separate HTTP/1.1 connection for WebSockets. This
-restriction concerns the HTTP version, not TLS: `wss://` over HTTP/1.1 is
-supported, including through addon layers.
+- WebSocket bytes count towards byte metrics, so a byte limit can close a
+  WebSocket.
+- Capture records both directions.
+- Addons sit between the client and the relay, so rules and capture see
+  what the addons pass on.
+- A WebSocket with no traffic for `limits.idle_timeout` (1 h) is closed.
+- The flow log records `ws_open` and `ws_close`, with byte counts.
 
 ## Extensions
 
-A compressed message (`permessage-deflate`) cannot be read without the
-compression state of every message before it, so when something reads the
-messages roxy removes `Sec-WebSocket-Extensions` from the upgrade request
-and refuses with `502` a `101` that accepts an extension anyway. That is
-when a rule reads `ws.*`, or an addon layer runs on the upgrade request
-(its `when` matched) with `http.decode_for_addons` on (the default;
-[addons](/reference/addon-configuration#content-codings)). Otherwise the
-client's offer and the upstream's answer pass through untouched.
+A compressed WebSocket message cannot be read on its own, so when
+anything needs to read messages, roxy removes the client's offer of
+compression. That is when a rule reads `ws.*`, or when an addon runs on
+the upgrade and decodes bodies (the default;
+[addons](/reference/addon-configuration#content-codings)). Otherwise
+extensions pass through.
 
 ## Message rules
 
-Rules that read `ws.*` are in-flight rules
-([evaluation](/design/policy-evaluation)), checked on every message after
-the `101`:
+Rules that read `ws.*` are checked on every message after the upgrade:
 
 ```yaml
 rules:
@@ -93,43 +63,27 @@ rules:
 | `ws.direction` | `c2s` (client to upstream) or `s2c` |
 | `ws.opcode` | 1 text, 2 binary, 8 close, 9 ping, 10 pong |
 | `ws.size` | payload length in bytes |
-| `ws.text` | a text message's text; `null` for every other opcode |
+| `ws.text` | a text message's text; `null` for other messages |
 
-`==`, `!=`, `in` and `not in` treat `null` as an ordinary value; any other
-operator on it fails closed
-([missing values](/reference/rule-language#missing-values-null)), so guard
-text rules with `ws.opcode == 1 and ...` or the first ping closes the
-WebSocket. Control messages (close, ping, pong) are checked like data
-messages: `ws.opcode == 2` denies binary messages, while `ws.opcode != 1`
-also denies every ping.
+`ws.text` is `null` for pings and other control messages, so start text
+rules with `ws.opcode == 1 and ...`
+([missing values](/reference/rule-language#missing-values-null)).
+Otherwise the first ping closes the WebSocket.
 
-A matching deny closes both sides with `1008`. A rule cannot drop or edit a
-single message (that is for addons). An in-flight rule's `log`, `tag` and
-`set_state` effects apply once per WebSocket, the first time it matches.
+A matching deny closes both sides with code `1008`. Rules cannot drop or
+change a single message; that needs an addon.
 
 ### Parsing
 
-With message rules, roxy:
-
-- negotiates no extension ([above](/reference/websockets#extensions));
-- decodes each direction strictly (RFC 6455 §5): RSV bits zero, known
-  opcodes, client frames masked and server frames not, shortest length
-  encoding, control frames unfragmented and at most 125 bytes, a close
-  frame with a valid code and a UTF-8 reason and nothing after it;
-- reassembles a fragmented message before checking it, up to
-  `limits.max_ws_message_bytes` (16 MiB); a control frame inside a
-  fragmented message is checked and relayed on its own;
-- checks that a text message is UTF-8;
-- re-encodes each relayed message as one unfragmented frame, masked toward
-  the upstream with its own random key.
-
-A protocol error closes both sides with its code: `1002` framing, `1007`
-invalid UTF-8, `1009` over the limit. A message is relayed only once
-complete.
+With message rules, roxy checks each message strictly against the
+WebSocket spec, reassembles fragmented messages up to
+`limits.max_ws_message_bytes` (16 MiB), and checks that text is valid
+UTF-8. It forwards each message once it is complete, as a single frame.
+A protocol error closes both sides with `1002`, `1007` for invalid UTF-8,
+or `1009` for a message over the limit.
 
 ### Logging
 
-A denied message is logged as `ws_message` with its `direction`, `opcode`,
-`size`, `decision` and the `rules` that matched.
-`log.flow.ws_message_every: N` also logs every Nth checked message of each
-WebSocket (`0`, the default: denied only). Payloads are never logged.
+A denied message is logged as a `ws_message` event. With
+`log.flow.ws_message_every: N`, every Nth message is logged as well.
+Message contents are never logged.
