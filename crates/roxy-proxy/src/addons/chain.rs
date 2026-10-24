@@ -227,11 +227,20 @@ pub(crate) struct Chain {
     /// torn down, for `why`.
     torn: CancellationToken,
     torn_why: OnceLock<&'static str>,
-    /// The first lane a layer cut of its own accord: the record's reason.
-    abort: OnceLock<&'static str>,
-    client_gone: AtomicBool,
-    /// Provisional fallback; a later observed client loss takes precedence.
-    upstream_abandoned: AtomicBool,
+    /// What happened to the exchange that its record is made from, in the
+    /// order it happened. Read once the exchange is over.
+    events: Mutex<Vec<Event>>,
+}
+
+/// A fact the flow's record is derived from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Event {
+    /// A layer cut a lane it produces of its own accord.
+    Aborted(&'static str),
+    /// The client edge saw the client go.
+    ClientGone,
+    /// The upstream work was cancelled because nothing waited for it.
+    UpstreamAbandoned,
 }
 
 /// The client edge's ends: it produces `req[0]` and consumes `res[0]`.
@@ -296,9 +305,7 @@ impl Chain {
             tasks,
             torn: CancellationToken::new(),
             torn_why: OnceLock::new(),
-            abort: OnceLock::new(),
-            client_gone: AtomicBool::new(false),
-            upstream_abandoned: AtomicBool::new(false),
+            events: Mutex::new(Vec::new()),
         });
         let ends = |dir| -> (Vec<Option<LaneTx>>, Vec<Option<LaneRx>>) {
             (0..=layers)
@@ -426,26 +433,36 @@ impl Chain {
         self.tasks.spawn(future)
     }
 
+    fn note(&self, event: Event) {
+        lock(&self.events).push(event);
+    }
+
+    fn noted(&self, event: Event) -> bool {
+        lock(&self.events).contains(&event)
+    }
+
     /// The first layer-initiated request or response abort, if any.
     pub(crate) fn abort_reason(&self) -> Option<&'static str> {
-        self.abort.get().copied()
+        lock(&self.events).iter().find_map(|e| match e {
+            Event::Aborted(why) => Some(*why),
+            Event::ClientGone | Event::UpstreamAbandoned => None,
+        })
     }
 
     pub(super) fn upstream_abandoned(&self) {
-        self.upstream_abandoned.store(true, Ordering::Relaxed);
+        self.note(Event::UpstreamAbandoned);
     }
 
     /// Observed cancellation, falling back to upstream abandonment only
     /// when no transport cancellation explains the unfinished work.
     pub(super) fn cancellation(&self) -> Option<Cancellation> {
-        self.client_gone
-            .load(Ordering::Acquire)
-            .then_some(Cancellation::ClientGone)
-            .or_else(|| {
-                self.upstream_abandoned
-                    .load(Ordering::Relaxed)
-                    .then_some(Cancellation::UpstreamAbandoned)
-            })
+        if self.noted(Event::ClientGone) {
+            Some(Cancellation::ClientGone)
+        } else if self.noted(Event::UpstreamAbandoned) {
+            Some(Cancellation::UpstreamAbandoned)
+        } else {
+            None
+        }
     }
 
     /// The layer whose own answer reached the client, if a layer's did.
@@ -468,7 +485,7 @@ impl Chain {
                 return false;
             }
             if let Some(why) = abort {
-                let _ = self.abort.set(why);
+                self.note(Event::Aborted(why));
             }
             slot.state = to;
         }
@@ -718,7 +735,7 @@ impl Chain {
     /// are cut or stopped. Driver cancellation does not depend on either.
     pub(crate) fn tear_down(&self, why: &'static str) {
         if why == super::CLIENT_GONE {
-            self.client_gone.store(true, Ordering::Release);
+            self.note(Event::ClientGone);
         }
         let _ = self.torn_why.set(why);
         self.torn.cancel();
