@@ -32,3 +32,24 @@ with the same reason.
 | `--ws-text`, `--ws-opcode`, `--ws-size`, `--ws-direction` | one WebSocket message |
 
 `roxy rule test --help` lists every flag.
+
+## Trialling a rule on live traffic
+
+To find out what a new `deny` rule would block before you turn it on, give
+it the same `when` but only `tag` and `log` actions:
+
+```yaml
+  - id: trial-no-gists
+    when: host == "gist.github.com"
+    then:
+      - tag: trial-no-gists
+      - log: { level: warn, message: "trial-no-gists would deny" }
+```
+
+A rule with no `allow`, `deny` or `quarantine` does not change the
+decision: other rules still decide the request. When the trial rule
+matches, the request's flow log entry lists it under `rules` and `tags`,
+and a `log` event is written beside it. Because a matching `deny` always
+wins, every request the trial rule matches is one the real rule would have
+refused. When you are happy with what it catches, replace the `tag` and
+`log` with `deny`.
