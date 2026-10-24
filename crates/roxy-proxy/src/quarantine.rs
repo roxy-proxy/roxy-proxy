@@ -35,9 +35,8 @@ pub enum QuarantineCause {
         call: Option<u64>,
     },
     /// A secret the exchange injected came back in its response, under
-    /// `http.redact_response_secrets.quarantine`. `part` is `headers`,
-    /// `body` or `trailers`.
-    SecretInResponse { flow: String, part: String },
+    /// `http.redact_response_secrets.quarantine`.
+    SecretInResponse { flow: String, part: ResponsePart },
     /// A listener's parse-error threshold was reached.
     Threshold {
         listener: String,
@@ -45,6 +44,15 @@ pub enum QuarantineCause {
         count: u32,
         window_seconds: u64,
     },
+}
+
+/// The part of a response a secret was found in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsePart {
+    Headers,
+    Body,
+    Trailers,
 }
 
 /// One quarantine incident. `id` is minted here per trip; a release names

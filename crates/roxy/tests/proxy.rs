@@ -48,7 +48,7 @@ async fn allow_get_end_to_end() {
     assert_eq!(e["terminal_rule"], "upstream");
     assert_eq!(e["res"]["status"], 200);
     assert_eq!(e["tls"]["sni"], "upstream.test");
-    assert_eq!(e["req"]["query"], "x=******");
+    assert_eq!(e["req"]["query"], "x=[REDACTED]");
     assert!(e["res"]["body_bytes"].as_u64().unwrap() > 0);
     h.stop().await;
 }

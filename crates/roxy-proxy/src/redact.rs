@@ -26,7 +26,7 @@ use roxy_http::{Body, BodyError, CanonicalRequest, CanonicalResponse, Headers};
 use crate::config::ResponseRedaction;
 use crate::needles::{MASK, Needles};
 use crate::pipeline::{FlowCx, response_known_empty};
-use crate::quarantine::QuarantineCause;
+use crate::quarantine::{QuarantineCause, ResponsePart as Part};
 use crate::server::Shared;
 
 /// The values this exchange's response is masked for: those its own
@@ -115,24 +115,6 @@ fn mask_value(needles: &Needles, v: &HeaderValue) -> Option<HeaderValue> {
     Some(HeaderValue::from_bytes(&b).expect("a masked header value stays valid"))
 }
 
-/// The part of a response a secret was found in.
-#[derive(Debug, Clone, Copy)]
-enum Part {
-    Headers,
-    Body,
-    Trailers,
-}
-
-impl Part {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Headers => "headers",
-            Self::Body => "body",
-            Self::Trailers => "trailers",
-        }
-    }
-}
-
 /// Reports a secret found in a response, and quarantines the process
 /// when `http.redact_response_secrets.quarantine` is on.
 struct Alarm {
@@ -142,11 +124,11 @@ struct Alarm {
 
 impl Alarm {
     fn raise(&self, part: Part) {
-        tracing::warn!(flow = %self.flow, part = part.as_str(), "injected secret found in the response; masked");
+        tracing::warn!(flow = %self.flow, ?part, "injected secret found in the response; masked");
         if let Some(shared) = &self.shared {
             shared.trip_quarantine(QuarantineCause::SecretInResponse {
                 flow: self.flow.clone(),
-                part: part.as_str().to_owned(),
+                part,
             });
         }
     }

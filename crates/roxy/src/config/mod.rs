@@ -255,17 +255,18 @@ pub struct RedactResponseSecrets {
     pub bodies: bool,
     /// Quarantine the process when a scrubbed part held a secret.
     pub quarantine: bool,
-    /// Values shorter than this many bytes are not masked. Default 8.
+    /// Values shorter than this many bytes are not masked.
     pub min_length: usize,
 }
 
 impl Default for RedactResponseSecrets {
     fn default() -> Self {
+        let d = roxy_proxy::ResponseRedaction::default();
         Self {
-            headers: false,
-            bodies: false,
-            quarantine: false,
-            min_length: 8,
+            headers: d.headers,
+            bodies: d.bodies,
+            quarantine: d.quarantine,
+            min_length: d.min_length,
         }
     }
 }
