@@ -25,6 +25,7 @@ hyper = { version = "1.11.1", features = ["client", "server", "http1", "http2"] 
 hyper-util = { version = "0.1.21", features = ["client-legacy", "tokio", "http1", "http2"] }
 ring.workspace = true
 ipnet.workspace = true
+memchr = "2.8.3"
 roxy-http.workspace = true
 roxy-log.workspace = true
 roxy-rules.workspace = true

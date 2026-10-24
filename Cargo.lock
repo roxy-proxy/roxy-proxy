@@ -3062,6 +3062,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "ipnet",
+ "memchr",
  "proptest",
  "ring",
  "roxy-http",

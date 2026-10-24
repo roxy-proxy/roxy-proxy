@@ -35,6 +35,8 @@
 //!   backpressure, rotation).
 //! - [`io`]: stream adapters.
 //! - `budget`: the process-wide byte budget for per-exchange buffers.
+//! - `redact`: scrubbing injected secrets from a response, head and
+//!   streaming body.
 
 pub mod addons;
 pub mod addr;
@@ -54,6 +56,7 @@ pub mod io;
 pub mod listener;
 mod pipeline;
 pub mod quarantine;
+mod redact;
 pub mod secrets;
 pub mod server;
 mod sign;

@@ -563,6 +563,9 @@ pub(crate) struct FlowCx {
     /// A `sign` effect of the admission decision, applied once every other
     /// request change has settled.
     pub sign: Option<AwsSigV4>,
+    /// An admission effect put a secret into the forwarded request: a
+    /// `set_header` value from one, or `sign`.
+    pub injected_secret: bool,
     /// Request body bytes forwarded so far (and their digest once the
     /// body completed), once the request is on its way.
     pub request_tally: Option<Arc<crate::body::Tally>>,
@@ -710,6 +713,7 @@ impl FlowCx {
             taps: PerDir::default(),
             host_override: None,
             sign: None,
+            injected_secret: false,
             request_tally: None,
             request_delivery: None,
             tasks: {
@@ -1199,6 +1203,12 @@ fn request_rules(cx: &mut FlowCx, mut req: CanonicalRequest) -> Verdict {
     if let Some(r) = refusal {
         return Verdict::Deny(r);
     }
+    if cx.injected_secret && cx.snap.http.redact_response_secrets.bodies {
+        // A body roxy scrubs must arrive in a coding it can read: asking
+        // for none leaves only an upstream that ignores the request to be
+        // decoded or refused.
+        req.headers.remove("accept-encoding");
+    }
     settle_request_facts(cx, &req);
     Verdict::Continue(req)
 }
@@ -1365,6 +1375,7 @@ fn apply_request_effect(
             req.headers
                 .insert(&name, value.as_str())
                 .map_err(|e| invalid(kind, &e))?;
+            cx.injected_secret |= value.is_from_secret();
             cx.record.mutations.push(format!("set_header:{name}"));
         }
         Effect::RemoveHeader(name) => {
@@ -1437,6 +1448,7 @@ fn apply_request_effect(
             if cx.sign.replace(spec).is_some() {
                 return Err(Refusal::fail_closed("sign_conflict"));
             }
+            cx.injected_secret = true;
         }
     }
     Ok(())
@@ -1525,7 +1537,7 @@ async fn inspect_response_body(
 
 /// A response with no body by its status, its framing, or because the
 /// request was a `HEAD`.
-fn response_known_empty(cx: &FlowCx, res: &CanonicalResponse) -> bool {
+pub(crate) fn response_known_empty(cx: &FlowCx, res: &CanonicalResponse) -> bool {
     status_forbids_body(res.status)
         || cx
             .facts

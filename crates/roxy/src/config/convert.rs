@@ -6,10 +6,10 @@
 use ipnet::IpNet;
 use roxy_http::url::parse_host;
 use roxy_http::{Host, HttpFlags, Limits};
-use roxy_proxy::{HttpBehaviour, ResponseRedaction};
 use roxy_proxy::addr::AddressPolicy;
 use roxy_proxy::addrlist::normalise_net;
 use roxy_proxy::{DnsSettings, UpstreamSettings};
+use roxy_proxy::{HttpBehaviour, ResponseRedaction};
 use roxy_tls::{MinTlsVersion, UpstreamTlsOptions};
 
 use super::{Config, Resolver, Startup, TlsVersion, UpstreamVerify};

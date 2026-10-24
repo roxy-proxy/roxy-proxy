@@ -785,6 +785,9 @@ async fn forward<F: ClientTransport>(
     let res = from_upstream_response(res, &cx.snap.limits);
     match response_steps(cx, res, transport).await {
         ResponseVerdict::Continue(mut res) => {
+            if let Err(r) = crate::redact::response(cx, &mut res) {
+                return Outcome::Refuse(r);
+            }
             let mut down_tap = down_tap;
             if let Some(t) = down_tap.as_mut() {
                 t.response_head(&res);

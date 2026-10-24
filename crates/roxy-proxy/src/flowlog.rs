@@ -832,38 +832,53 @@ impl Redactor {
     /// Replace every occurrence of a registered secret in `s` with
     /// [`REDACTED`]. Overlapping occurrences are merged into one marker.
     pub fn redact_str<'a>(&self, s: &'a str) -> Cow<'a, str> {
+        match self.redact_bytes(s.as_bytes()) {
+            Cow::Borrowed(_) => Cow::Borrowed(s),
+            // A secret is whole UTF-8, so in UTF-8 text it matches only on
+            // char boundaries, and the marker is ASCII.
+            Cow::Owned(b) => Cow::Owned(
+                String::from_utf8(b).expect("redacting UTF-8 on char boundaries keeps it UTF-8"),
+            ),
+        }
+    }
+
+    /// [`Redactor::redact_str`] over bytes.
+    pub fn redact_bytes<'a>(&self, b: &'a [u8]) -> Cow<'a, [u8]> {
+        let ranges = self.secret_ranges(b);
+        if ranges.is_empty() {
+            return Cow::Borrowed(b);
+        }
+        Cow::Owned(replace_ranges(b, &ranges))
+    }
+
+    /// Where registered secrets occur in `b`, overlapping occurrences
+    /// merged, in order.
+    pub(crate) fn secret_ranges(&self, b: &[u8]) -> Vec<(usize, usize)> {
         let mut ranges: Vec<(usize, usize)> = Vec::new();
         for secret in &self.secrets {
-            // Find every start position, including overlapping ones.
+            let finder = memchr::memmem::Finder::new(secret.as_bytes());
+            // Every start position, overlapping ones included.
             let mut from = 0;
-            while let Some(i) = s[from..].find(secret.as_str()) {
+            while let Some(i) = finder.find(&b[from..]) {
                 let start = from + i;
                 ranges.push((start, start + secret.len()));
-                // Advance by one char so overlapping matches are found.
-                from = start + s[start..].chars().next().map_or(1, char::len_utf8);
+                from = start + 1;
             }
-        }
-        if ranges.is_empty() {
-            return Cow::Borrowed(s);
         }
         ranges.sort_unstable();
-        let mut out = String::with_capacity(s.len());
-        let mut pos = 0;
-        let mut iter = ranges.into_iter().peekable();
-        while let Some((start, mut end)) = iter.next() {
-            while let Some(&(next_start, next_end)) = iter.peek() {
-                if next_start > end {
-                    break;
-                }
-                end = end.max(next_end);
-                iter.next();
+        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => last.1 = last.1.max(end),
+                _ => merged.push((start, end)),
             }
-            out.push_str(&s[pos..start]);
-            out.push_str(REDACTED);
-            pos = end;
         }
-        out.push_str(&s[pos..]);
-        Cow::Owned(out)
+        merged
+    }
+
+    /// The length of the longest registered secret; 0 with none.
+    pub(crate) fn longest_secret(&self) -> usize {
+        self.secrets.iter().map(String::len).max().unwrap_or(0)
     }
 
     /// The loggable form of a header value: [`REDACTED`] for redacted header
@@ -890,6 +905,19 @@ impl Redactor {
             other @ (Value::Null | Value::Bool(_) | Value::Number(_)) => other,
         }
     }
+}
+
+/// `b` with each of `ranges` (sorted, disjoint) replaced by [`REDACTED`].
+pub(crate) fn replace_ranges(b: &[u8], ranges: &[(usize, usize)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(b.len());
+    let mut pos = 0;
+    for &(start, end) in ranges {
+        out.extend_from_slice(&b[pos..start]);
+        out.extend_from_slice(REDACTED.as_bytes());
+        pos = end;
+    }
+    out.extend_from_slice(&b[pos..]);
+    out
 }
 
 #[cfg(test)]
