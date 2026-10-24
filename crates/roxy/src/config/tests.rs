@@ -690,7 +690,7 @@ fn uses_quarantine_sees_every_trigger() {
 }
 
 /// `quarantine` finds secrets only in the parts it scrubs, so on its own
-/// it would never fire.
+/// it would never fire; a `min_length` of 0 would mask nothing useful.
 #[test]
 fn redaction_quarantine_needs_a_part_to_scrub() {
     let d = diagnostics(&format!(
@@ -698,6 +698,10 @@ fn redaction_quarantine_needs_a_part_to_scrub() {
     ));
     assert_eq!(d.len(), 1, "{d:?}");
     assert_eq!(d[0].path, "http.redact_response_secrets.quarantine");
+    let d = diagnostics(&format!(
+        "{BASE}http: {{ redact_response_secrets: {{ bodies: true, min_length: 0 }} }}\n"
+    ));
+    assert_eq!(d[0].path, "http.redact_response_secrets.min_length");
     for part in ["headers", "bodies"] {
         parse(&format!(
             "{BASE}http: {{ redact_response_secrets: {{ {part}: true, quarantine: true }} }}\n"

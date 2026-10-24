@@ -248,13 +248,26 @@ pub struct Http {
 }
 
 /// `http.redact_response_secrets`: which parts of a response are scrubbed.
-#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct RedactResponseSecrets {
     pub headers: bool,
     pub bodies: bool,
     /// Quarantine the process when a scrubbed part held a secret.
     pub quarantine: bool,
+    /// Values shorter than this many bytes are not masked. Default 8.
+    pub min_length: usize,
+}
+
+impl Default for RedactResponseSecrets {
+    fn default() -> Self {
+        Self {
+            headers: false,
+            bodies: false,
+            quarantine: false,
+            min_length: 8,
+        }
+    }
 }
 
 impl Default for Http {

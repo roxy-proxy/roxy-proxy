@@ -33,6 +33,7 @@ http:
     headers: false
     bodies: false
     quarantine: false         # quarantine the process when a scrubbed part held a secret
+    min_length: 8             # injected values shorter than this are not masked
 
 limits:
   max_header_bytes: 64kb

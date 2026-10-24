@@ -148,7 +148,7 @@ Four things trip it:
 - an injected secret found in a response, under
   `http.redact_response_secrets.quarantine`
   ([secrets](/reference/secrets#redacting-responses)): the value is
-  scrubbed from what is sent, and the proxy is quarantined.
+  masked in what is sent, and the proxy is quarantined.
 
 While quarantined, every request is refused with `403`, `terminal_rule:
 _quarantined` and reason `quarantined`, before the addons and the rules, and

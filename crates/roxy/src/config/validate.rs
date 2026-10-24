@@ -233,6 +233,12 @@ impl Config {
                 "needs `headers` or `bodies`: a secret is only found in a part roxy scrubs",
             ));
         }
+        if r.min_length == 0 {
+            d.push(Diagnostic::new(
+                "http.redact_response_secrets.min_length",
+                "must be at least 1",
+            ));
+        }
     }
 
     fn validate_addons(&self, d: &mut Vec<Diagnostic>) {

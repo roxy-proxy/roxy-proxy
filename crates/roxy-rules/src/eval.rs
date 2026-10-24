@@ -288,6 +288,8 @@ impl fmt::Display for Deny {
 pub struct SetHeaderValue {
     text: String,
     from_secret: bool,
+    /// The secret values substituted into `text`.
+    secrets: Vec<String>,
 }
 
 impl SetHeaderValue {
@@ -296,14 +298,16 @@ impl SetHeaderValue {
         Self {
             text: text.into(),
             from_secret: false,
+            secrets: Vec::new(),
         }
     }
 
-    /// A value with a secret substituted into it.
-    pub fn from_secret(text: impl Into<String>) -> Self {
+    /// A value with `secrets`, their values, substituted into it.
+    pub fn from_secrets(text: impl Into<String>, secrets: Vec<String>) -> Self {
         Self {
             text: text.into(),
             from_secret: true,
+            secrets,
         }
     }
 
@@ -314,6 +318,11 @@ impl SetHeaderValue {
     /// Whether a secret was substituted into the value.
     pub fn is_from_secret(&self) -> bool {
         self.from_secret
+    }
+
+    /// The secret values substituted into the value, in template order.
+    pub fn secrets(&self) -> &[String] {
+        &self.secrets
     }
 }
 

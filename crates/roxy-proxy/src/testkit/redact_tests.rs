@@ -1,6 +1,7 @@
 //! `http.redact_response_secrets`: an upstream that echoes an injected
-//! secret hands the client the marker, not the value, in whichever parts
-//! are switched on, and only on exchanges that injected one.
+//! secret hands the client a mask of the same length, not the value, in
+//! whichever parts are switched on, and only on exchanges that injected
+//! that value.
 
 use std::io::Write as _;
 
@@ -11,6 +12,8 @@ use super::{AddonDef, Answer, Client, Kit};
 use crate::config::ResponseRedaction;
 
 const SECRET: &str = "s3cr3t-token-value-0123456789";
+/// [`SECRET`] masked.
+const MASKED: &str = "*****************************";
 
 const RULES: &str = r#"
 - id: inject
@@ -36,6 +39,7 @@ const BOTH: ResponseRedaction = ResponseRedaction {
     headers: true,
     bodies: true,
     quarantine: false,
+    min_length: 8,
 };
 
 fn gzip(b: &[u8]) -> Vec<u8> {
@@ -67,8 +71,9 @@ async fn a_reflected_secret_is_scrubbed_from_the_head_and_the_body() {
         };
         let a = c.call("GET", "/reflect", &[], b"").await;
         assert_eq!(a.status, 200, "h2 {h2}: {a:?}");
-        assert_eq!(a.headers["x-reflect"], "Bearer [REDACTED]", "h2 {h2}");
-        assert_eq!(body(&a), "Bearer [REDACTED]", "h2 {h2}");
+        let masked = format!("Bearer {MASKED}");
+        assert_eq!(a.headers["x-reflect"], masked.as_str(), "h2 {h2}");
+        assert_eq!(body(&a), masked, "h2 {h2}");
     }
     let seen = kit.upstream.wait_seen(2).await;
     assert_eq!(seen[0].headers["authorization"], format!("Bearer {SECRET}"));
@@ -81,25 +86,21 @@ async fn headers_and_bodies_switch_separately() {
         let kit = kit(ResponseRedaction {
             headers,
             bodies,
-            quarantine: false,
+            ..BOTH
         })
         .await;
         let a = kit.h1().await.call("GET", "/reflect", &[], b"").await;
         let scrubbed = |on: bool| {
             if on {
-                "Bearer [REDACTED]".to_owned()
+                format!("Bearer {MASKED}")
             } else {
                 format!("Bearer {SECRET}")
             }
         };
         assert_eq!(a.headers["x-reflect"], scrubbed(headers).as_str());
         assert_eq!(body(&a), scrubbed(bodies));
-        // Only a scrubbed body loses its declared length.
-        assert_eq!(
-            a.headers.contains_key("content-length"),
-            !bodies,
-            "{headers} {bodies}: {a:?}"
-        );
+        // Masking keeps the body's length.
+        assert!(a.headers.contains_key("content-length"), "{a:?}");
     }
 }
 
@@ -127,7 +128,7 @@ async fn an_encoded_body_is_decoded_then_scrubbed() {
     .await;
     assert_eq!(a.status, 200, "{a:?}");
     assert!(!a.headers.contains_key("content-encoding"), "{a:?}");
-    assert_eq!(body(&a), "before [REDACTED] after");
+    assert_eq!(body(&a), format!("before {MASKED} after"));
     let seen = kit.upstream.wait_seen(1).await;
     assert!(
         !seen[0].headers.contains_key("accept-encoding"),
@@ -184,7 +185,8 @@ async fn a_plain_range_is_scrubbed() {
     )
     .await;
     assert_eq!(a.status, 206, "{a:?}");
-    assert_eq!(body(&a), "[[REDACTED]]");
+    assert_eq!(body(&a), format!("[{MASKED}]"));
+    assert!(a.headers.contains_key("content-length"), "{a:?}");
 }
 
 /// Layers downstream of the core see the scrubbed response, and the
@@ -200,8 +202,9 @@ async fn the_addon_stack_sees_the_scrubbed_response() {
         .await;
     let a = kit.h1().await.call("GET", "/reflect", &[], b"").await;
     assert_eq!(a.status, 200, "{a:?}");
-    assert_eq!(a.headers["x-reflect"], "Bearer [REDACTED]");
-    assert_eq!(body(&a), "Bearer [REDACTED]");
+    let masked = format!("Bearer {MASKED}");
+    assert_eq!(a.headers["x-reflect"], masked.as_str());
+    assert_eq!(body(&a), masked);
 }
 
 /// With `quarantine`, a secret in the head refuses the exchange that found
@@ -256,4 +259,31 @@ async fn nothing_logged_holds_the_secret() {
     kit.request_event().await;
     let all = serde_json::to_string(&kit.sink.events()).unwrap();
     assert!(!all.contains(SECRET), "secret leaked into the flow log");
+}
+
+/// A value shorter than `min_length` is left alone, and so is a secret
+/// this exchange did not inject.
+#[tokio::test]
+async fn only_injected_values_of_min_length_are_masked() {
+    let kit = Kit::builder()
+        .secret("token", SECRET)
+        .secret("short", "abc123")
+        .secret("other", "an-unrelated-secret-value")
+        .rules(
+            r#"
+- id: inject
+  when: host == "up.test"
+  then:
+    - set_header: { authorization: "${secret:token} ${secret:short}" }
+    - allow
+"#,
+        )
+        .http(|h| h.redact_response_secrets = BOTH)
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+    let a = post(&mut c, "/echo", &[], b"an-unrelated-secret-value".to_vec()).await;
+    assert_eq!(body(&a), "an-unrelated-secret-value");
+    let a = kit.h1().await.call("GET", "/reflect", &[], b"").await;
+    assert_eq!(body(&a), format!("{MASKED} abc123"));
 }

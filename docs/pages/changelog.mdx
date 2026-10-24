@@ -6,7 +6,7 @@ come first. Each release's GitHub page lists every merged pull request.
 
 ## Unreleased
 
-The request trailers a service layer passes on are validated as a client's before they reach an origin, captures are written as JSON lines for line-oriented shippers, and injected secrets can be scrubbed from the responses of the exchanges that injected them.
+The request trailers a service layer passes on are validated as a client's before they reach an origin, captures are written as JSON lines for line-oriented shippers, and injected secrets can be masked in the responses of the exchanges that injected them.
 
 <details>
 <summary>Details</summary>
@@ -18,7 +18,7 @@ The request trailers a service layer passes on are validated as a client's befor
 
 ### Added
 
-- `http.redact_response_secrets` scrubs injected secret values from the response head and trailers (`headers`) and from the body as it streams (`bodies`), on exchanges that injected a secret. With `bodies`, those requests go out without `accept-encoding`, and a response roxy cannot decode is refused `unsupported_content_encoding`. `quarantine: true` quarantines the process when a scrubbed part held a secret, with the new cause `secret_in_response` ([#576](https://github.com/roxy-proxy/roxy-proxy/issues/576)).
+- `http.redact_response_secrets` masks the secret values an exchange's `set_header` effects injected, byte for byte with `*`, in the response head and trailers (`headers`) and in the body as it streams (`bodies`). Values under `min_length` bytes (default 8) are left alone. With `bodies`, those requests go out without `accept-encoding`, and a response roxy cannot decode is refused `unsupported_content_encoding`. `quarantine: true` quarantines the process when a masked part held a secret, with the new cause `secret_in_response` ([#576](https://github.com/roxy-proxy/roxy-proxy/issues/576)).
 
 ### Fixed
 

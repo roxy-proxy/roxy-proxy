@@ -924,7 +924,7 @@ impl Redactor {
 }
 
 /// `b` with each of `ranges` (sorted, disjoint) replaced by [`REDACTED`].
-pub(crate) fn replace_ranges(b: &[u8], ranges: &[(usize, usize)]) -> Vec<u8> {
+fn replace_ranges(b: &[u8], ranges: &[(usize, usize)]) -> Vec<u8> {
     let mut out = Vec::with_capacity(b.len());
     let mut pos = 0;
     for &(start, end) in ranges {

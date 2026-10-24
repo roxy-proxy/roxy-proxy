@@ -563,9 +563,9 @@ pub(crate) struct FlowCx {
     /// A `sign` effect of the admission decision, applied once every other
     /// request change has settled.
     pub sign: Option<AwsSigV4>,
-    /// An admission effect put a secret into the forwarded request: a
-    /// `set_header` value from one, or `sign`.
-    pub injected_secret: bool,
+    /// The secret values `set_header` effects put into the forwarded
+    /// request: what an upstream could echo that the client never held.
+    pub injected: Vec<String>,
     /// Request body bytes forwarded so far (and their digest once the
     /// body completed), once the request is on its way.
     pub request_tally: Option<Arc<crate::body::Tally>>,
@@ -713,7 +713,7 @@ impl FlowCx {
             taps: PerDir::default(),
             host_override: None,
             sign: None,
-            injected_secret: false,
+            injected: Vec::new(),
             request_tally: None,
             request_delivery: None,
             tasks: {
@@ -1203,7 +1203,8 @@ fn request_rules(cx: &mut FlowCx, mut req: CanonicalRequest) -> Verdict {
     if let Some(r) = refusal {
         return Verdict::Deny(r);
     }
-    if cx.injected_secret && cx.snap.http.redact_response_secrets.bodies {
+    let redaction = cx.snap.http.redact_response_secrets;
+    if redaction.bodies && cx.injected.iter().any(|v| v.len() >= redaction.min_length) {
         // A body roxy scrubs must arrive in a coding it can read: asking
         // for none leaves only an upstream that ignores the request to be
         // decoded or refused.
@@ -1375,7 +1376,7 @@ fn apply_request_effect(
             req.headers
                 .insert(&name, value.as_str())
                 .map_err(|e| invalid(kind, &e))?;
-            cx.injected_secret |= value.is_from_secret();
+            cx.injected.extend_from_slice(value.secrets());
             cx.record.mutations.push(format!("set_header:{name}"));
         }
         Effect::RemoveHeader(name) => {
@@ -1448,7 +1449,6 @@ fn apply_request_effect(
             if cx.sign.replace(spec).is_some() {
                 return Err(Refusal::fail_closed("sign_conflict"));
             }
-            cx.injected_secret = true;
         }
     }
     Ok(())

@@ -41,7 +41,7 @@
 //! redactor, so an injected secret value (which the agent never saw) is
 //! scrubbed wherever it appears. Bodies are captured as they are
 //! forwarded: unredacted, except a response body that
-//! `http.redact_response_secrets` scrubbed on its way out.
+//! `http.redact_response_secrets` masked on its way out.
 
 use std::fmt::Write as _;
 use std::io;

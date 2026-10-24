@@ -110,9 +110,9 @@ pub struct HttpBehaviour {
     pub redact_response_secrets: ResponseRedaction,
 }
 
-/// Which parts of a response the exchange's secret values are scrubbed
-/// from, on an exchange that injected one. Both off by default.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Which parts of a response the exchange's injected secret values are
+/// masked in. All off by default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResponseRedaction {
     /// The head's field values, and the trailers'.
     pub headers: bool,
@@ -120,6 +120,19 @@ pub struct ResponseRedaction {
     pub bodies: bool,
     /// Quarantine the process when a scrubbed part held a secret.
     pub quarantine: bool,
+    /// Values shorter than this many bytes are not masked.
+    pub min_length: usize,
+}
+
+impl Default for ResponseRedaction {
+    fn default() -> Self {
+        Self {
+            headers: false,
+            bodies: false,
+            quarantine: false,
+            min_length: 8,
+        }
+    }
 }
 
 impl Default for HttpBehaviour {

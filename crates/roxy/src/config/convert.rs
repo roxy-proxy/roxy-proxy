@@ -70,6 +70,7 @@ impl From<&Config> for HttpBehaviour {
                 headers: h.redact_response_secrets.headers,
                 bodies: h.redact_response_secrets.bodies,
                 quarantine: h.redact_response_secrets.quarantine,
+                min_length: h.redact_response_secrets.min_length,
             },
         }
     }

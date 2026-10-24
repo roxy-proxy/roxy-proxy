@@ -1,11 +1,13 @@
 //! Scrubbing injected secrets from a response on its way to the client
 //! (`http.redact_response_secrets`).
 //!
-//! Only an exchange that injected a secret is scrubbed: it is the one
-//! whose upstream holds a value the client was never given. The stage runs
-//! in the core, after the response rules and before the in-flight body
-//! checks, the capture tap and the addon layers, so everything downstream
-//! of the upstream sees the scrubbed response.
+//! An exchange scrubs the values its own `set_header` effects put into the
+//! request, and nothing else: those are what its upstream holds that the
+//! client was never given. Each occurrence is masked with [`MASK`] byte for
+//! byte, so lengths, `content-length` and byte ranges stay as the upstream
+//! sent them. The stage runs in the core, after the response rules and
+//! before the in-flight body checks, the capture tap and the addon layers,
+//! so everything downstream of the upstream sees the masked response.
 //!
 //! Matching is literal, so this stops a verbatim echo only: a value the
 //! upstream transforms (base64, escaping, a change of case) passes.
@@ -20,11 +22,13 @@ use http_body::Frame;
 use roxy_http::{Body, BodyError, CanonicalResponse, Headers, coding};
 
 use crate::config::ResponseRedaction;
-use crate::flowlog::{REDACTED, Redactor, replace_ranges};
+use crate::flowlog::Redactor;
 use crate::pipeline::{FlowCx, Refusal, response_known_empty};
 use crate::quarantine::QuarantineCause;
-use crate::secrets::Secrets;
 use crate::server::Shared;
+
+/// What each byte of a secret becomes.
+const MASK: u8 = b'*';
 
 /// Flow-log `reason` of a response whose body cannot be scrubbed: its
 /// content coding is one roxy does not decode, or it is a range of an
@@ -36,15 +40,28 @@ const UNDECODABLE: &str = "unsupported_content_encoding";
 /// rather than passed unscrubbed.
 pub(crate) fn response(cx: &FlowCx, res: &mut CanonicalResponse) -> Result<(), Refusal> {
     let switches = cx.snap.http.redact_response_secrets;
-    if !cx.injected_secret || !(switches.headers || switches.bodies) {
+    if !(switches.headers || switches.bodies) {
         return Ok(());
     }
+    // A short value would mask unrelated bytes wherever it happens to
+    // occur, so values under `min_length` are left alone.
+    let mut needles = Redactor::new();
+    for value in cx
+        .injected
+        .iter()
+        .filter(|v| v.len() >= switches.min_length)
+    {
+        needles.add_secret(value.clone());
+    }
+    if needles.longest_secret() == 0 {
+        return Ok(());
+    }
+    let needles = Arc::new(needles);
     let alarm = Alarm {
         shared: switches.quarantine.then(|| cx.shared.clone()),
         flow: cx.flow.to_string(),
     };
-    let secrets = cx.secrets().clone();
-    if switches.headers && redact_headers(secrets.redactor(), &mut res.headers) {
+    if switches.headers && mask_headers(&needles, &mut res.headers) {
         alarm.raise(Part::Headers);
     }
     if response_known_empty(cx, res) {
@@ -54,13 +71,13 @@ pub(crate) fn response(cx: &FlowCx, res: &mut CanonicalResponse) -> Result<(), R
         decode(cx, res)?;
     }
     let body = std::mem::take(&mut res.body);
-    res.body = RedactedBody::wrap(body, secrets, switches, alarm);
+    res.body = MaskedBody::wrap(body, needles, switches, alarm);
     Ok(())
 }
 
 /// Leaves `res`'s body as plain bytes: decoded by its `content-encoding`,
 /// or refused when it cannot be. A range of an encoded body cannot be
-/// decoded on its own; a range of a plain one is scrubbed as it is.
+/// decoded on its own; a range of a plain one is masked as it is.
 fn decode(cx: &FlowCx, res: &mut CanonicalResponse) -> Result<(), Refusal> {
     let codings =
         coding::content_codings(&res.headers).map_err(|_| Refusal::fail_closed(UNDECODABLE))?;
@@ -80,22 +97,29 @@ fn decode(cx: &FlowCx, res: &mut CanonicalResponse) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// Scrubs every value in `headers`; whether any held a secret.
-fn redact_headers(r: &Redactor, headers: &mut Headers) -> bool {
+/// Masks every byte of `b` inside `ranges`.
+fn mask(b: &mut [u8], ranges: &[(usize, usize)]) {
+    for &(start, end) in ranges {
+        b[start..end].fill(MASK);
+    }
+}
+
+/// Masks every value in `headers`; whether any held a secret.
+fn mask_headers(needles: &Redactor, headers: &mut Headers) -> bool {
     let mut found = false;
     headers.replace_values(|v| {
-        let new = redact_value(r, v)?;
+        let new = mask_value(needles, v)?;
         found = true;
         Some(new)
     });
     found
 }
 
-/// Scrubs every value in a trailer block; whether any held a secret.
-fn redact_trailers(r: &Redactor, trailers: &mut HeaderMap) -> bool {
+/// Masks every value in a trailer block; whether any held a secret.
+fn mask_trailers(needles: &Redactor, trailers: &mut HeaderMap) -> bool {
     let mut found = false;
     for v in trailers.values_mut() {
-        if let Some(new) = redact_value(r, v) {
+        if let Some(new) = mask_value(needles, v) {
             *v = new;
             found = true;
         }
@@ -103,18 +127,16 @@ fn redact_trailers(r: &Redactor, trailers: &mut HeaderMap) -> bool {
     found
 }
 
-/// `v` scrubbed, or `None` when it holds no secret.
-fn redact_value(r: &Redactor, v: &HeaderValue) -> Option<HeaderValue> {
-    let ranges = r.secret_ranges(v.as_bytes());
+/// `v` masked, or `None` when it holds no secret.
+fn mask_value(needles: &Redactor, v: &HeaderValue) -> Option<HeaderValue> {
+    let ranges = needles.secret_ranges(v.as_bytes());
     if ranges.is_empty() {
         return None;
     }
-    // The marker is visible ASCII and the bytes around it were already a
-    // valid value, so this cannot fail; the whole marker is the fallback.
-    Some(
-        HeaderValue::from_bytes(&replace_ranges(v.as_bytes(), &ranges))
-            .unwrap_or_else(|_| HeaderValue::from_static(REDACTED)),
-    )
+    let mut b = v.as_bytes().to_vec();
+    mask(&mut b, &ranges);
+    // A valid value with some bytes swapped for visible ASCII is valid.
+    Some(HeaderValue::from_bytes(&b).expect("a masked header value stays valid"))
 }
 
 /// The part of a response a secret was found in.
@@ -144,7 +166,7 @@ struct Alarm {
 
 impl Alarm {
     fn raise(&self, part: Part) {
-        tracing::warn!(flow = %self.flow, part = part.as_str(), "injected secret found in the response; redacted");
+        tracing::warn!(flow = %self.flow, part = part.as_str(), "injected secret found in the response; masked");
         if let Some(shared) = &self.shared {
             shared.trip_quarantine(QuarantineCause::SecretInResponse {
                 flow: self.flow.clone(),
@@ -154,22 +176,23 @@ impl Alarm {
     }
 }
 
-/// A response body with secrets scrubbed from its data, its trailers, or
+/// A response body with secrets masked in its data, its trailers, or
 /// both, as it streams. A secret can straddle two frames, so bytes that
 /// end a frame and begin a secret (at most `longest secret - 1`) are held
 /// back until the next frame or the end shows whether the rest follows.
-/// Nothing else is buffered, so a stream of events is not delayed by them
-/// unless an event ends in what could start a secret.
-struct RedactedBody {
+/// Nothing else is buffered, so a stream of events is not delayed unless
+/// an event ends in what could start a secret.
+struct MaskedBody {
     inner: Body,
-    secrets: Arc<Secrets>,
-    /// `bodies` scrubs the data, `headers` the trailers.
+    needles: Arc<Redactor>,
+    /// `bodies` masks the data, `headers` the trailers.
     switches: ResponseRedaction,
-    /// The most bytes ever held back: `longest secret - 1`.
+    /// `longest secret - 1`: the most a secret can reach back into bytes
+    /// already released.
     keep: usize,
     /// Bytes not yet released: a secret could begin in them.
     held: Vec<u8>,
-    /// The last `keep + 1` bytes released, unscrubbed.
+    /// The last `keep` bytes released, unmasked.
     behind: Vec<u8>,
     /// Trailers to send once `held` is flushed.
     pending_trailers: Option<HeaderMap>,
@@ -180,19 +203,20 @@ struct RedactedBody {
     done: bool,
 }
 
-impl RedactedBody {
-    fn wrap(inner: Body, secrets: Arc<Secrets>, switches: ResponseRedaction, alarm: Alarm) -> Body {
-        let keep = secrets.redactor().longest_secret().saturating_sub(1);
-        // Scrubbing only the trailers leaves the data, and its length, alone.
-        let length = if switches.bodies {
-            None
-        } else {
-            inner.known_length()
-        };
+impl MaskedBody {
+    fn wrap(
+        inner: Body,
+        needles: Arc<Redactor>,
+        switches: ResponseRedaction,
+        alarm: Alarm,
+    ) -> Body {
+        let keep = needles.longest_secret().saturating_sub(1);
+        // Masking keeps every length.
+        let length = inner.known_length();
         Body::wrap_native(
             Self {
                 inner,
-                secrets,
+                needles,
                 switches,
                 keep,
                 held: Vec::new(),
@@ -208,53 +232,44 @@ impl RedactedBody {
         )
     }
 
-    /// The scrubbed bytes of `held` that no later byte can change, or all
-    /// of it at the end. A match that runs past the hold-back point is
-    /// complete, so it is released whole rather than split. A secret
-    /// overlapping one already released is found against `behind`, the
-    /// raw bytes released last; its released part is already under a
-    /// marker, so the rest is dropped without another (as is one adjoining
-    /// it, which the log merges too), and the output is the same however
-    /// the body is split.
+    /// The masked bytes of `held` that no later byte can change, or all of
+    /// it at the end. A match that runs past the hold-back point is
+    /// complete, so it is released whole rather than split. A secret that
+    /// began in bytes already released is found against `behind`, so its
+    /// rest is masked too, and the output is the same however the body is
+    /// split.
     fn release(&mut self, end: bool) -> Option<Bytes> {
         let from = self.behind.len();
         let mut buf = std::mem::take(&mut self.behind);
         buf.extend_from_slice(&self.held);
-        let ranges = self.secrets.redactor().secret_ranges(&buf);
+        let ranges = self.needles.secret_ranges(&buf);
         let mut cut = if end {
             buf.len()
         } else {
             // A secret begun in `behind` may still be arriving: its rest
-            // waits too, to be dropped as a continuation.
-            (buf.len() - self.secrets.redactor().partial_suffix(&buf)).max(from)
+            // waits too.
+            (buf.len() - self.needles.partial_suffix(&buf)).max(from)
         };
         if let Some(&(_, e)) = ranges.iter().find(|&&(s, e)| s < cut && e > cut) {
             cut = e;
         }
-        let mut out = Vec::with_capacity(cut - from);
-        let mut pos = from;
+        let mut out = buf[from..cut].to_vec();
+        let mut hit = false;
         for &(s, e) in ranges.iter().filter(|&&(s, e)| s < cut && e > from) {
-            if s >= from {
-                out.extend_from_slice(&buf[pos..s]);
-                out.extend_from_slice(REDACTED.as_bytes());
-                if !self.found {
-                    self.found = true;
-                    self.alarm.raise(Part::Body);
-                }
-            }
-            pos = e;
+            out[s.max(from) - from..e - from].fill(MASK);
+            hit = true;
         }
-        out.extend_from_slice(&buf[pos.min(cut)..cut]);
+        if hit && !self.found {
+            self.found = true;
+            self.alarm.raise(Part::Body);
+        }
         self.held = buf.split_off(cut);
-        // One byte more than is held back: a secret ending right where the
-        // release ended is whole in it, so a match adjoining it merges.
-        let keep_from = cut.saturating_sub(self.keep + 1);
-        self.behind = buf.split_off(keep_from);
+        self.behind = buf.split_off(cut.saturating_sub(self.keep));
         (!out.is_empty()).then(|| Bytes::from(out))
     }
 }
 
-impl http_body::Body for RedactedBody {
+impl http_body::Body for MaskedBody {
     type Data = Bytes;
     type Error = BodyError;
 
@@ -285,9 +300,7 @@ impl http_body::Body for RedactedBody {
                     }
                     Err(f) => {
                         if let Ok(mut t) = f.into_trailers() {
-                            if this.switches.headers
-                                && redact_trailers(this.secrets.redactor(), &mut t)
-                            {
+                            if this.switches.headers && mask_trailers(&this.needles, &mut t) {
                                 this.alarm.raise(Part::Trailers);
                             }
                             this.pending_trailers = Some(t);
@@ -313,19 +326,19 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
 
-    fn secrets(values: &[&str]) -> Arc<Secrets> {
-        let map = values
-            .iter()
-            .enumerate()
-            .map(|(i, v)| (format!("s{i}"), (*v).to_owned()))
-            .collect();
-        crate::secrets::SecretStore::new(map, Redactor::new()).load()
+    fn needles(values: &[&str]) -> Arc<Redactor> {
+        let mut r = Redactor::new();
+        for v in values {
+            r.add_secret(*v);
+        }
+        Arc::new(r)
     }
 
     const ALL: ResponseRedaction = ResponseRedaction {
         headers: true,
         bodies: true,
         quarantine: false,
+        min_length: 1,
     };
 
     fn quiet() -> Alarm {
@@ -335,15 +348,22 @@ mod tests {
         }
     }
 
-    /// `input` fed to the redactor `chunk` bytes at a time.
-    async fn redact(values: &[&str], input: &[u8], chunk: usize) -> Vec<u8> {
-        let sizes = std::iter::repeat_n(chunk, input.len().div_ceil(chunk)).collect();
-        redact_split(values, input, sizes).await
+    /// `input` masked whole.
+    fn masked(values: &[&str], input: &[u8]) -> Vec<u8> {
+        let mut out = input.to_vec();
+        mask(&mut out, &needles(values).secret_ranges(input));
+        out
     }
 
-    /// `input` fed to the redactor in frames of `sizes` bytes (the last
-    /// frame takes what is left).
-    async fn redact_split(values: &[&str], input: &[u8], sizes: Vec<usize>) -> Vec<u8> {
+    /// `input` fed to the body `chunk` bytes at a time.
+    async fn stream(values: &[&str], input: &[u8], chunk: usize) -> Vec<u8> {
+        let sizes = std::iter::repeat_n(chunk, input.len().div_ceil(chunk)).collect();
+        stream_split(values, input, sizes).await
+    }
+
+    /// `input` fed to the body in frames of `sizes` bytes (the last frame
+    /// takes what is left).
+    async fn stream_split(values: &[&str], input: &[u8], sizes: Vec<usize>) -> Vec<u8> {
         let (mut tx, body) = Body::channel(u64::MAX, None);
         let input = input.to_vec();
         let feed = tokio::spawn(async move {
@@ -356,57 +376,52 @@ mod tests {
             tx.send_data(Bytes::copy_from_slice(rest)).await.unwrap();
             tx.finish().await.unwrap();
         });
-        let body = RedactedBody::wrap(body, secrets(values), ALL, quiet());
+        let body = MaskedBody::wrap(body, needles(values), ALL, quiet());
         let out = body.collect().await.unwrap().to_bytes().to_vec();
         feed.await.unwrap();
         out
     }
 
     proptest::proptest! {
-        /// However the body is split, the stream comes out as the flow log
-        /// would redact it whole: overlapping and repeated secrets over a
-        /// small alphabet make every straddle likely.
+        /// However the body is split, the stream comes out as masking it
+        /// whole would: overlapping and repeated secrets over a small
+        /// alphabet make every straddle likely.
         #[test]
-        fn streaming_matches_redacting_whole(
+        fn streaming_matches_masking_whole(
             input in proptest::collection::vec(proptest::sample::select(b"abc".to_vec()), 0..64),
             sizes in proptest::collection::vec(1usize..8, 0..16),
         ) {
             let values = ["abca", "cab", "bb", "aaaa"];
-            let want = secrets(&values).redactor().redact_bytes(&input).into_owned();
             let got = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(redact_split(&values, &input, sizes));
-            proptest::prop_assert_eq!(got, want);
+                .block_on(stream_split(&values, &input, sizes));
+            proptest::prop_assert_eq!(got, masked(&values, &input));
         }
     }
 
     #[tokio::test]
-    async fn scrubs_secrets_straddling_frames() {
+    async fn masks_secrets_straddling_frames() {
         let input = b"key sk-live-123, token ghp_abc and sk-live-123x";
-        let want = b"key [REDACTED], token [REDACTED] and [REDACTED]x";
+        let want = b"key ***********, token ******* and ***********x";
         for chunk in 1..=input.len() {
             assert_eq!(
-                redact(&["sk-live-123", "ghp_abc"], input, chunk).await,
+                stream(&["sk-live-123", "ghp_abc"], input, chunk).await,
                 want,
                 "chunk size {chunk}"
             );
         }
     }
 
-    /// Overlapping occurrences merge into one marker, as in the flow log,
-    /// however the body is split.
     #[tokio::test]
-    async fn overlapping_secrets_merge_as_in_the_log() {
-        let r = secrets(&["abcd", "cdef"]);
+    async fn overlapping_secrets_are_masked_as_one_run() {
         let input = b"x abcdef y aaabcd";
-        let want = r.redactor().redact_bytes(input).into_owned();
-        assert_eq!(want, b"x [REDACTED] y aa[REDACTED]");
+        assert_eq!(masked(&["abcd", "cdef"], input), b"x ****** y aa****");
         for chunk in 1..=input.len() {
             assert_eq!(
-                redact(&["abcd", "cdef"], input, chunk).await,
-                want,
+                stream(&["abcd", "cdef"], input, chunk).await,
+                masked(&["abcd", "cdef"], input),
                 "chunk size {chunk}"
             );
         }
@@ -416,7 +431,7 @@ mod tests {
     async fn a_body_without_secrets_is_unchanged() {
         let input = b"nothing to see; sk-live-12 is not the whole secret";
         for chunk in [1, 7, input.len()] {
-            assert_eq!(redact(&["sk-live-123"], input, chunk).await, input);
+            assert_eq!(stream(&["sk-live-123"], input, chunk).await, input);
         }
     }
 
@@ -425,7 +440,7 @@ mod tests {
     #[tokio::test]
     async fn only_a_possible_secret_start_is_held_back() {
         let (mut tx, body) = Body::channel(u64::MAX, None);
-        let mut body = RedactedBody::wrap(body, secrets(&["sk-live-123"]), ALL, quiet());
+        let mut body = MaskedBody::wrap(body, needles(&["sk-live-123"]), ALL, quiet());
         tx.send_data(Bytes::from_static(b"data: one\n\n"))
             .await
             .unwrap();
@@ -441,34 +456,34 @@ mod tests {
             .unwrap();
         tx.finish().await.unwrap();
         let rest = body.collect().await.unwrap().to_bytes();
-        assert_eq!(rest, &b"[REDACTED]\n\n"[..]);
+        assert_eq!(rest, &b"***********\n\n"[..]);
     }
 
     #[tokio::test]
-    async fn trailers_are_scrubbed_after_the_held_bytes() {
+    async fn trailers_are_masked_after_the_held_bytes() {
         let mut trailers = HeaderMap::new();
         trailers.insert("x-echo", HeaderValue::from_static("Bearer sk-live-123"));
         let body = Body::from_parts(Bytes::from_static(b"tail sk-live"), Some(trailers));
-        let body = RedactedBody::wrap(body, secrets(&["sk-live-123"]), ALL, quiet());
+        let body = MaskedBody::wrap(body, needles(&["sk-live-123"]), ALL, quiet());
         let collected = body.collect().await.unwrap();
         let trailers = collected.trailers().cloned().unwrap();
-        assert_eq!(trailers["x-echo"], "Bearer [REDACTED]");
+        assert_eq!(trailers["x-echo"], "Bearer ***********");
         assert_eq!(collected.to_bytes(), &b"tail sk-live"[..]);
     }
 
     #[test]
     fn header_values_keep_their_other_bytes() {
-        let r = secrets(&["sk-live-123"]);
+        let r = needles(&["sk-live-123"]);
         let mut h = Headers::new();
         h.append("location", "https://x.test/cb?key=sk-live-123&a=1")
             .unwrap();
         h.append("x-other", "fine").unwrap();
-        assert!(redact_headers(r.redactor(), &mut h));
+        assert!(mask_headers(&r, &mut h));
         assert_eq!(
             h.get("location"),
-            Some("https://x.test/cb?key=[REDACTED]&a=1")
+            Some("https://x.test/cb?key=***********&a=1")
         );
         assert_eq!(h.get("x-other"), Some("fine"));
-        assert!(!redact_headers(r.redactor(), &mut h));
+        assert!(!mask_headers(&r, &mut h));
     }
 }

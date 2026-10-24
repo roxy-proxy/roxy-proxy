@@ -30,7 +30,7 @@ the client sees one clean wire form.
   the client, through ambiguous framing;
 - exfiltrating real credentials: with secret injection the client only ever
   holds placeholders. An allowed upstream that echoes an injected value
-  back is outside this; `http.redact_response_secrets` scrubs a verbatim
+  back is outside this; `http.redact_response_secrets` masks a verbatim
   echo ([secrets](/reference/secrets#redacting-responses));
 - unbounded memory and file-descriptor use from slowloris, huge headers,
   unbounded bodies and cardinality attacks, within the configured limits;
