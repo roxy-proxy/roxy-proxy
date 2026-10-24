@@ -2928,6 +2928,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "arc-swap",
+ "base64 0.23.1",
  "bytes",
  "bytesize",
  "chrono",
@@ -3049,6 +3050,7 @@ dependencies = [
  "aws-credential-types",
  "aws-sigv4",
  "aws-smithy-runtime-api",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "criterion",

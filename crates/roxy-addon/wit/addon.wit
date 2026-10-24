@@ -10,8 +10,9 @@
 /// Everything a layer can do outside its own streams is in `endpoints` and
 /// `flow`. Apart from `flow.current`, `flow.add-tag` and `flow.config`,
 /// each of those calls is a capability granted per layer in roxy's config.
-/// A call the layer was not granted traps; the import is always linked, so
-/// one binary runs under different grants.
+/// A call the layer was not granted traps, failing the layer (the exchange
+/// with it, in enforce mode); the import is always linked, so one binary
+/// runs under different grants.
 package roxy:addon@0.3.0;
 
 /// Heads, bodies and the response a call will produce.
@@ -169,7 +170,7 @@ interface flow {
   /// Tag the flow: the rules' `tag[..]` and the layers' `when` that run
   /// after this call read it, as do `current` and the flow log. Needs no
   /// capability, but only an enforce layer may tag: from an observer it
-  /// fails the exchange.
+  /// fails the layer (`layer_error`, kind `host`) and the exchange goes on.
   add-tag: func(tag: string);
   /// The layer's `config:` value as a JSON document. Always available.
   config: func() -> string;
@@ -187,7 +188,8 @@ interface flow {
   /// the store's default. Fails with a message when the key or value is
   /// too long. A full store fails the exchange, as it does a rule's
   /// `set_state`; nothing is evicted. Only an enforce layer may write:
-  /// from an observer it fails the exchange.
+  /// from an observer it fails the layer (`layer_error`, kind `host`) and
+  /// the exchange goes on.
   state-put: func(key: string, value: string, ttl-ms: option<u64>) -> result<_, string>;
   /// Read a metric (capability `metrics`) for this flow's own key, the
   /// metric's key fields evaluated on the request that left the stack. The
@@ -197,7 +199,8 @@ interface flow {
   /// Put the whole proxy into quarantine (capability `quarantine`): every
   /// exchange from here on, this one included, is refused until an
   /// operator or the control plane lifts it. Only an enforce layer may:
-  /// from an observer it fails the exchange.
+  /// from an observer it fails the layer (`layer_error`, kind `host`) and
+  /// the exchange goes on.
   quarantine: func();
 }
 

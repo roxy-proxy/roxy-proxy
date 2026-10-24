@@ -740,20 +740,26 @@ pub(crate) async fn raw(proxy: SocketAddr, bytes: &[u8]) -> (String, bool) {
     (String::from_utf8_lossy(&out).into_owned(), eof)
 }
 
-/// Parses a capture stream (`capture.rxc`) into `(header, payload)` records.
+/// Parses a capture stream (`capture.jsonl`) into `(header, payload)`
+/// records: a head re-serialised, data base64-decoded.
 pub(crate) fn parse_capture(bytes: &[u8]) -> Vec<(Value, Vec<u8>)> {
-    let mut out = Vec::new();
-    let mut rest = bytes;
-    while !rest.is_empty() {
-        let nl = rest.iter().position(|&b| b == b'\n').expect("header line");
-        let head: Value = serde_json::from_slice(&rest[..nl]).unwrap();
-        let len = usize::try_from(head["len"].as_u64().unwrap()).unwrap();
-        let payload = rest[nl + 1..nl + 1 + len].to_vec();
-        assert_eq!(rest[nl + 1 + len], b'\n', "record terminator");
-        rest = &rest[nl + 2 + len..];
-        out.push((head, payload));
-    }
-    out
+    use base64::Engine as _;
+    let text = std::str::from_utf8(bytes).expect("capture is UTF-8");
+    text.lines()
+        .map(|line| {
+            let mut v: Value = serde_json::from_str(line).unwrap();
+            let obj = v.as_object_mut().unwrap();
+            let payload = match (obj.remove("head"), obj.remove("data")) {
+                (Some(head), None) => head.to_string().into_bytes(),
+                (None, Some(data)) => base64::prelude::BASE64_STANDARD
+                    .decode(data.as_str().unwrap())
+                    .unwrap(),
+                (None, None) => Vec::new(),
+                (Some(_), Some(_)) => panic!("head and data: {line}"),
+            };
+            (v, payload)
+        })
+        .collect()
 }
 
 /// The records of one flow and direction, in order.

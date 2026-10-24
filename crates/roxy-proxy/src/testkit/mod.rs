@@ -540,9 +540,7 @@ impl KitBuilder {
             f(&mut settings);
         }
         let (limits, flags, http) = (self.limits.clone(), self.flags.clone(), self.http.clone());
-        let capture = self
-            .capture
-            .map(|all| Arc::new(capture_log(&dir.path().join("capture"), all)));
+        let capture = self.capture.map(|all| capture_log(dir.path(), all));
         let server_sink: Arc<dyn FlowSink> = match &self.log_gate {
             Some(gate) => Arc::new(gate::GatedSink::new(sink.clone(), gate.clone())),
             None => sink.clone(),
@@ -1401,10 +1399,10 @@ fn metric_source(
     }
 }
 
-/// A capture log in `dir`; `all` takes every forwarded exchange.
-fn capture_log(dir: &std::path::Path, all: bool) -> crate::capture::CaptureLog {
-    crate::capture::CaptureLog::open(
-        dir,
+/// A capture log in `<dir>/capture`; `all` takes every forwarded exchange.
+fn capture_log(dir: &std::path::Path, all: bool) -> Arc<crate::capture::CaptureLog> {
+    let log = crate::capture::CaptureLog::open(
+        &dir.join("capture"),
         crate::capture::CaptureOptions {
             max_body_bytes: 16 * 1024 * 1024,
             all,
@@ -1412,7 +1410,8 @@ fn capture_log(dir: &std::path::Path, all: bool) -> crate::capture::CaptureLog {
             rotate: roxy_log::RotateOptions::default(),
         },
     )
-    .unwrap()
+    .unwrap();
+    Arc::new(log)
 }
 
 /// A request body the test feeds chunk by chunk.

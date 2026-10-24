@@ -582,6 +582,18 @@ fn check(path: &Path) -> ExitCode {
                 config.secrets.len(),
                 config.addons.len(),
             );
+            if let Some(dir) = &config.capture_dir {
+                let c = &config.log.capture;
+                println!(
+                    "capture: {} ({})",
+                    dir.join(roxy_proxy::CAPTURE_FILE).display(),
+                    if c.all {
+                        "every forwarded exchange"
+                    } else {
+                        "exchanges a rule selects"
+                    },
+                );
+            }
             if policy.rule_count() > 0 {
                 print!("rules:\n{}", roxy::ruletest::classification(&policy));
             }
