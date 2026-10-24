@@ -20,7 +20,6 @@ pub(crate) mod attribution;
 mod chain;
 mod client_edge;
 mod core_edge;
-mod decode;
 mod endpoint;
 mod host;
 mod layer;

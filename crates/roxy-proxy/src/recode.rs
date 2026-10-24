@@ -90,32 +90,31 @@ pub(crate) fn decode_response(cx: &FlowCx, res: &mut CanonicalResponse, codings:
         return;
     }
     res.headers.remove("content-encoding");
-    res.body = coding::decode_body(
-        std::mem::take(&mut res.body),
+    decode(
+        &cx.shared,
+        &mut res.body,
         &codings,
         cx.snap.limits.max_response_body_bytes,
-        cx.shared.window_meter(),
     );
     res.meta.decoded_from = codings;
 }
 
-/// Decodes `body` for a layer, dropping `content-encoding` from `headers`;
-/// the codings to encode it in again. A coding roxy cannot decode is left,
-/// header and all, and gives none.
+/// Decodes a request's `body` for the layers, dropping `content-encoding`
+/// from `headers`; the codings to encode it in again. A coding roxy cannot
+/// decode is left, header and all, for a layer to judge, and gives none.
 pub(crate) fn request(
     shared: &Arc<Shared>,
-    headers: &mut Headers,
+    headers: &mut HeaderMap,
     body: &mut Body,
     limit: u64,
 ) -> Vec<Coding> {
-    let Ok(codings) = coding::content_codings(headers) else {
+    let Ok(codings) = coding::content_codings(&Headers::from_header_map_lenient(headers)) else {
         return Vec::new();
     };
-    if codings.is_empty() {
-        return codings;
+    if !codings.is_empty() {
+        headers.remove(http::header::CONTENT_ENCODING);
+        decode(shared, body, &codings, limit);
     }
-    headers.remove("content-encoding");
-    *body = coding::decode_body(std::mem::take(body), &codings, limit, shared.window_meter());
     codings
 }
 
@@ -131,13 +130,9 @@ pub(crate) fn encode_response(shared: &Arc<Shared>, res: &mut CanonicalResponse)
         return;
     }
     res.headers
-        .insert("content-encoding", &header(&codings))
+        .insert("content-encoding", &coding::header_value(&codings))
         .expect("coding tokens are a valid header value");
-    res.body = coding::encode_body(
-        std::mem::take(&mut res.body),
-        &codings,
-        shared.window_meter(),
-    );
+    encode(shared, &mut res.body, &codings);
 }
 
 /// Encodes a request's body in `codings` again, unless a layer gave it a
@@ -156,18 +151,20 @@ pub(crate) fn encode_request(
     }
     headers.insert(
         http::header::CONTENT_ENCODING,
-        HeaderValue::from_str(&header(codings)).expect("coding tokens are a valid header value"),
+        HeaderValue::from_str(&coding::header_value(codings))
+            .expect("coding tokens are a valid header value"),
     );
-    *body = coding::encode_body(std::mem::take(body), codings, shared.window_meter());
+    encode(shared, body, codings);
 }
 
-/// The `content-encoding` value naming `codings`, in the order applied.
-fn header(codings: &[Coding]) -> String {
-    codings
-        .iter()
-        .map(|c| c.as_str())
-        .collect::<Vec<_>>()
-        .join(", ")
+/// `body` decoded from `codings`, its windows charged to the budget.
+fn decode(shared: &Arc<Shared>, body: &mut Body, codings: &[Coding], limit: u64) {
+    *body = coding::decode_body(std::mem::take(body), codings, limit, shared.window_meter());
+}
+
+/// `body` encoded in `codings`, its encoders charged to the budget.
+fn encode(shared: &Arc<Shared>, body: &mut Body, codings: &[Coding]) {
+    *body = coding::encode_body(std::mem::take(body), codings, shared.window_meter());
 }
 
 #[cfg(test)]

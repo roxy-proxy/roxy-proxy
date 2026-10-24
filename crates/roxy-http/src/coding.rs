@@ -156,6 +156,16 @@ pub fn content_codings(headers: &Headers) -> Result<Vec<Coding>, DecodeError> {
     Ok(out)
 }
 
+/// The `content-encoding` value naming `codings`, in the order they were
+/// applied: the inverse of [`content_codings`].
+pub fn header_value(codings: &[Coding]) -> String {
+    codings
+        .iter()
+        .map(|c| c.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Decodes all of `input`, which was encoded with `codings` in that order.
 /// The decoded body may be at most `limit` bytes; the stages' windows are
 /// charged to `meter`.
