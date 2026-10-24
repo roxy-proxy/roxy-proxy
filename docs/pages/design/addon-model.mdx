@@ -1,153 +1,106 @@
 ---
 title: "Addon model"
-description: "What an addon layer is: a stage on the exchange's two lanes. How the stack is shaped, how layers are ordered against each other, what every layer is held to, and what the modes mean."
+description: "What an addon is: a step every exchange it runs on streams through, in both directions. How addons are ordered, what they are held to, and what the modes mean."
 ---
 
 import layerOrdering from "../../assets/layer-ordering.svg";
 
 # Addon model
 
-roxy knows HTTP, not any particular application or API. Logic that needs to
-understand the traffic goes in an addon: a layer downstream of the rules
-that owns both lanes of every exchange it runs on. An addon is either:
+roxy understands HTTP, not any particular API. Logic that needs to
+understand the traffic, such as checking a model's tool calls or counting
+tokens, goes in an addon. Each addon is a step that the request passes
+through on its way to the rules, and that the response passes back
+through on its way to the client. An addon is either:
 
-- **a WASM layer** (`kind: wasm`): a WebAssembly component run in-process,
-  written against the `roxy:addon` WIT package
-  ([writing addons](/guides/writing-addons)); or
+- **a WASM layer** (`kind: wasm`): a WebAssembly component that runs
+  inside roxy ([writing addons](/guides/writing-addons)); or
 - **a service layer** (`kind: service`): an external service that each
   exchange streams through over a WebSocket
   ([service layer protocol](/reference/service-layers)).
 
-How to configure one, and exactly what it sees and how it fails, is in
+Configuring addons is covered in
 [addon configuration](/reference/addon-configuration).
 
 ## The stack
 
 ```
                  request ↓                                   ↑ response
- fixed   ┌─ CONNECT gate (SNI must match) ───────────────────────────────┐
- config  ├─ addon: first listed                                          │
- config  ├─ addon: second listed                                         │
- fixed   ├─ rules                  (admission ↓ / in flight ↑)           │
- fixed   ├─ address floor + deny lists (on the IP actually dialled)      │
- fixed   └─ connector ──▶ origin ────────────────────────────────────────┘
+         ┌─ CONNECT and TLS ─────────────────────────────────────────────┐
+         ├─ first addon listed                                           │
+         ├─ second addon listed                                          │
+         ├─ rules                                                        │
+         ├─ address floor                                                │
+         └─ connection to the origin ────────────────────────────────────┘
 ```
 
-Addons sit downstream of the rules, in the order listed under `addons:`.
-Nothing configurable runs between the rules and the network, so what the
-rules judged is what leaves. The stack is a pipeline: every layer runs at
-once, as its own task, each working on what the layer downstream of it
-passed on. On a long stream each works on a different chunk at the same
-time.
+Addons run in the order they are listed under `addons:`, between the
+client and the rules. Nothing configurable runs between the rules and the
+network, so whatever the rules approved is what leaves. All the steps run
+at the same time on a stream, each working on the chunk the step before
+it passed on.
 
-## Lanes
+## What an addon can do
 
-Between two neighbouring stages (the client edge, each layer, the core)
-run two lanes: a request lane going upstream and a response lane coming
-back. A lane is shaped like an HTTP/2 stream: at most one head, then bytes,
-then optional trailers, then an end (complete) or a cut (incomplete). Its
-reader may stop it. The lanes carry no HTTP rules of their own; what a
-head or a chunk means is for the two ends of the proxy to say.
+For each exchange, an addon gets the request as the step before it passed
+it on. It can:
 
-A layer may pass on what it was given, hold it, rewrite it, or make its
-own, chunk by chunk, on either lane. The two lanes are independent: a
-layer may answer before forwarding, while forwarding, or without ever
-forwarding, and roxy infers nothing about one lane from the other.
-Answering without forwarding and the rules refusing are the same event at
-different stages: that stage produces the response, and nothing upstream
-of it sees the request.
+- pass the request on unchanged, or change it first;
+- hold it, for example while a person approves it;
+- answer the client itself, without passing the request on;
+- do the same with the response on its way back.
 
-A few rules follow from the shape:
+The request and response are handled separately, so an addon can start
+answering before it has passed the request on, or while it still holds
+it. An addon passes each request on at most once and answers exactly once.
+To call anything else, such as a monitoring model, it uses a
+[named endpoint](/reference/host-services#endpoints-endpoints), which does
+not go through the stack.
 
-- **No head, no message.** A request lane ended without a head is no
-  forward. A response lane a layer lets go of without a head is no answer,
-  and that is a fault.
-- **A layer cutting its own lane is an abort, not a fault.** The next
-  stage sees the body incomplete. A cut that follows a fault or the
-  client's loss is not an abort: it is how that failure reaches the next
-  stage.
-- **Stopping the response gives up the forward.** A layer that stops
-  reading the response to its forward has the forward, and every stage
-  upstream of it, cancelled. Stopping the request lane only tells its
-  producer.
-- **A response is a response wherever it starts.** The origin's, a
-  refusal from the rules, a layer's own answer, or the `503` roxy puts on
-  a failed layer's lane all travel downstream through the layers the same
-  way. A layer may pass on or replace the rules' refusal: addons are
-  trusted configuration, the request did not leave, and the flow log keeps
-  the rules' verdict.
-- **One forward and one answer per layer.** A layer calls `next` at most
-  once and answers exactly once. It never sends requests of its own
-  through the layers upstream of it: anything else it needs to reach is a
-  [named endpoint](/reference/host-services#endpoints-endpoints), which
-  goes straight to the connector.
+An addon can ask for the head only, or the head and the body, in each
+direction. A body it does not ask for goes past it untouched and costs
+nothing ([what a layer sees](/reference/addon-configuration#what-a-layer-sees)).
 
-A layer subscribes to the head only, or the head and the body, of each
-direction. A body it is not subscribed to bypasses it, as if it had passed
-the body on untouched, and costs no copies
-([what a layer sees](/reference/addon-configuration#what-a-layer-sees)).
+## Guarantees
 
-## The two ends enforce validity
+1. **The rules judge every request that leaves.** Whatever the last addon
+   passes on is checked as strictly as a client's request, and judged by
+   the rules as if the client had sent it.
+2. **Addons are held to the client's limits.** Header limits, body caps
+   and timeouts apply to what an addon passes on, as they do to a client.
+3. **Failure is closed.** An enforcing addon that fails makes the
+   exchange fail with `503`. There is no "on error, pass"
+   ([failure](/reference/addon-configuration#failure)).
 
-What happens on the lanes between layers is the layers' business. What
-reaches a socket is not: the request the last layer passes upstream is
-re-validated as strictly as a client's and judged by the rules, and the
-response the first layer passes downstream is re-framed as strictly as an
-origin's. A head that cannot go out is the fault of the last layer that
-touched it.
+An addon can replace any response on its way back, including a refusal
+from the rules. Addons are trusted, the refused request never left, and
+the flow log keeps the rules' decision.
 
 ## Ordering across layers
 
-Two things come out of a layer, and roxy orders only one of them.
+Traffic passes through the addons in order: the second addon sees what
+the first passed on, in the order it passed it on.
 
-The exchange's bytes form a pipeline. A head or a chunk reaches layer B
-only after layer A has sent it on, so what B reads is what A passed, in
-the order A passed it. The response runs the same way downstream: the
-in-flight rules see the upstream's bytes first, then B, then A.
-
-Host-service effects (`add_tag`, `state_put`, `record`, `quarantine`) are
-not in that pipeline. Each layer's calls run in order on its own worker,
-beside the lanes. A's `state_put` lands before B's `state_get` only if A
-awaits its result before sending the bytes B will read. A WASM layer's
-call returns before the layer goes on, so it has that order by
-construction; a service layer awaits the `result` itself
-([host services on a stream](/reference/service-layers#host-services)).
+Calls to roxy's [host services](/reference/host-services), such as
+writing state or adding a tag, run alongside the traffic rather than in
+it. If addon A writes state that addon B should read, A must wait for its
+write to finish before passing on the bytes B will read them with. A WASM
+addon's calls always finish before it carries on. A service layer waits
+for the `result` itself.
 
 <img src={layerOrdering} alt="Two enforce layers, A and B, in roxy's request path, left to right, then the rules. The client's head (a solid line) and body bytes (a dashed line) run through A, then B, then to the rules; the gap between A and B is labelled: a chunk reaches B only after A sends it. Part-way through the body, A calls state_put, drawn as an arrow down to a host services strip along the bottom with a result arrow back up, and the note awaits result, then sends on; A's body line is broken at that point. In B, on the chunk that followed, a state_get arrow goes down to the strip and a result comes back, with the note on that chunk: sees A's write. A dotted line between the two calls says ordered only by A's await. The strip reads host services (add_tag, state_put, state_get, record, quarantine, and more): beside the pipeline. Under it: each layer's calls run on their own worker, so A's put lands before B's get only because A awaited its result; a write for this exchange's admission lands before the request is forwarded; any other is seen by the next rule that reads it: a tag in flight on this exchange, state there or at a later exchange's admission." />
 
-So, to make an effect visible:
-
-- **to the layers upstream**: await the result before sending what they
-  should see it with;
-- **to this exchange's admission rules**: land it before the request is
-  forwarded;
-- **otherwise**, it is seen by the next rule that reads it, in flight on
-  this exchange or at a later one's admission. A write never reopens a
-  decision already made
-  ([policy evaluation](/design/policy-evaluation#evaluation)).
-
-## Invariants
-
-1. **The rules judge every request that leaves.** A layer's output is
-   re-validated and judged exactly as if the client had sent it. On the way
-   back, the in-flight rules see the upstream's response before any layer
-   does.
-2. **Every layer is held to the workload's limits.** Whatever a layer
-   passes on is treated as a client's: header limits, body caps, idle
-   timeouts. A layer cannot pass on `CONNECT`.
-3. **Failure is closed.** An enforcing layer that fails puts a `503` on
-   the lane downstream of it before the response head, and cuts the body
-   after it. There is no "on error, pass". One party is blamed for a
-   failed exchange: the first to fail
-   ([failure](/reference/addon-configuration#failure)).
+For the rules to see a tag or state write when they decide on the
+request, it must land before the addon passes the request on. A later
+write is seen by the next rule that reads it, but never changes a decision
+already made.
 
 ## Modes
 
-- `mode: enforce` (the default): the layer is in the path and its
-  decisions take effect.
-- `mode: observe`: roxy copies both lanes to the layer and ignores
-  anything it produces except host-service calls such as `record`. It
-  cannot change or delay traffic, so its failures are logged, never fatal.
-  That makes it the way to run an uncalibrated monitor. An observer that
-  falls behind loses its copy; the exchange goes on
+- `mode: enforce` (the default): the addon is in the path, and what it
+  does takes effect.
+- `mode: observe`: the addon gets a copy of the traffic and cannot change
+  or delay it. Its failures are logged, never fatal. This is the way to
+  try out a new monitor. An observer that falls too far behind loses its
+  copy, and the exchange carries on
   ([observers](/reference/addon-configuration#observers)).

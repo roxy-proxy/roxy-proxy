@@ -1,151 +1,115 @@
 # Threat model and guarantees
 
-roxy is a security boundary for the HTTP traffic that reaches it. These
-guarantees decide every behaviour on the other pages; where a page says
-"fails closed" or "deny wins", this is why.
+roxy is a security boundary for the HTTP traffic that reaches it. The
+guarantees on this page decide the behaviour described everywhere else.
 
 ## Threat model
 
-**Attacker:** the client. It controls every byte it sends to roxy, may run
-arbitrary code, and may have root inside its own container or VM.
+**The attacker is the client.** It controls every byte it sends to roxy,
+may run arbitrary code, and may have root inside its own container or VM.
 
-**Trusted:** the host, roxy's binary and config, the secrets roxy holds, the
-public CA trust store used to verify upstreams, the upstreams the rules
-allow, and the proxies a listener's `forwarded_for` counts: the trusted
-hops of `X-Forwarded-For` are taken as written, so a client's identity is
-only as good as the load balancer that appended it, and the network must
-let only those proxies reach the listener. A hop that is missing or is not
-an address refuses the request rather than falling back to the peer
-([HTTP](/reference/http#clients-behind-a-load-balancer)). Upstream responses are not treated as adversarial; roxy applies the
-size and time limits that protect its own resources and re-frames them so
-the client sees one clean wire form.
+**Trusted:** the host, roxy's binary and config (addons included), the
+secrets roxy holds, the public CA roots used to verify upstreams, the
+upstreams the rules allow, and the load balancers a listener's
+`forwarded_for` counts. Upstream responses are not treated as hostile,
+but roxy still bounds their size and time and re-frames them.
 
-**For traffic that reaches it, in a [sandbox](/guides/containment) and a
-[gateway](/guides/gateway) alike, roxy prevents:**
+**For traffic that reaches it, roxy prevents:**
 
 - reaching any destination the rules do not allow, including through
-  Host/SNI spoofing, DNS rebinding, redirects to private ranges, CONNECT to
-  arbitrary ports, or non-HTTP protocols tunnelled through CONNECT;
-- desync and smuggling between roxy and the upstream, or between roxy and
-  the client, through ambiguous framing;
-- exfiltrating real credentials: with secret injection the client only ever
+  Host or SNI spoofing, DNS rebinding, redirects to private addresses,
+  CONNECT to arbitrary ports, or non-HTTP protocols inside CONNECT;
+- request smuggling and desync through ambiguous framing, on either side
+  of roxy;
+- exfiltrating real credentials: with secret injection the client only
   holds placeholders;
-- unbounded memory and file-descriptor use from slowloris, huge headers,
-  unbounded bodies and cardinality attacks, within the configured limits;
-- learning anything useful from a deny beyond the rule id.
+- unbounded memory or connection use from slow clients, huge headers,
+  huge bodies and key churn, within the configured limits;
+- learning anything from a deny beyond the rule id.
 
-**roxy does not try to prevent** traffic that never reaches it, timing or
-DNS side channels from the workload (block DNS egress at the network layer;
-roxy resolves names itself), compromise of an upstream the rules already
-allow, or compromise of the host running roxy. WASM addons have memory,
-instance and answer-deadline limits. Epoch yielding makes guest code
-cancellable and shares execution time; it is not a total CPU budget. A
-handler that has answered can continue consuming CPU until its exchange is
-cancelled, so addon configuration remains trusted.
+**roxy does not prevent** traffic that never reaches it, timing or DNS
+side channels from the workload, compromise of an upstream the rules
+allow, or compromise of the host. WASM addons have memory and time limits
+but no total CPU budget, so addon configuration must be trusted.
 
 ## Which use case claims what
 
-roxy is not a transparent proxy: it decides what passes through it and
-cannot stop traffic that never reaches it.
+roxy decides what passes through it. It cannot stop traffic that goes
+around it.
 
 - **Sandbox containment** claims that all of the workload's traffic goes
-  through roxy. That claim is the network's: the workload must have no
-  route out except roxy's proxy port, with direct TCP, UDP and DNS blocked
-  at the boundary ([sandbox containment](/guides/containment)). The proxy
-  variables and the CA only tell a well-behaved client where roxy is.
-- **An HTTP gateway** makes no such claim. It governs the requests its
-  clients send to it; the clients keep whatever other routes they have
+  through roxy. The network makes that true: the workload must have no
+  route out except roxy's proxy port
+  ([sandbox containment](/guides/containment)).
+- **An HTTP gateway** makes no such claim. It governs the requests sent to
+  it, and clients keep any other routes they have
   ([HTTP gateway](/guides/gateway)).
-
-roxy speaks HTTP/1.1, HTTP/2 and WebSockets to clients. Raw TCP does not
-pass.
 
 ## Node identity
 
-In [node mode](/guides/node-mode) the node is a bearer token the control
-plane issued at enrolment, kept in the state dir (mode `0600`) and
-presented inside the server's TLS on every request. What it protects
-against is a host that was never enrolled, or one the operator has cut
-off: the control plane accepts leases, flow batches and renewals only
-from tokens it issued, each token expires and is renewed, and revocation
-(`410`) is per node and immediate. The node never re-enrols on its own,
-so a lost token is a stopped node, not a new one.
-
-It does not protect against the host roxy runs on: whatever can read the
-state dir holds the node's identity, as it would hold any credential kept
-there, and the host is already trusted. Nor does it bind the token to a
-connection; a token read from the node can be replayed from elsewhere
-until it expires or the node is revoked, which is why the control plane
-should store tokens hashed and keep their lifetime short.
+In [node mode](/guides/node-mode) a node proves who it is with a bearer
+token that the control plane issued at enrolment. The token stops a host
+that was never enrolled, or one that has been revoked, from getting a
+policy or secrets. It does not protect against the host roxy runs on:
+whatever can read the state dir can use the token until it expires or the
+node is revoked.
 
 ## Fail closed
 
-Anything roxy cannot parse, verify or classify is dropped. An empty rule
-set denies everything, and so does a policy past its `valid_until`
-([lease](/guides/operations#lease)). A config that fails to compile is not
-loaded, and a failed reload keeps the running policy. An addon in
-`enforce` mode that fails denies the flow; an `observe` addon cannot
-affect traffic, so its failure is logged and the flow goes on. An
-unavailable policy input denies the flow rather than making a predicate
-false. A [quarantine](/guides/operations#quarantine), once tripped, denies
-everything across reloads and restarts until lifted from outside the
-process. [Resource limits](/reference/limits#fail-closed-outcomes) lists
-every case.
+Anything roxy cannot parse, verify or classify is refused. An empty rule
+set denies everything, and so does an expired policy. A config that fails
+to load is not applied, and a failed reload keeps the running policy. A
+policy input that is unavailable, such as a full metric table, denies the
+exchange rather than making a condition false. An enforcing addon that
+fails denies the exchange. [Resource limits](/reference/limits#fail-closed-outcomes)
+lists every case.
 
 ## Canonical re-serialisation
 
-Requests are parsed into a strict internal model and re-emitted in one
-unambiguous wire form; nothing the client sends reaches the upstream
-byte-for-byte. Ambiguous input is rejected rather than resolved, and what
-the rules match is exactly what is forwarded ([HTTP](/reference/http)).
-After a WebSocket upgrade the connection carries only that WebSocket;
-when a rule reads messages, each is decoded strictly and re-encoded in one
-form ([WebSockets](/reference/websockets#message-rules)).
+roxy parses each request into a strict model and writes it out again in
+one unambiguous form. Nothing the client sends reaches the upstream
+byte for byte, and what the rules match is exactly what is forwarded
+([HTTP](/reference/http)).
 
 ## Deny always wins
 
-Any matching deny wins over any matching allow, wherever it sits in the
-list, and nothing overrides a deny later in an exchange. Rule order orders
-effects, never decisions, so adding a deny can only narrow what passes
-([policy evaluation](/design/policy-evaluation)).
+A matching deny wins over any matching allow, wherever it sits in the
+list. Rule order affects effects, never decisions, so adding a deny can
+only narrow what passes ([policy evaluation](/design/policy-evaluation)).
 
 ## Never evict
 
-Bounded tables (metric series, the state store) never evict to make
-room. A flow that needs a new entry in a full table is denied instead, so a
-client cannot reset its own counter by churning keys
-([rate limits](/reference/rate-limits#metrics)).
+Bounded tables, such as metric series and the state store, never evict
+entries to make room. A request that needs a new entry in a full table is
+denied, so a client cannot reset its own rate limit by churning keys.
 
 ## Audit backpressure
 
-The flow log and traffic capture never drop a record. When a log falls
-behind or its disk fails, roxy holds traffic back until it catches up
+The flow log and capture never drop a record. When a log falls behind or
+its disk fails, roxy holds traffic until it catches up
 ([flow log](/reference/flow-log#writing)).
 
 ## The rules judge everything that leaves
 
-Addons sit downstream of the rules and can reshape traffic freely, but what they
-pass on is re-validated as strictly as a client request and judged by the
-rules as if the client had sent it. Nothing configurable runs between the
-rules and the network, and the address floor checks the IP actually
-dialled. A refusal the rules make travels downstream through the addons as a
-response. A downstream addon may reshape it, including into a success
-response: addons are trusted configuration, the request did not leave, and the flow log records the rules' verdict whatever the client was
-given ([addon model](/design/addon-model)).
+Addons run before the rules and can reshape traffic freely. Whatever they
+pass on is validated like a client request and judged by the rules as if
+the client had sent it. Nothing configurable runs between the rules and
+the network, and the address floor checks the address actually dialled.
+
+An addon can still change the response the client gets, including a
+refusal from the rules: addons are trusted, the request did not leave,
+and the flow log records the rules' decision.
 
 ## Streams, not messages
 
-An exchange is a request head, a request body stream, a response head and a
-response body stream. A body is buffered only when a rule or addon needs
-its content, up to a cap, and the buffers of all exchanges together stay
-within one process-wide budget ([limits](/reference/limits#limits)). Memory
-use grows with neither body size nor the number of clients holding a
-buffer.
+A body is buffered only when a rule or addon needs to read it, up to a
+cap, and all buffers together stay within one process-wide budget
+([limits](/reference/limits#buffer-budget)). Memory use does not grow with
+body size.
 
-## Well-behaved clients work unhindered
+## Well-behaved clients work
 
-Strictness is aimed at malformed or ambiguous traffic. A conforming
-HTTP/1.1 or HTTP/2 client doing ordinary things (large uploads, keep-alive,
-`100-continue`, WebSockets, redirects, compression) through an allowed rule
-should notice nothing except the CA. A default that trips a conforming
-client is a bug.
+Strictness is aimed at malformed or ambiguous traffic. A conforming client
+doing ordinary things (large uploads, keep-alive, `100-continue`,
+WebSockets, compression) through an allowed rule should notice nothing
+except the CA. A default that breaks a conforming client is a bug.
