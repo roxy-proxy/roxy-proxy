@@ -35,8 +35,10 @@
 //!   backpressure, rotation).
 //! - [`io`]: stream adapters.
 //! - `budget`: the process-wide byte budget for per-exchange buffers.
-//! - `redact`: scrubbing injected secrets from a response, head and
-//!   streaming body.
+//! - [`needles`]: the secret matcher and its byte-for-byte mask, shared
+//!   by the flow log's redaction and the response masking.
+//! - `redact`: masking injected secrets in a response, head and streaming
+//!   body.
 
 pub mod addons;
 pub mod addr;
@@ -54,6 +56,7 @@ mod h2conn;
 mod in_flight;
 pub mod io;
 pub mod listener;
+pub mod needles;
 mod pipeline;
 pub mod quarantine;
 mod redact;

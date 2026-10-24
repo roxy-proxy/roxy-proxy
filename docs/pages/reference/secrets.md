@@ -25,9 +25,10 @@ rules:
   fatal. `roxy check` and `roxy rule test` do not resolve secrets.
 - At evaluation, a missing secret fails closed (`_fail_closed`, reason
   `secret_missing`); one that is not a valid header value, `secret_invalid`.
-- Injected values are redacted from the flow log and capture heads, and,
-  with `http.redact_response_secrets`, masked in the responses of the
-  exchanges that injected them ([below](/reference/secrets#redacting-responses)).
+- Injected values are masked with `*`, byte for byte, in the flow log and
+  capture heads, and, with `http.redact_response_secrets`, in the
+  responses of the exchanges that injected them
+  ([below](/reference/secrets#redacting-responses)).
 - A `redirect` in a matching rule sends the request, injected values
   included, to the redirect target: a secret's `set_header` rule should
   not match a request another rule redirects elsewhere.

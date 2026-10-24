@@ -12,6 +12,7 @@
 //! Matching is literal, so this stops a verbatim echo only: a value the
 //! upstream transforms (base64, escaping, a change of case) passes.
 
+use std::borrow::Cow;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll, ready};
@@ -22,13 +23,10 @@ use http_body::Frame;
 use roxy_http::{Body, BodyError, CanonicalResponse, Headers, coding};
 
 use crate::config::ResponseRedaction;
-use crate::flowlog::Redactor;
+use crate::needles::{MASK, Needles};
 use crate::pipeline::{FlowCx, Refusal, response_known_empty};
 use crate::quarantine::QuarantineCause;
 use crate::server::Shared;
-
-/// What each byte of a secret becomes.
-const MASK: u8 = b'*';
 
 /// Flow-log `reason` of a response whose body cannot be scrubbed: its
 /// content coding is one roxy does not decode, or it is a range of an
@@ -45,15 +43,15 @@ pub(crate) fn response(cx: &FlowCx, res: &mut CanonicalResponse) -> Result<(), R
     }
     // A short value would mask unrelated bytes wherever it happens to
     // occur, so values under `min_length` are left alone.
-    let mut needles = Redactor::new();
+    let mut needles = Needles::default();
     for value in cx
         .injected
         .iter()
         .filter(|v| v.len() >= switches.min_length)
     {
-        needles.add_secret(value.clone());
+        needles.add(value.clone());
     }
-    if needles.longest_secret() == 0 {
+    if needles.is_empty() {
         return Ok(());
     }
     let needles = Arc::new(needles);
@@ -97,15 +95,8 @@ fn decode(cx: &FlowCx, res: &mut CanonicalResponse) -> Result<(), Refusal> {
     Ok(())
 }
 
-/// Masks every byte of `b` inside `ranges`.
-fn mask(b: &mut [u8], ranges: &[(usize, usize)]) {
-    for &(start, end) in ranges {
-        b[start..end].fill(MASK);
-    }
-}
-
 /// Masks every value in `headers`; whether any held a secret.
-fn mask_headers(needles: &Redactor, headers: &mut Headers) -> bool {
+fn mask_headers(needles: &Needles, headers: &mut Headers) -> bool {
     let mut found = false;
     headers.replace_values(|v| {
         let new = mask_value(needles, v)?;
@@ -116,7 +107,7 @@ fn mask_headers(needles: &Redactor, headers: &mut Headers) -> bool {
 }
 
 /// Masks every value in a trailer block; whether any held a secret.
-fn mask_trailers(needles: &Redactor, trailers: &mut HeaderMap) -> bool {
+fn mask_trailers(needles: &Needles, trailers: &mut HeaderMap) -> bool {
     let mut found = false;
     for v in trailers.values_mut() {
         if let Some(new) = mask_value(needles, v) {
@@ -128,13 +119,10 @@ fn mask_trailers(needles: &Redactor, trailers: &mut HeaderMap) -> bool {
 }
 
 /// `v` masked, or `None` when it holds no secret.
-fn mask_value(needles: &Redactor, v: &HeaderValue) -> Option<HeaderValue> {
-    let ranges = needles.secret_ranges(v.as_bytes());
-    if ranges.is_empty() {
+fn mask_value(needles: &Needles, v: &HeaderValue) -> Option<HeaderValue> {
+    let Cow::Owned(b) = needles.mask_bytes(v.as_bytes()) else {
         return None;
-    }
-    let mut b = v.as_bytes().to_vec();
-    mask(&mut b, &ranges);
+    };
     // A valid value with some bytes swapped for visible ASCII is valid.
     Some(HeaderValue::from_bytes(&b).expect("a masked header value stays valid"))
 }
@@ -184,7 +172,7 @@ impl Alarm {
 /// an event ends in what could start a secret.
 struct MaskedBody {
     inner: Body,
-    needles: Arc<Redactor>,
+    needles: Arc<Needles>,
     /// `bodies` masks the data, `headers` the trailers.
     switches: ResponseRedaction,
     /// `longest secret - 1`: the most a secret can reach back into bytes
@@ -204,13 +192,8 @@ struct MaskedBody {
 }
 
 impl MaskedBody {
-    fn wrap(
-        inner: Body,
-        needles: Arc<Redactor>,
-        switches: ResponseRedaction,
-        alarm: Alarm,
-    ) -> Body {
-        let keep = needles.longest_secret().saturating_sub(1);
+    fn wrap(inner: Body, needles: Arc<Needles>, switches: ResponseRedaction, alarm: Alarm) -> Body {
+        let keep = needles.longest().saturating_sub(1);
         // Masking keeps every length.
         let length = inner.known_length();
         Body::wrap_native(
@@ -242,7 +225,7 @@ impl MaskedBody {
         let from = self.behind.len();
         let mut buf = std::mem::take(&mut self.behind);
         buf.extend_from_slice(&self.held);
-        let ranges = self.needles.secret_ranges(&buf);
+        let ranges = self.needles.ranges(&buf);
         let mut cut = if end {
             buf.len()
         } else {
@@ -326,12 +309,12 @@ mod tests {
     use super::*;
     use http_body_util::BodyExt;
 
-    fn needles(values: &[&str]) -> Arc<Redactor> {
-        let mut r = Redactor::new();
+    fn needles(values: &[&str]) -> Arc<Needles> {
+        let mut n = Needles::default();
         for v in values {
-            r.add_secret(*v);
+            n.add(*v);
         }
-        Arc::new(r)
+        Arc::new(n)
     }
 
     const ALL: ResponseRedaction = ResponseRedaction {
@@ -350,9 +333,7 @@ mod tests {
 
     /// `input` masked whole.
     fn masked(values: &[&str], input: &[u8]) -> Vec<u8> {
-        let mut out = input.to_vec();
-        mask(&mut out, &needles(values).secret_ranges(input));
-        out
+        needles(values).mask_bytes(input).into_owned()
     }
 
     /// `input` fed to the body `chunk` bytes at a time.

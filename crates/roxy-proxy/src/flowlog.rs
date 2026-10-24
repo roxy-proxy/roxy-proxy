@@ -21,12 +21,15 @@ use std::task::{Context, Poll};
 use roxy_log::{LogWriter, RotateOptions, RotatingFile, Stream, WriterOptions};
 use roxy_rules::RuleId;
 
+use crate::needles::Needles;
+
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::ser::SerializeSeq;
 use serde::{Serialize, Serializer};
 
-/// Replacement text for redacted values.
-pub const REDACTED: &str = "[REDACTED]";
+/// Replacement text for a value hidden whole: a redacted header's. Its
+/// width is fixed, so it says nothing of the value's length.
+pub const REDACTED: &str = "******";
 
 /// Header names whose values are never logged. `log.redact_headers`
 /// extends this set.
@@ -786,10 +789,11 @@ impl FlowSink for MemorySink {
 // Redaction
 // ---------------------------------------------------------------------------
 
-/// Scrubs secret values and sensitive headers from logged strings.
+/// Masks secret values in logged strings and hides the values of
+/// sensitive headers.
 #[derive(Debug, Clone)]
 pub struct Redactor {
-    secrets: Vec<String>,
+    secrets: Needles,
     headers: HashSet<String>,
 }
 
@@ -803,7 +807,7 @@ impl Redactor {
     /// A redactor with no secrets and the default redacted headers.
     pub fn new() -> Self {
         Self {
-            secrets: Vec::new(),
+            secrets: Needles::default(),
             headers: DEFAULT_REDACTED_HEADERS
                 .iter()
                 .map(|h| (*h).to_owned())
@@ -813,10 +817,7 @@ impl Redactor {
 
     /// Register a secret value. Empty strings are ignored.
     pub fn add_secret(&mut self, secret: impl Into<String>) {
-        let secret = secret.into();
-        if !secret.is_empty() && !self.secrets.contains(&secret) {
-            self.secrets.push(secret);
-        }
+        self.secrets.add(secret);
     }
 
     /// Add a header name (case-insensitive) whose values are never logged.
@@ -829,76 +830,14 @@ impl Redactor {
         self.headers.contains(&name.to_ascii_lowercase())
     }
 
-    /// Replace every occurrence of a registered secret in `s` with
-    /// [`REDACTED`]. Overlapping occurrences are merged into one marker.
+    /// `s` with every registered secret masked
+    /// ([`Needles::mask_str`]).
     pub fn redact_str<'a>(&self, s: &'a str) -> Cow<'a, str> {
-        match self.redact_bytes(s.as_bytes()) {
-            Cow::Borrowed(_) => Cow::Borrowed(s),
-            // A secret is whole UTF-8, so in UTF-8 text it matches only on
-            // char boundaries, and the marker is ASCII.
-            Cow::Owned(b) => Cow::Owned(
-                String::from_utf8(b).expect("redacting UTF-8 on char boundaries keeps it UTF-8"),
-            ),
-        }
-    }
-
-    /// [`Redactor::redact_str`] over bytes.
-    pub fn redact_bytes<'a>(&self, b: &'a [u8]) -> Cow<'a, [u8]> {
-        let ranges = self.secret_ranges(b);
-        if ranges.is_empty() {
-            return Cow::Borrowed(b);
-        }
-        Cow::Owned(replace_ranges(b, &ranges))
-    }
-
-    /// Where registered secrets occur in `b`, overlapping occurrences
-    /// merged, in order.
-    pub(crate) fn secret_ranges(&self, b: &[u8]) -> Vec<(usize, usize)> {
-        let mut ranges: Vec<(usize, usize)> = Vec::new();
-        for secret in &self.secrets {
-            let finder = memchr::memmem::Finder::new(secret.as_bytes());
-            // Every start position, overlapping ones included.
-            let mut from = 0;
-            while let Some(i) = finder.find(&b[from..]) {
-                let start = from + i;
-                ranges.push((start, start + secret.len()));
-                from = start + 1;
-            }
-        }
-        ranges.sort_unstable();
-        let mut merged: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-        for (start, end) in ranges {
-            match merged.last_mut() {
-                Some(last) if start <= last.1 => last.1 = last.1.max(end),
-                _ => merged.push((start, end)),
-            }
-        }
-        merged
-    }
-
-    /// The length of the longest suffix of `b` that is a proper prefix of
-    /// a registered secret: bytes that may begin a secret whose rest has
-    /// not arrived yet.
-    pub(crate) fn partial_suffix(&self, b: &[u8]) -> usize {
-        self.secrets
-            .iter()
-            .filter_map(|secret| {
-                let secret = secret.as_bytes();
-                (1..secret.len().min(b.len() + 1))
-                    .rev()
-                    .find(|&k| b.ends_with(&secret[..k]))
-            })
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// The length of the longest registered secret; 0 with none.
-    pub(crate) fn longest_secret(&self) -> usize {
-        self.secrets.iter().map(String::len).max().unwrap_or(0)
+        self.secrets.mask_str(s)
     }
 
     /// The loggable form of a header value: [`REDACTED`] for redacted header
-    /// names, otherwise the value with secrets scrubbed.
+    /// names, otherwise the value with secrets masked.
     pub fn redact_header<'a>(&self, name: &str, value: &'a str) -> Cow<'a, str> {
         if self.is_redacted_header(name) {
             Cow::Borrowed(REDACTED)
@@ -907,7 +846,7 @@ impl Redactor {
         }
     }
 
-    /// Every string in `v`, object keys included, with secrets scrubbed.
+    /// Every string in `v`, object keys included, with secrets masked.
     pub fn redact_json(&self, v: serde_json::Value) -> serde_json::Value {
         use serde_json::Value;
         match v {
@@ -921,19 +860,6 @@ impl Redactor {
             other @ (Value::Null | Value::Bool(_) | Value::Number(_)) => other,
         }
     }
-}
-
-/// `b` with each of `ranges` (sorted, disjoint) replaced by [`REDACTED`].
-fn replace_ranges(b: &[u8], ranges: &[(usize, usize)]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(b.len());
-    let mut pos = 0;
-    for &(start, end) in ranges {
-        out.extend_from_slice(&b[pos..start]);
-        out.extend_from_slice(REDACTED.as_bytes());
-        pos = end;
-    }
-    out.extend_from_slice(&b[pos..]);
-    out
 }
 
 #[cfg(test)]
@@ -1194,29 +1120,6 @@ mod tests {
     }
 
     #[test]
-    fn redact_str_replaces_secrets() {
-        let mut r = Redactor::new();
-        r.add_secret("sk-live-123");
-        r.add_secret("");
-        assert!(matches!(r.redact_str("nothing here"), Cow::Borrowed(_)));
-        assert_eq!(
-            r.redact_str("Bearer sk-live-123 and sk-live-123!"),
-            "Bearer [REDACTED] and [REDACTED]!"
-        );
-    }
-
-    #[test]
-    fn redact_str_handles_overlaps() {
-        let mut r = Redactor::new();
-        r.add_secret("abcd");
-        r.add_secret("cdef");
-        r.add_secret("aa");
-        assert_eq!(r.redact_str("xabcdefx"), "x[REDACTED]x");
-        assert_eq!(r.redact_str("aaa"), "[REDACTED]");
-        assert_eq!(r.redact_str("é-abcd-é"), "é-[REDACTED]-é");
-    }
-
-    #[test]
     fn redact_json_scrubs_keys_as_well_as_values() {
         let mut r = Redactor::new();
         r.add_secret("hunter2");
@@ -1236,6 +1139,6 @@ mod tests {
         r.add_header("X-Custom");
         assert_eq!(r.redact_header("x-custom", "visible"), REDACTED);
         r.add_secret("tok");
-        assert_eq!(r.redact_header("x-other", "a tok b"), "a [REDACTED] b");
+        assert_eq!(r.redact_header("x-other", "a tok b"), "a *** b");
     }
 }

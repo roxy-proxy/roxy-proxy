@@ -1577,7 +1577,7 @@ mod tests {
         let out = edit_query(None, "k", Some("v")).unwrap().unwrap();
         assert_eq!(out.as_str(), "k=v");
         let q = Query::try_from("x=1").unwrap();
-        assert_eq!(redact_query(&q), "x=[REDACTED]");
+        assert_eq!(redact_query(&q), "x=******");
     }
 
     #[test]

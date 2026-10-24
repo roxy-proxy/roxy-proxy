@@ -651,7 +651,6 @@ mod tests {
     use super::client_edge::stack_outcome;
     use super::*;
     use crate::exchange::Outcome;
-    use crate::flowlog::REDACTED;
     use crate::testkit::{AddonDef, Kit, capture_logs};
     use roxy_http::Body;
     use roxy_wasm::LayerError;
@@ -855,11 +854,11 @@ mod tests {
         });
         assert!(logged.contains("layer failed"), "{logged}");
         assert!(!logged.contains(secret), "{logged}");
-        assert!(logged.contains(REDACTED), "{logged}");
+        assert!(logged.contains("x-token: ***********"), "{logged}");
         let errs = kit.events("layer_error", 1).await;
         assert_eq!(
             errs[0]["message"],
-            format!("layer passed an invalid request: header x-token: {REDACTED}")
+            "layer passed an invalid request: header x-token: ***********"
         );
     }
 
@@ -945,11 +944,14 @@ mod tests {
         });
         assert!(logged.contains("metric recording failed"), "{logged}");
         assert!(!logged.contains(secret), "{logged}");
-        assert!(logged.contains(REDACTED), "{logged}");
+        assert!(logged.contains("token=***********"), "{logged}");
         let errs = kit.events("policy_input_unavailable", 1).await;
         assert_eq!(
             errs[0]["reason"],
-            format!("{}: metric key unavailable: key token={REDACTED}", e.code())
+            format!(
+                "{}: metric key unavailable: key token=***********",
+                e.code()
+            )
         );
     }
 

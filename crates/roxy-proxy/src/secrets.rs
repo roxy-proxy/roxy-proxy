@@ -152,14 +152,14 @@ mod tests {
         store.swap(map(&[("k", "new-value")]));
         assert_eq!(store.load().get("k").as_deref(), Some("new-value"));
         let r = store.redactor();
-        assert_eq!(r.redact_str("x old-value y"), "x [REDACTED] y");
-        assert_eq!(r.redact_str("x new-value y"), "x [REDACTED] y");
+        assert_eq!(r.redact_str("x old-value y"), "x ********* y");
+        assert_eq!(r.redact_str("x new-value y"), "x ********* y");
 
         // Two swaps on: the first generation is no longer in flight.
         store.swap(map(&[]));
         assert_eq!(store.load().get("k"), None);
         let r = store.redactor();
-        assert_eq!(r.redact_str("new-value"), "[REDACTED]");
+        assert_eq!(r.redact_str("new-value"), "*********");
         assert_eq!(r.redact_str("old-value"), "old-value");
     }
 
@@ -173,7 +173,7 @@ mod tests {
         store.swap(map(&[("akid", "AKID2"), ("sk", "SK2")]));
         store.swap(map(&[("akid", "AKID3"), ("sk", "SK3")]));
         assert_eq!(generation.get("sk").as_deref(), Some("SK1"));
-        assert_eq!(generation.redactor().redact_str("SK1"), "[REDACTED]");
+        assert_eq!(generation.redactor().redact_str("SK1"), "***");
         assert_eq!(store.load().get("sk").as_deref(), Some("SK3"));
         assert_eq!(store.redactor().redact_str("SK1"), "SK1");
     }
@@ -188,6 +188,6 @@ mod tests {
 
         store.replace(map(&[]), Redactor::new());
         assert!(!store.redactor().is_redacted_header("x-custom"));
-        assert_eq!(store.redactor().redact_str("v"), "[REDACTED]");
+        assert_eq!(store.redactor().redact_str("v"), "*");
     }
 }

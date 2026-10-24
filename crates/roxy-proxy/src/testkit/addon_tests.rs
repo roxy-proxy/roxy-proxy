@@ -1970,7 +1970,7 @@ mod service {
             .iter()
             .find(|h| h[0] == "x-token")
             .expect("x-token captured");
-        assert_eq!(token[1], "Bearer [REDACTED]", "{head:#}");
+        assert_eq!(token[1], "Bearer ***********", "{head:#}");
         assert!(
             !captured
                 .iter()
@@ -2889,7 +2889,7 @@ async fn endpoints_respect_the_address_floor() {
 }
 
 /// A record's `kind` is the guest's string as much as its document: a
-/// secret in it is redacted in the flow log.
+/// secret in it is masked in the flow log.
 #[tokio::test]
 async fn a_record_kind_is_redacted_like_its_document() {
     use roxy_wasm::Capability;
@@ -2901,7 +2901,7 @@ async fn a_record_kind_is_redacted_like_its_document() {
     let a = cap(&kit, "record").await;
     assert_eq!(a.text(), "ok", "{a:?}");
     let r = kit.events("layer_record", 1).await;
-    assert_eq!(r[0]["kind"], "[REDACTED]", "{r:#?}");
+    assert_eq!(r[0]["kind"], "*******", "{r:#?}");
     assert_eq!(r[0]["data"]["score"], 0.9);
 }
 

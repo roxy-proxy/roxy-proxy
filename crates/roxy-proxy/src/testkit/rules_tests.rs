@@ -125,7 +125,8 @@ async fn swapped_secrets_reach_the_next_request_without_a_rebuild() {
         .iter()
         .map(|e| e["req"]["path"].as_str().unwrap())
         .collect();
-    assert_eq!(paths, ["/p/[REDACTED]", "/p/[REDACTED]"], "{events:#?}");
+    let masked = format!("/p/{}", "*".repeat(OLD.len()));
+    assert_eq!(paths, [masked.as_str(); 2], "{events:#?}");
     let all = serde_json::to_string(&kit.sink.events()).unwrap();
     assert!(
         !all.contains(OLD) && !all.contains(NEW),
@@ -176,7 +177,11 @@ async fn an_exchange_spanning_two_swaps_still_redacts_the_value_it_injected() {
     assert_eq!(a.status, 200, "{a:?}");
 
     let ev = kit.request_event().await;
-    assert_eq!(ev["req"]["path"], "/p/[REDACTED]", "{ev:#}");
+    assert_eq!(
+        ev["req"]["path"],
+        format!("/p/{}", "*".repeat(GEN1.len())),
+        "{ev:#}"
+    );
 }
 
 #[tokio::test]

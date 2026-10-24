@@ -87,12 +87,14 @@ It emits no `response_error` for an already completed response.
 
 ### Redaction
 
-Every injected secret value is scrubbed from any logged string, the
-operational log (`tracing`) included: a string is redacted once, with the
-secret generation the exchange loaded, and that one copy goes to every
-sink. Values of `authorization`, `proxy-authorization`, `cookie`,
-`set-cookie` and `x-api-key` are never logged; `log.redact_headers` adds
-more. Query values are redacted.
+Every injected secret value is masked in any logged string, the
+operational log (`tracing`) included: each of its bytes becomes `*`, so
+the string keeps its length. A string is masked once, with the secret
+generation the exchange loaded, and that one copy goes to every sink.
+Values of `authorization`, `proxy-authorization`, `cookie`, `set-cookie`
+and `x-api-key` are never logged; `log.redact_headers` adds more. Their
+values, and query values, are logged as a fixed `******`, which says
+nothing of their length.
 
 ### Writing
 
@@ -160,8 +162,8 @@ allowed a chunk. WebSocket relays are captured both ways at the relay next
 to the upstream, not as an addon layer changes them for the client.
 
 Capture is written like the flow log (one writer, batching, rotation,
-backpressure). Injected secret values are scrubbed from every string of a
-captured head (URL, header names and values); nothing else is: the
+backpressure). Injected secret values are masked with `*` in every string
+of a captured head (URL, header names and values); nothing else is: the
 header-name redaction above is flow-log only, and bodies are captured
 **unredacted**, except that a response
 [`http.redact_response_secrets.bodies`](/reference/secrets#redacting-responses)
