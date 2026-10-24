@@ -87,8 +87,8 @@ pub struct QuarantineReport {
     pub id: String,
     pub since: DateTime<Utc>,
     /// What tripped it: `{"kind": "rule", ...}`, `{"kind": "threshold",
-    /// ...}` or `{"kind": "layer", ...}`, as the proxy's `quarantined` flow
-    /// event carries it.
+    /// ...}`, `{"kind": "layer", ...}` or `{"kind": "secret_in_response",
+    /// ...}`, as the proxy's `quarantined` flow event carries it.
     pub cause: serde_json::Value,
 }
 

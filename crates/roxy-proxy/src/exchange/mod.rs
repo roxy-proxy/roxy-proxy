@@ -37,6 +37,7 @@ use crate::pipeline::{
     BodyIo, FlowCx, PerDir, Refusal, RefusalKind, ResponseVerdict, Verdict, body_failure, ms,
     request_steps, response_steps,
 };
+use crate::recode::{Leg, Need};
 use crate::server::Shared;
 use crate::upstream::{ConnectError, ConnectInfo, Protocols, UpstreamBody, classify, describe};
 use crate::view::host_text;
@@ -753,6 +754,7 @@ async fn forward<F: ClientTransport>(
         });
         req.meta.upgrade = None;
     }
+    crate::redact::request(cx, &mut req);
     if let Err(e) = cx
         .snap
         .upstream
@@ -785,9 +787,31 @@ async fn forward<F: ClientTransport>(
     let res = from_upstream_response(res, &cx.snap.limits);
     match response_steps(cx, res, transport).await {
         ResponseVerdict::Continue(mut res) => {
+            let needles = crate::redact::needles(cx);
+            let need = if crate::redact::masks_body(cx) {
+                Need::Masking
+            } else if matches!(cx.response_leg, Leg::Stack { decode: true, .. }) {
+                Need::Layers
+            } else {
+                Need::None
+            };
+            let codings = match crate::recode::response_codings(cx, &res, need) {
+                Ok(codings) => codings,
+                Err(r) => return Outcome::Refuse(r),
+            };
+            // The capture and the in-flight byte counts see the response
+            // as the upstream sent it: decoding and masking come after.
             let mut down_tap = down_tap;
             if let Some(t) = down_tap.as_mut() {
                 t.response_head(&res);
+            }
+            if upgrade.is_none() {
+                let body = std::mem::take(&mut res.body);
+                res.body = in_flight_body(body, in_flight, Dir::Response, down_tap.take());
+            }
+            crate::recode::decode_response(cx, &mut res, codings);
+            if let Some(needles) = needles {
+                crate::redact::response(cx, &mut res, needles);
             }
             if let Some((upstream, key)) = upgrade {
                 // The relay takes the taps after the `101`.
@@ -797,8 +821,11 @@ async fn forward<F: ClientTransport>(
                 };
                 return Outcome::Upgrade { res, upstream, key };
             }
-            let body = std::mem::take(&mut res.body);
-            res.body = in_flight_body(body, in_flight, Dir::Response, down_tap);
+            // Encoded again at the client's end of the chain: here, or at
+            // the stack's client edge.
+            if matches!(cx.response_leg, Leg::Direct) {
+                crate::recode::encode_response(&cx.shared, &mut res);
+            }
             Outcome::Respond(res)
         }
         ResponseVerdict::Deny(r) => Outcome::Refuse(r),

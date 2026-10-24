@@ -132,6 +132,10 @@ pub struct ResponseMeta {
     /// `Connection` field, because the upstream connection is managed
     /// independently of the client's keep-alive.
     pub close: bool,
+    /// The content codings roxy decoded the body from, in the order they
+    /// were applied, so that it is encoded in them again before it leaves.
+    /// Empty when the body travels as it came.
+    pub decoded_from: Vec<crate::coding::Coding>,
 }
 
 /// A response to be sent to the client.

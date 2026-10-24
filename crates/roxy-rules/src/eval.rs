@@ -287,7 +287,8 @@ impl fmt::Display for Deny {
 #[derive(Clone, PartialEq, Eq)]
 pub struct SetHeaderValue {
     text: String,
-    from_secret: bool,
+    /// The secret values substituted into `text`.
+    secrets: Vec<String>,
 }
 
 impl SetHeaderValue {
@@ -295,15 +296,15 @@ impl SetHeaderValue {
     pub fn literal(text: impl Into<String>) -> Self {
         Self {
             text: text.into(),
-            from_secret: false,
+            secrets: Vec::new(),
         }
     }
 
-    /// A value with a secret substituted into it.
-    pub fn from_secret(text: impl Into<String>) -> Self {
+    /// A value with `secrets`, their values, substituted into it.
+    pub fn from_secrets(text: impl Into<String>, secrets: Vec<String>) -> Self {
         Self {
             text: text.into(),
-            from_secret: true,
+            secrets,
         }
     }
 
@@ -313,7 +314,12 @@ impl SetHeaderValue {
 
     /// Whether a secret was substituted into the value.
     pub fn is_from_secret(&self) -> bool {
-        self.from_secret
+        !self.secrets.is_empty()
+    }
+
+    /// The secret values substituted into the value, in template order.
+    pub fn secrets(&self) -> &[String] {
+        &self.secrets
     }
 }
 
@@ -331,7 +337,7 @@ impl From<String> for SetHeaderValue {
 
 impl fmt::Display for SetHeaderValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.from_secret {
+        if self.is_from_secret() {
             f.write_str("[REDACTED]")
         } else {
             f.write_str(&self.text)
@@ -341,7 +347,7 @@ impl fmt::Display for SetHeaderValue {
 
 impl fmt::Debug for SetHeaderValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.from_secret {
+        if self.is_from_secret() {
             fmt::Debug::fmt("[REDACTED]", f)
         } else {
             fmt::Debug::fmt(&self.text, f)

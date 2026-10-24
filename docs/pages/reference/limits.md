@@ -14,6 +14,7 @@ connection rather than letting traffic through
 | a metric, address list or secret is unavailable | `503`, `_fail_closed` |
 | a metric table is full | `503`, `_fail_closed`, `metric_table_full` |
 | a body is too large to inspect, or cannot be decoded | `503`, `_fail_closed` |
+| a response that [masking](/reference/secrets#redacting-responses) cannot read whole: a coding roxy does not decode, or a `206` | `503`, `_fail_closed`, `unsupported_content_encoding` or `partial_response` |
 | a body to sign is over `max_sign_body_bytes` | `413`, `_sign` |
 | the buffer budget is used up | `503`, `_fail_closed`, `buffer_budget_exhausted` |
 | a body or header limit is exceeded mid-stream | both sides are closed |
@@ -89,8 +90,8 @@ and records `upstream_body_timeout`.
 ### Buffer budget
 
 `max_buffered_bytes` bounds everything roxy buffers to inspect or copy:
-bodies that rules read, bodies being decoded or signed, WebSocket messages
-that rules read, endpoint call bodies, and copies for observing addons.
+bodies that rules read, bodies being decoded, compressed again or signed,
+WebSocket messages that rules read, endpoint call bodies, and copies for observing addons.
 Each exchange reserves what it needs before it buffers. If the budget
 cannot cover a reservation, the exchange fails at once
 (`buffer_budget_exhausted`). Nothing waits and nothing is evicted.
@@ -98,7 +99,9 @@ cannot cover a reservation, the exchange fails at once
 A body of unknown length that a rule reads reserves the whole
 `max_inspect_body_bytes`, so the defaults allow 1024 such bodies at once.
 The budget is not a cap on the process's memory: socket buffers, streaming
-buffers and addon memory are separate.
+buffers and addon memory are separate. So are the bytes that the masking
+of secrets holds back from a streaming response, which come to less than
+twice the longest injected secret.
 
 ## Connections
 

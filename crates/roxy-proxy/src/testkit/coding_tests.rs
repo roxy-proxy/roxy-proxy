@@ -35,6 +35,11 @@ fn gzip(b: &[u8]) -> Vec<u8> {
     e.finish().unwrap()
 }
 
+fn gunzip(b: &[u8]) -> Vec<u8> {
+    use roxy_http::coding::{Coding, decode, unmetered};
+    decode(&[Coding::Gzip], b, 1 << 20, unmetered()).expect("a gzip body")
+}
+
 async fn post(c: &mut Client, path: &str, headers: &[(&str, &str)], body: Vec<u8>) -> Answer {
     let req = c
         .request("POST", path, headers)
@@ -235,13 +240,14 @@ async fn with_layer(decode: bool) -> Kit {
 async fn a_layer_sees_the_request_body_decoded() {
     let kit = with_layer(true).await;
     // The layer upper-cases what it reads, so the upstream gets "HELLO"
-    // only if the layer was given the decoded text.
+    // only if the layer was given the decoded text. It gets it in the
+    // client's coding.
     let headers = [("content-encoding", "gzip"), ("x-upper", "1")];
     let a = post(&mut kit.h1().await, "/x", &headers, gzip(b"hello")).await;
     assert_eq!(a.status, 200, "{a:?}");
     let seen = kit.upstream.wait_seen(1).await;
-    assert_eq!(seen[0].body, b"HELLO");
-    assert!(!seen[0].headers.contains_key("content-encoding"));
+    assert_eq!(seen[0].headers["content-encoding"], "gzip");
+    assert_eq!(gunzip(&seen[0].body), b"HELLO");
 }
 
 #[tokio::test]
@@ -257,9 +263,10 @@ async fn a_layer_sees_the_response_body_decoded() {
         // An identity request body, which the upstream echoes as gzip.
         let a = post(&mut c, "/echo", &headers, gzip(b"hello")).await;
         assert_eq!(a.status, 200, "h2 {h2}: {a:?}");
-        assert!(!a.headers.contains_key("content-encoding"), "{a:?}");
-        // Upper-cased by the layer after decoding.
-        assert_eq!(a.text(), "HELLO");
+        // Upper-cased by the layer after decoding, and encoded again in
+        // the upstream's coding.
+        assert_eq!(a.headers["content-encoding"], "gzip", "{a:?}");
+        assert_eq!(gunzip(a.body.as_deref().unwrap()), b"HELLO");
     }
 }
 
@@ -415,13 +422,13 @@ async fn the_first_layer_that_runs_gets_bodies_decoded() {
     let a = post(&mut kit.h1().await, "/x", &headers, gzip(b"hello")).await;
     assert_eq!(a.status, 200, "{a:?}");
     let seen = kit.upstream.wait_seen(1).await;
-    assert_eq!(seen[0].body, b"HELLO");
-    assert!(!seen[0].headers.contains_key("content-encoding"));
+    assert_eq!(gunzip(&seen[0].body), b"HELLO");
+    assert_eq!(seen[0].headers["content-encoding"], "gzip");
 
     let headers = [("x-echo-encoding", "gzip"), ("x-upper", "1")];
     let a = post(&mut kit.h1().await, "/echo", &headers, gzip(b"hello")).await;
-    assert!(!a.headers.contains_key("content-encoding"), "{a:?}");
-    assert_eq!(a.text(), "HELLO");
+    assert_eq!(a.headers["content-encoding"], "gzip", "{a:?}");
+    assert_eq!(gunzip(a.body.as_deref().unwrap()), b"HELLO");
 }
 
 /// A layer its `when` skips is not in the WebSocket, so the WebSocket
@@ -480,8 +487,10 @@ async fn a_decoder_window_is_charged_while_a_layer_reads_the_body() {
     tx.send_data(Bytes::copy_from_slice(&gz[..16]))
         .await
         .unwrap();
+    // The request is encoded again on its way to the core, and that
+    // encoder is charged too.
     let charged = tokio::time::timeout(Duration::from_secs(10), async {
-        while kit.server.shared().buffered() != FLATE_WINDOW {
+        while kit.server.shared().buffered() < FLATE_WINDOW {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
     })
@@ -497,7 +506,8 @@ async fn a_decoder_window_is_charged_while_a_layer_reads_the_body() {
     tx.finish().await.unwrap();
     let a = answer.await.unwrap().unwrap();
     assert_eq!(a.status, 200, "{a:?}");
-    assert_eq!(a.json()["body_len"], text.len());
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(gunzip(&seen[0].body), text);
     let freed = tokio::time::timeout(Duration::from_secs(10), async {
         while kit.server.shared().buffered() != 0 {
             tokio::time::sleep(Duration::from_millis(5)).await;

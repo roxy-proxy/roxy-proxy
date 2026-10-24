@@ -451,6 +451,20 @@ components:
                   type: integer
                   minimum: 0
                   description: A service layer's id for the call that tripped it.
+            - type: object
+              description: >-
+                A secret the exchange injected came back in its response,
+                under `http.redact_response_secrets.quarantine`.
+              required: [kind, flow, part]
+              properties:
+                kind:
+                  const: secret_in_response
+                flow:
+                  type: string
+                  minLength: 1
+                part:
+                  type: string
+                  enum: [headers, body, trailers]
 
     LeaseQuarantine:
       type: object

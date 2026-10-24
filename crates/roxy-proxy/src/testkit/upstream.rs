@@ -334,6 +334,8 @@ impl Upstream {
     ///   status to its `x-echo-status` (default `200`);
     /// * `/trailers`: reads the body, answers `200` with an empty body
     ///   followed by the trailer `x-checksum: none`;
+    /// * `/reflect`: reads the body, answers `200` with the request's
+    ///   `authorization` as the header `x-reflect` and as the body;
     /// * `/grpc`: reads the body, answers `200 application/grpc` with the
     ///   body `hello` of undeclared length and the trailers
     ///   `grpc-status: 0`, `grpc-message: OK`; with `x-forbidden-trailer`
@@ -394,18 +396,13 @@ impl Upstream {
             return drip(&path);
         }
 
-        let host = req
-            .headers()
-            .get("host")
-            .map(|h| String::from_utf8_lossy(h.as_bytes()).into_owned())
-            .or_else(|| req.uri().authority().map(ToString::to_string));
-        let via = req
-            .headers()
-            .get("x-via")
-            .map(|h| String::from_utf8_lossy(h.as_bytes()).into_owned());
+        let host =
+            header_text(&req, "host").or_else(|| req.uri().authority().map(ToString::to_string));
+        let via = header_text(&req, "x-via");
         let method = req.method().to_string();
         let echo_encoding = req.headers().get("x-echo-encoding").cloned();
         let echo_status = req.headers().get("x-echo-status").cloned();
+        let authorization = req.headers().get("authorization").cloned();
         let read = self.clone().read_body(entry.clone(), req.into_body());
 
         if path == "/early" || path.starts_with("/early-drip?") {
@@ -437,6 +434,9 @@ impl Upstream {
         }
         if path == "/trailers" {
             return trailers();
+        }
+        if path == "/reflect" {
+            return reflect(authorization);
         }
         if let Some(code) = path.strip_prefix("/status/") {
             return http::Response::builder()
@@ -578,6 +578,21 @@ impl Upstream {
 }
 
 /// `/trailers`: an empty body with an `x-checksum` trailer.
+fn header_text(req: &http::Request<Incoming>, name: &str) -> Option<String> {
+    req.headers()
+        .get(name)
+        .map(|h| String::from_utf8_lossy(h.as_bytes()).into_owned())
+}
+
+/// `/reflect`: the request's `authorization`, as a header and as the body.
+fn reflect(authorization: Option<http::HeaderValue>) -> http::Response<Body> {
+    let auth = authorization.unwrap_or(http::HeaderValue::from_static(""));
+    http::Response::builder()
+        .header("x-reflect", auth.clone())
+        .body(full(Bytes::copy_from_slice(auth.as_bytes())))
+        .unwrap()
+}
+
 fn trailers() -> http::Response<Body> {
     let mut trailers = http::HeaderMap::new();
     trailers.insert("x-checksum", http::HeaderValue::from_static("none"));

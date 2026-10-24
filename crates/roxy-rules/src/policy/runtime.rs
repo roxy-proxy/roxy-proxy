@@ -302,20 +302,23 @@ impl Policy {
 
 /// Substitute secrets into a `set_header` value and validate the result.
 fn render(parts: &[Part], ctx: &EvalContext<'_>) -> Result<SetHeaderValue, FailClosedReason> {
-    let (out, from_secret) = render_text(parts, ctx)?;
-    Ok(if from_secret {
-        SetHeaderValue::from_secret(out)
-    } else {
+    let (out, secrets) = render_text(parts, ctx)?;
+    Ok(if secrets.is_empty() {
         SetHeaderValue::literal(out)
+    } else {
+        SetHeaderValue::from_secrets(out, secrets)
     })
 }
 
 /// Substitute secrets into a template. Every secret must be a valid header
 /// value: the rendered text goes into a request header, or (a signing key)
-/// into a signature that does. Also returns whether a secret was used.
-fn render_text(parts: &[Part], ctx: &EvalContext<'_>) -> Result<(String, bool), FailClosedReason> {
+/// into a signature that does. Also returns the secret values used.
+fn render_text(
+    parts: &[Part],
+    ctx: &EvalContext<'_>,
+) -> Result<(String, Vec<String>), FailClosedReason> {
     let mut out = String::new();
-    let mut from_secret = false;
+    let mut secrets = Vec::new();
     for part in parts {
         match part {
             Part::Lit(s) => out.push_str(s),
@@ -326,11 +329,11 @@ fn render_text(parts: &[Part], ctx: &EvalContext<'_>) -> Result<(String, bool), 
                     return Err(FailClosedReason::SecretInvalid(name.clone()));
                 }
                 out.push_str(&value);
-                from_secret = true;
+                secrets.push(value);
             }
         }
     }
-    Ok((out, from_secret))
+    Ok((out, secrets))
 }
 
 /// Resolve the credentials of a `sign: aws_sigv4` action.

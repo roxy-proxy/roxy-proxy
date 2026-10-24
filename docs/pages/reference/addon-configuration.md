@@ -203,13 +203,20 @@ gets the same answer.
 ### Content codings
 
 When an addon that reads bodies runs on an exchange, roxy decompresses
-the bodies for it and removes `content-encoding`. The client then gets an
-uncompressed response and the upstream an uncompressed request. Nothing
-is compressed again. A body in a coding roxy does not know, or a partial
-response (`206`), passes through as it is.
+the bodies for it and removes `content-encoding`. Each body is compressed
+again in its original coding as it leaves the addons, so the client and
+the upstream get the coding they asked for
+([content codings](/reference/http#content-codings)). An addon that sets
+its own `content-encoding` has compressed the body itself, and roxy leaves
+it as it is. A body in a coding roxy does not know, or a partial response
+(`206`), passes through as it is.
 
 `http.decode_for_addons: false` turns this off, so addons see bodies as
-sent.
+sent. The masking of secrets in responses
+([redacting responses](/reference/secrets#redacting-responses)) decodes a
+response whatever this switch says, and refuses one it cannot decode or a
+`206`. Addons then get that response decoded, and its head without
+`content-encoding`, even an addon that reads only heads.
 
 ### WebSockets
 

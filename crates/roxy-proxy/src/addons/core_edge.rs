@@ -15,7 +15,7 @@ use roxy_wasm::{LayerError, LayerRequest};
 use super::attribution::{Side, attributed};
 use super::chain::{CoreIo, Head, Headless, LaneState, LaneTx};
 use super::client_edge::refusal_for_fault;
-use super::{StackFlow, decode, ws};
+use super::{StackFlow, lock, ws};
 use crate::body::{Collected, collect_prefix};
 use crate::exchange::{ClientTransport, Outcome, refusal_response};
 use crate::pipeline::{BodyIo, CollectFuture, Refusal};
@@ -35,7 +35,7 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
         arrived = req_in.head() => arrived,
     };
     let req = match arrived {
-        Ok((Head::Request(parts), body)) => http::Request::from_parts(parts, body),
+        Ok((Head::Request(parts), body)) => reencoded(&st, parts, body),
         Ok((Head::Response(_), _)) => unreachable!("a request lane carries requests"),
         // Nothing was forwarded: nothing answers.
         Err(Headless::Ended) => return res_out.end_headless(),
@@ -51,6 +51,10 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
     };
     let cx = lease.cx();
     cx.layer_reads_bytes = st.reads_bytes();
+    cx.response_leg = crate::recode::Leg::Stack {
+        decode: st.snap.http.decode_for_addons
+            && st.body_subscribed(crate::in_flight::Dir::Response),
+    };
     cx.facts.request = Some(crate::pipeline::request_facts(&creq));
     st.set_facts(&cx.facts);
     let mut transport = LaneTransport;
@@ -67,14 +71,12 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
     };
     let cx = lease.cx();
     st.set_facts(&cx.facts);
-    let snap = st.snap.clone();
     match outcome {
         Outcome::Respond(mut res) => {
+            // The layers' response carries no meta: what the core decoded
+            // it from waits for the client edge on the flow.
+            *lock(&st.response_codings) = std::mem::take(&mut res.meta.decoded_from);
             res.body = attributed(&st, Side::Upstream, std::mem::take(&mut res.body));
-            // A response body no layer reads passes through unchanged.
-            if snap.http.decode_for_addons && st.body_subscribed(crate::in_flight::Dir::Response) {
-                decode::response(&st, &mut res, snap.limits.max_response_body_bytes);
-            }
             answer(res_out, res);
             if let Some(delivery) = lease.cx().request_delivery.take() {
                 tokio::select! {
@@ -189,6 +191,15 @@ pub(super) fn admit(
             None
         }
     }
+}
+
+/// The request the last layer passed on, encoded again as it was before
+/// the layers decoded it, so the rules and the flow log see it as it will
+/// leave.
+fn reencoded(st: &StackFlow, mut parts: http::request::Parts, mut body: Body) -> LayerRequest {
+    let codings = std::mem::take(&mut *lock(&st.request_codings));
+    crate::recode::encode_request(&st.shared, &mut parts.headers, &mut body, &codings);
+    http::Request::from_parts(parts, body)
 }
 
 fn answer(res_out: LaneTx, res: roxy_http::CanonicalResponse) {

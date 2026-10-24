@@ -133,6 +133,7 @@ where
         // The upstream's `connection: close` concerns roxy's upstream
         // connection only; it must not close the client's.
         close: false,
+        decoded_from: Vec::new(),
     };
     CanonicalResponse {
         status: parts.status,

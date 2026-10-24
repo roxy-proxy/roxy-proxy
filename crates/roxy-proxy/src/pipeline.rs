@@ -563,6 +563,9 @@ pub(crate) struct FlowCx {
     /// A `sign` effect of the admission decision, applied once every other
     /// request change has settled.
     pub sign: Option<AwsSigV4>,
+    /// The secret values `set_header` effects put into the forwarded
+    /// request: what an upstream could echo that the client never held.
+    pub injected: Vec<String>,
     /// Request body bytes forwarded so far (and their digest once the
     /// body completed), once the request is on its way.
     pub request_tally: Option<Arc<crate::body::Tally>>,
@@ -575,6 +578,8 @@ pub(crate) struct FlowCx {
     /// An addon layer that ran on this request reads a body: on an upgrade,
     /// it is in the WebSocket's byte path.
     pub layer_reads_bytes: bool,
+    /// Where the core hands its response, and what it decoded it from.
+    pub response_leg: crate::recode::Leg,
     /// The exchange's share of the buffer budget, held until it ends: the
     /// buffered body text stays with the facts for as long as the flow.
     pub buffers: Vec<BufferLease>,
@@ -710,6 +715,7 @@ impl FlowCx {
             taps: PerDir::default(),
             host_override: None,
             sign: None,
+            injected: Vec::new(),
             request_tally: None,
             request_delivery: None,
             tasks: {
@@ -719,6 +725,7 @@ impl FlowCx {
             },
             stack: None,
             layer_reads_bytes: false,
+            response_leg: crate::recode::Leg::Direct,
             buffers: Vec::new(),
             logged: false,
         })
@@ -1112,7 +1119,7 @@ async fn inspect_request_body(
 
 /// A body that carries no bytes needs no inspection buffer; the rules see
 /// it as empty text.
-fn known_empty(body: &Body) -> bool {
+pub(crate) fn known_empty(body: &Body) -> bool {
     body.known_length() == Some(0) || http_body::Body::is_end_stream(body)
 }
 
@@ -1365,6 +1372,7 @@ fn apply_request_effect(
             req.headers
                 .insert(&name, value.as_str())
                 .map_err(|e| invalid(kind, &e))?;
+            cx.injected.extend_from_slice(value.secrets());
             cx.record.mutations.push(format!("set_header:{name}"));
         }
         Effect::RemoveHeader(name) => {
@@ -1525,7 +1533,7 @@ async fn inspect_response_body(
 
 /// A response with no body by its status, its framing, or because the
 /// request was a `HEAD`.
-fn response_known_empty(cx: &FlowCx, res: &CanonicalResponse) -> bool {
+pub(crate) fn response_known_empty(cx: &FlowCx, res: &CanonicalResponse) -> bool {
     status_forbids_body(res.status)
         || cx
             .facts

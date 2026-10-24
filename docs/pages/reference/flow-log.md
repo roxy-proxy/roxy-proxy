@@ -41,7 +41,7 @@ Common reasons, by `terminal_rule`:
 
 | `terminal_rule` | `reason` |
 |---|---|
-| `_fail_closed` | `metric_unavailable`, `metric_table_full`, `address_list_unavailable`, `secret_missing`, `secret_invalid`, `body_too_large_to_inspect`, `body_decode_failed`, `unsupported_content_encoding`, `buffer_budget_exhausted`, `missing_value`, `state_unavailable`, `sign_conflict`, `effect_invalid` |
+| `_fail_closed` | `metric_unavailable`, `metric_table_full`, `address_list_unavailable`, `secret_missing`, `secret_invalid`, `body_too_large_to_inspect`, `body_decode_failed`, `unsupported_content_encoding`, `partial_response`, `buffer_budget_exhausted`, `missing_value`, `state_unavailable`, `sign_conflict`, `effect_invalid` |
 | `_address_policy` | `address_policy` |
 | `_expired` | `policy_expired` ([lease](/guides/operations#lease)) |
 | `_quarantined` | `quarantined` ([quarantine](/guides/operations#quarantine)) |
@@ -82,7 +82,7 @@ Common reasons, by `terminal_rule`:
 Secret values that roxy injects are removed from everything it logs. The
 values of `authorization`, `proxy-authorization`, `cookie`, `set-cookie`
 and `x-api-key` are never logged, and `log.redact_headers` adds more.
-Query values are redacted.
+Query values are redacted. Each is logged as `[REDACTED]`.
 
 ### Writing
 
@@ -130,8 +130,11 @@ with `capture: request | response | both`, or every exchange with
 `log.capture.all: true`. It is written like the flow log, with the same
 batching, rotation and backpressure.
 
-Secret values are removed from captured headers and URLs. **Bodies are
-captured unredacted.**
+Secret values are masked in captured headers and URLs. **Bodies are
+captured unredacted**, as they cross roxy's edge: a response is captured
+as the upstream sent it, before roxy decompresses it for addons or masks
+secrets in it
+([redacting responses](/reference/secrets#redacting-responses)).
 
 ```yaml
 capture_dir: /var/lib/roxy/capture   # absent = capture off; restart to change
