@@ -105,6 +105,21 @@ pub struct HttpBehaviour {
     /// `http.decode_for_addons`: decode bodies at the edge of the addon
     /// stack. Default true.
     pub decode_for_addons: bool,
+    /// `http.redact_response_secrets`: scrub injected secret values from
+    /// the responses of the exchanges that injected them.
+    pub redact_response_secrets: ResponseRedaction,
+}
+
+/// Which parts of a response the exchange's secret values are scrubbed
+/// from, on an exchange that injected one. Both off by default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ResponseRedaction {
+    /// The head's field values, and the trailers'.
+    pub headers: bool,
+    /// The body's bytes, decoded first if the upstream encoded them.
+    pub bodies: bool,
+    /// Quarantine the process when a scrubbed part held a secret.
+    pub quarantine: bool,
 }
 
 impl Default for HttpBehaviour {
@@ -115,6 +130,7 @@ impl Default for HttpBehaviour {
             allow_plain_in_connect: false,
             strip_accept_encoding: false,
             decode_for_addons: true,
+            redact_response_secrets: ResponseRedaction::default(),
         }
     }
 }

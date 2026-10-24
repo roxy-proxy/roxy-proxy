@@ -6,7 +6,7 @@
 use ipnet::IpNet;
 use roxy_http::url::parse_host;
 use roxy_http::{Host, HttpFlags, Limits};
-use roxy_proxy::HttpBehaviour;
+use roxy_proxy::{HttpBehaviour, ResponseRedaction};
 use roxy_proxy::addr::AddressPolicy;
 use roxy_proxy::addrlist::normalise_net;
 use roxy_proxy::{DnsSettings, UpstreamSettings};
@@ -66,6 +66,11 @@ impl From<&Config> for HttpBehaviour {
             allow_plain_in_connect: h.allow_plain_in_connect,
             strip_accept_encoding: h.strip_accept_encoding,
             decode_for_addons: h.decode_for_addons,
+            redact_response_secrets: ResponseRedaction {
+                headers: h.redact_response_secrets.headers,
+                bodies: h.redact_response_secrets.bodies,
+                quarantine: h.redact_response_secrets.quarantine,
+            },
         }
     }
 }

@@ -39,6 +39,7 @@ impl Config {
         self.validate_listeners(&mut d);
         self.validate_tls(&mut d);
         self.validate_secrets(&mut d);
+        self.validate_redaction(&mut d);
         self.validate_address_lists(&mut d);
         self.validate_addons(&mut d);
         self.validate_limits(&mut d);
@@ -221,6 +222,16 @@ impl Config {
                     "secret source must not be empty",
                 ));
             }
+        }
+    }
+
+    fn validate_redaction(&self, d: &mut Vec<Diagnostic>) {
+        let r = &self.http.redact_response_secrets;
+        if r.quarantine && !r.headers && !r.bodies {
+            d.push(Diagnostic::new(
+                "http.redact_response_secrets.quarantine",
+                "needs `headers` or `bodies`: a secret is only found in a part roxy scrubs",
+            ));
         }
     }
 
