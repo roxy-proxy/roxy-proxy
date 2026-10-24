@@ -48,6 +48,8 @@ mod lease_tests;
 mod quarantine_tests;
 mod reclamation_tests;
 #[cfg(test)]
+mod redact_tests;
+#[cfg(test)]
 mod rules_tests;
 #[cfg(test)]
 mod sign_tests;

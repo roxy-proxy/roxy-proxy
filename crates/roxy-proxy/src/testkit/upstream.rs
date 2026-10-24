@@ -334,6 +334,8 @@ impl Upstream {
     ///   status to its `x-echo-status` (default `200`);
     /// * `/trailers`: reads the body, answers `200` with an empty body
     ///   followed by the trailer `x-checksum: none`;
+    /// * `/reflect`: reads the body, answers `200` with the request's
+    ///   `authorization` as the header `x-reflect` and as the body;
     /// * `/grpc`: reads the body, answers `200 application/grpc` with the
     ///   body `hello` of undeclared length and the trailers
     ///   `grpc-status: 0`, `grpc-message: OK`; with `x-forbidden-trailer`
@@ -406,6 +408,7 @@ impl Upstream {
         let method = req.method().to_string();
         let echo_encoding = req.headers().get("x-echo-encoding").cloned();
         let echo_status = req.headers().get("x-echo-status").cloned();
+        let authorization = req.headers().get("authorization").cloned();
         let read = self.clone().read_body(entry.clone(), req.into_body());
 
         if path == "/early" || path.starts_with("/early-drip?") {
@@ -437,6 +440,13 @@ impl Upstream {
         }
         if path == "/trailers" {
             return trailers();
+        }
+        if path == "/reflect" {
+            let auth = authorization.unwrap_or(http::HeaderValue::from_static(""));
+            return http::Response::builder()
+                .header("x-reflect", auth.clone())
+                .body(full(Bytes::copy_from_slice(auth.as_bytes())))
+                .unwrap();
         }
         if let Some(code) = path.strip_prefix("/status/") {
             return http::Response::builder()
