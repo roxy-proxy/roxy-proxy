@@ -212,7 +212,11 @@ it as it is. A body in a coding roxy does not know, or a partial response
 (`206`), passes through as it is.
 
 `http.decode_for_addons: false` turns this off, so addons see bodies as
-sent.
+sent. The masking of secrets in responses
+([redacting responses](/reference/secrets#redacting-responses)) decodes a
+response whatever this switch says, and refuses one it cannot decode or a
+`206`. Addons then get that response decoded, and its head without
+`content-encoding`, even an addon that reads only heads.
 
 ### WebSockets
 

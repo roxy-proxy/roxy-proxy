@@ -99,7 +99,9 @@ cannot cover a reservation, the exchange fails at once
 A body of unknown length that a rule reads reserves the whole
 `max_inspect_body_bytes`, so the defaults allow 1024 such bodies at once.
 The budget is not a cap on the process's memory: socket buffers, streaming
-buffers and addon memory are separate.
+buffers and addon memory are separate. So are the bytes that the masking
+of secrets holds back from a streaming response, which come to less than
+twice the longest injected secret.
 
 ## Connections
 

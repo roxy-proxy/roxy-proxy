@@ -199,9 +199,10 @@ through unchanged. Size and time limits are in
 
 ## Content codings
 
-roxy decodes `content-encoding` only to inspect a body. `body.text` and
-`response.body.text` see the decoded text, while the bytes forwarded are
-the bytes received ([body rules](/reference/rule-language#body-rules)).
+For the rules, roxy decodes `content-encoding` only to inspect a body.
+`body.text` and `response.body.text` see the decoded text, while the
+bytes forwarded are the bytes received
+([body rules](/reference/rule-language#body-rules)).
 
 Addons that read bodies
 ([content codings for addons](/reference/addon-configuration#content-codings))
