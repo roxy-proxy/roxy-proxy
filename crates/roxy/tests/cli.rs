@@ -772,21 +772,20 @@ fn rule_test_checks_a_websocket_message() {
 
 /// `check` reports `valid_until`, warns when it has already passed (the
 /// document still passes: it loads and denies), and refuses a malformed one.
-/// `check` names the capture file, which says the format, and what is
-/// captured.
+/// `check` names the capture file and what is captured.
 #[test]
-fn check_reports_the_capture_format() {
+fn check_reports_the_capture_file() {
     let dir = tempfile::tempdir().unwrap();
     let cfg = dir.path().join("roxy.yaml");
     let base = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:0 }]\ncapture_dir: /tmp/c\n";
     for (extra, line) in [
         (
             "",
-            "capture: /tmp/c/capture.rxc (rxc, exchanges a rule selects)\n",
+            "capture: /tmp/c/capture.jsonl (exchanges a rule selects)\n",
         ),
         (
-            "log: { capture: { format: jsonl, all: true } }\n",
-            "capture: /tmp/c/capture.jsonl (jsonl, every forwarded exchange)\n",
+            "log: { capture: { all: true } }\n",
+            "capture: /tmp/c/capture.jsonl (every forwarded exchange)\n",
         ),
     ] {
         std::fs::write(&cfg, format!("{base}{extra}")).unwrap();

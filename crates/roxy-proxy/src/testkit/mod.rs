@@ -301,7 +301,6 @@ pub(crate) struct KitBuilder {
     /// Open a capture log: `Some(true)` takes every forwarded exchange,
     /// `Some(false)` only those a `capture` action selects.
     capture: Option<bool>,
-    capture_format: crate::capture::CaptureFormat,
     secrets: HashMap<String, String>,
     /// `address_lists:` by name, as list source text.
     address_lists: HashMap<String, String>,
@@ -347,13 +346,6 @@ impl KitBuilder {
     #[must_use]
     pub(crate) fn capture_selected(mut self) -> Self {
         self.capture = Some(false);
-        self
-    }
-
-    /// Writes the capture log in `format` rather than the default.
-    #[must_use]
-    pub(crate) fn capture_format(mut self, format: crate::capture::CaptureFormat) -> Self {
-        self.capture_format = format;
         self
     }
 
@@ -546,9 +538,7 @@ impl KitBuilder {
             f(&mut settings);
         }
         let (limits, flags, http) = (self.limits.clone(), self.flags.clone(), self.http.clone());
-        let capture = self
-            .capture
-            .map(|all| capture_log(dir.path(), all, self.capture_format));
+        let capture = self.capture.map(|all| capture_log(dir.path(), all));
         let server_sink: Arc<dyn FlowSink> = match &self.log_gate {
             Some(gate) => Arc::new(gate::GatedSink::new(sink.clone(), gate.clone())),
             None => sink.clone(),
@@ -773,7 +763,6 @@ impl Kit {
             },
             state: Arc::new(UnavailableState),
             capture: None,
-            capture_format: crate::capture::CaptureFormat::default(),
             secrets: HashMap::new(),
             address_lists: HashMap::new(),
             deny_lists: Vec::new(),
@@ -1063,7 +1052,7 @@ impl Kit {
     pub(crate) fn captured(&self) -> Vec<(serde_json::Value, Vec<u8>)> {
         let log = self.capture.as_ref().expect("capture_all");
         assert!(log.flush());
-        crate::capture::tests::parse_as(log.format(), &std::fs::read(log.path()).unwrap())
+        crate::capture::tests::parse(&std::fs::read(log.path()).unwrap())
     }
 
     /// Waits until `n` requests have reached the upstream (their bodies may
@@ -1409,17 +1398,12 @@ fn metric_source(
 }
 
 /// A capture log in `<dir>/capture`; `all` takes every forwarded exchange.
-fn capture_log(
-    dir: &std::path::Path,
-    all: bool,
-    format: crate::capture::CaptureFormat,
-) -> Arc<crate::capture::CaptureLog> {
+fn capture_log(dir: &std::path::Path, all: bool) -> Arc<crate::capture::CaptureLog> {
     let log = crate::capture::CaptureLog::open(
         &dir.join("capture"),
         crate::capture::CaptureOptions {
             max_body_bytes: 16 * 1024 * 1024,
             all,
-            format,
             writer: roxy_log::WriterOptions::default(),
             rotate: roxy_log::RotateOptions::default(),
         },

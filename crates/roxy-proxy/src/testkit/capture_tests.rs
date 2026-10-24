@@ -33,15 +33,11 @@ fn kinds(recs: &[&(Value, Vec<u8>)]) -> Vec<String> {
         .collect()
 }
 
-/// A `jsonl` capture carries the same exchange as `rxc`: an upload whose
-/// bytes include newlines comes back byte for byte from the base64 lines.
+/// Every record is one line, and an upload holding every byte value,
+/// newlines included, comes back byte for byte from the base64.
 #[tokio::test]
-async fn a_jsonl_capture_records_the_same_exchange() {
-    let kit = Kit::builder()
-        .capture_all()
-        .capture_format(crate::capture::CaptureFormat::Jsonl)
-        .start()
-        .await;
+async fn every_byte_value_round_trips_through_the_lines() {
+    let kit = Kit::builder().capture_all().start().await;
     let mut c = kit.h1().await;
     let sent: Vec<u8> = (0..=255u8).cycle().take(64 * 1024).collect();
     let req = c

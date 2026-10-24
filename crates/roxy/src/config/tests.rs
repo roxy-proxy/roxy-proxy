@@ -1226,21 +1226,6 @@ fn restart(running: &str, new: &str) -> Vec<&'static str> {
     changed
 }
 
-/// `log.capture.format` parses, defaults to `rxc`, refuses anything else,
-/// and changing it needs a restart: the open file is the old format's.
-#[test]
-fn capture_format_parses_and_needs_a_restart() {
-    let base = format!("{BASE}capture_dir: /tmp/c\n");
-    let rxc = parse(&base);
-    assert_eq!(rxc.log.capture.format, roxy_proxy::CaptureFormat::Rxc);
-    let jsonl = format!("{base}log:\n  capture:\n    format: jsonl\n");
-    let cfg = parse(&jsonl);
-    cfg.validate().unwrap();
-    assert_eq!(cfg.log.capture.format, roxy_proxy::CaptureFormat::Jsonl);
-    assert!(Config::from_yaml(&format!("{base}log:\n  capture:\n    format: csv\n")).is_err());
-    assert_eq!(restart(&base, &jsonl), ["log.capture"]);
-}
-
 #[test]
 fn listeners_need_a_restart() {
     let base = "version: 1\nlisteners: [{ name: p, bind: 127.0.0.1:443 }]\n";

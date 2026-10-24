@@ -584,14 +584,14 @@ async fn capture_cap_truncates_explicitly() {
 }
 
 /// A capture destination that cannot keep up holds traffic back instead of
-/// dropping captured bytes: `capture.rxc` is a FIFO whose reader does not
+/// dropping captured bytes: `capture.jsonl` is a FIFO whose reader does not
 /// read until the test lets it.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stalled_capture_log_holds_traffic() {
     use std::io::Read;
     let fifo_dir = tempfile::tempdir().unwrap();
-    let fifo = fifo_dir.path().join("capture.rxc");
+    let fifo = fifo_dir.path().join(roxy_proxy::CAPTURE_FILE);
     let made = std::process::Command::new("mkfifo")
         .arg(&fifo)
         .status()

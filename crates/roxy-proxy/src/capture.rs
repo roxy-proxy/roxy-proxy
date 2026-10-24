@@ -1,21 +1,19 @@
 //! Body capture and traffic teeing.
 //!
-//! Captured traffic is one append-only stream, `<capture_dir>/capture.rxc`
-//! or `<capture_dir>/capture.jsonl` by [`CaptureFormat`], written through a [`LogWriter`] (one writer thread, batching, rotation,
+//! Captured traffic is one append-only stream, `<capture_dir>/capture.jsonl`,
+//! written through a [`LogWriter`] (one writer thread, batching, rotation,
 //! and the same backpressure as the flow log: capture is never dropped; a
 //! slow disk slows traffic).
 //!
 //! # Format
 //!
-//! In `rxc`, a sequence of records. Each record is one JSON header line, then exactly
-//! `len` payload bytes, then `\n`:
+//! One JSON object per line, so a line-oriented shipper can split the file
+//! on `\n` without corrupting a payload:
 //!
 //! ```text
-//! {"flow":"01J9…","dir":"request","kind":"head","seq":0,"len":187}
-//! {"method":"POST","url":"https://api.example.com/v1/x","headers":[["content-type","application/json"]]}
-//! {"flow":"01J9…","dir":"request","kind":"data","seq":1,"len":5}
-//! hello
-//! {"flow":"01J9…","dir":"request","kind":"end","seq":2,"len":0,"bytes":5}
+//! {"flow":"01J9…","dir":"request","kind":"head","seq":0,"head":{"headers":[["content-type","application/json"]],"method":"POST","url":"https://api.example.com/v1/x"}}
+//! {"flow":"01J9…","dir":"request","kind":"data","seq":1,"data":"aGVsbG8="}
+//! {"flow":"01J9…","dir":"request","kind":"end","seq":2,"bytes":5}
 //! ```
 //!
 //! - `flow` joins the records to the flow log's events.
@@ -23,20 +21,17 @@
 //!   client). The WebSocket relay uses the same names for its two
 //!   directions.
 //! - `kind`:
-//!   - `head`: the canonical head as JSON, after rule effects, i.e. as
-//!     forwarded;
-//!   - `data`: body bytes, exactly as forwarded (or relayed);
+//!   - `head`: the canonical head as JSON under `head`, after rule
+//!     effects, i.e. as forwarded;
+//!   - `data`: body bytes, exactly as forwarded (or relayed), base64 under
+//!     `data`; at most [`DATA_RECORD_MAX`] bytes, so a larger chunk spans
+//!     several records;
 //!   - `truncated`: `limits.max_capture_body_bytes` was reached; nothing
 //!     more of this direction is captured. The record carries the cap.
 //!   - `end`: the direction ended. It carries the total `bytes` forwarded,
 //!     and `aborted: true` if it did not complete (stopped by a rule, the
 //!     client or upstream went away, an error).
 //! - `seq` counts records per flow and direction.
-//!
-//! In `jsonl`, the same records one JSON object per line, with no `len`:
-//! a head nested under `head`, data base64 under `data`, and a data
-//! record at most [`JSONL_DATA_MAX`] bytes, so a larger chunk spans
-//! several records.
 //!
 //! What is captured is what was forwarded: data records are written by the
 //! same body adapters that forward each chunk, after the in-flight rules
@@ -60,59 +55,19 @@ use roxy_log::{LogWriter, RotateOptions, RotatingFile, WriterOptions};
 
 use crate::secrets::Secrets;
 
-/// The capture file's name inside `capture_dir`, in the default format.
-pub const CAPTURE_FILE: &str = "capture.rxc";
+/// The capture file's name inside `capture_dir`.
+pub const CAPTURE_FILE: &str = "capture.jsonl";
 
-/// How capture records are laid out on disk: `log.capture.format`.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CaptureFormat {
-    /// A JSON header line, then `len` raw payload bytes, then `\n`.
-    #[default]
-    Rxc,
-    /// One JSON object per line, the payload inline: a head nested under
-    /// `head`, body bytes base64 under `data`. Line-oriented shippers split
-    /// on `\n`, which raw payload bytes would corrupt.
-    Jsonl,
-}
-
-/// The most body bytes one `jsonl` data record carries: 64 KiB once base64
+/// The most body bytes one data record carries: 64 KiB once base64
 /// encoded. Forwarded chunks have no useful bound of their own (a
 /// WebSocket message can be 16 MiB), and a shipper's line limit needs one.
-pub const JSONL_DATA_MAX: usize = 48 << 10;
-
-impl CaptureFormat {
-    /// The capture file's name inside `capture_dir`. Rotations append
-    /// `.<UTC>-<seq>`, so the name tells a reader the format.
-    pub fn file_name(self) -> &'static str {
-        match self {
-            Self::Rxc => CAPTURE_FILE,
-            Self::Jsonl => "capture.jsonl",
-        }
-    }
-
-    /// The most body bytes one data record carries.
-    fn data_max(self) -> usize {
-        match self {
-            Self::Rxc => usize::MAX,
-            Self::Jsonl => JSONL_DATA_MAX,
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Rxc => "rxc",
-            Self::Jsonl => "jsonl",
-        }
-    }
-}
+pub const DATA_RECORD_MAX: usize = 48 << 10;
 
 /// The capture destination, shared by every exchange.
 #[derive(Debug)]
 pub struct CaptureLog {
     writer: LogWriter,
     path: PathBuf,
-    format: CaptureFormat,
     max_body: u64,
     all: bool,
 }
@@ -124,22 +79,19 @@ pub struct CaptureOptions {
     pub max_body_bytes: u64,
     /// Capture every forwarded exchange, not only those a rule selects.
     pub all: bool,
-    pub format: CaptureFormat,
     pub writer: WriterOptions,
     pub rotate: RotateOptions,
 }
 
 impl CaptureLog {
-    /// Opens the format's file in `dir` for appending, creating `dir` if
-    /// needed.
+    /// Opens `<dir>/capture.jsonl` for appending, creating `dir` if needed.
     pub fn open(dir: &Path, opts: CaptureOptions) -> io::Result<Self> {
         std::fs::create_dir_all(dir)?;
-        let path = dir.join(opts.format.file_name());
+        let path = dir.join(CAPTURE_FILE);
         let dest = RotatingFile::open(&path, opts.rotate)?;
         Ok(Self {
             writer: LogWriter::spawn("capture", dest, opts.writer)?,
             path,
-            format: opts.format,
             max_body: opts.max_body_bytes,
             all: opts.all,
         })
@@ -147,10 +99,6 @@ impl CaptureLog {
 
     pub fn path(&self) -> &Path {
         &self.path
-    }
-
-    pub fn format(&self) -> CaptureFormat {
-        self.format
     }
 
     /// Whether every forwarded exchange is captured.
@@ -173,47 +121,27 @@ impl CaptureLog {
         self.writer.reopen();
     }
 
-    /// Appends one record as one unit: in `rxc` the header line, the
-    /// payload and `\n`; in `jsonl` one line with the payload inline.
+    /// Appends one record: one line, the payload inline.
     fn record(&self, flow: &str, dir: Dir, kind: &str, seq: u64, extra: &str, payload: Payload) {
         let mut line = String::with_capacity(128);
         let _ = write!(
             line,
-            "{{\"flow\":\"{flow}\",\"dir\":\"{}\",\"kind\":\"{kind}\",\"seq\":{seq}",
+            "{{\"flow\":\"{flow}\",\"dir\":\"{}\",\"kind\":\"{kind}\",\"seq\":{seq}{extra}",
             dir.as_str()
         );
-        let buf = match self.format {
-            CaptureFormat::Rxc => {
-                let bytes = match &payload {
-                    Payload::None => Vec::new(),
-                    Payload::Head(v) => v.to_string().into_bytes(),
-                    Payload::Data(d) => d.to_vec(),
-                };
-                let _ = writeln!(line, ",\"len\":{}{extra}}}", bytes.len());
-                let mut buf = Vec::with_capacity(line.len() + bytes.len() + 1);
-                buf.extend_from_slice(line.as_bytes());
-                buf.extend_from_slice(&bytes);
-                buf.push(b'\n');
-                buf
+        match payload {
+            Payload::None => {}
+            Payload::Head(v) => {
+                let _ = write!(line, ",\"head\":{v}");
             }
-            CaptureFormat::Jsonl => {
-                line.push_str(extra);
-                match payload {
-                    Payload::None => {}
-                    Payload::Head(v) => {
-                        let _ = write!(line, ",\"head\":{v}");
-                    }
-                    Payload::Data(d) => {
-                        line.push_str(",\"data\":\"");
-                        BASE64_STANDARD.encode_string(d, &mut line);
-                        line.push('"');
-                    }
-                }
-                line.push_str("}\n");
-                line.into_bytes()
+            Payload::Data(d) => {
+                line.push_str(",\"data\":\"");
+                BASE64_STANDARD.encode_string(d, &mut line);
+                line.push('"');
             }
-        };
-        self.writer.append(&buf);
+        }
+        line.push_str("}\n");
+        self.writer.append(line.as_bytes());
     }
 }
 
@@ -334,7 +262,7 @@ impl Tap {
         let captured = self.bytes - d.len() as u64;
         let room = self.log.max_body.saturating_sub(captured);
         let take = usize::try_from(room).unwrap_or(usize::MAX).min(d.len());
-        for part in d[..take].chunks(self.log.format.data_max()) {
+        for part in d[..take].chunks(DATA_RECORD_MAX) {
             let seq = self.next_seq();
             self.log
                 .record(&self.flow, self.dir, "data", seq, "", Payload::Data(part));
@@ -398,55 +326,24 @@ pub(crate) mod tests {
     use crate::flowlog::{REDACTED, Redactor};
     use crate::secrets::SecretStore;
 
-    /// Parses a capture file into `(header, payload)` records.
+    /// Parses a capture file into `(header, payload)` records: the payload
+    /// taken out of the line, a head re-serialised and data base64-decoded.
     pub(crate) fn parse(bytes: &[u8]) -> Vec<(serde_json::Value, Vec<u8>)> {
-        let mut out = Vec::new();
-        let mut rest = bytes;
-        while !rest.is_empty() {
-            let nl = rest.iter().position(|&b| b == b'\n').expect("header line");
-            let head: serde_json::Value = serde_json::from_slice(&rest[..nl]).unwrap();
-            let len = usize::try_from(head["len"].as_u64().unwrap()).unwrap();
-            let payload = rest[nl + 1..nl + 1 + len].to_vec();
-            assert_eq!(rest[nl + 1 + len], b'\n', "record terminator");
-            rest = &rest[nl + 2 + len..];
-            out.push((head, payload));
-        }
-        out
-    }
-
-    /// Parses a `jsonl` capture file into the same `(header, payload)`
-    /// records as [`parse`]: the payload taken out of the line (a head
-    /// re-serialised, data base64-decoded) and `len` added, so the two
-    /// formats compare equal record for record.
-    pub(crate) fn parse_jsonl(bytes: &[u8]) -> Vec<(serde_json::Value, Vec<u8>)> {
-        let text = std::str::from_utf8(bytes).expect("jsonl is UTF-8");
+        let text = std::str::from_utf8(bytes).expect("capture is UTF-8");
         assert!(text.is_empty() || text.ends_with('\n'), "last line ends");
         text.lines()
             .map(|line| {
                 let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
                 let obj = v.as_object_mut().unwrap();
-                assert!(obj.get("len").is_none(), "{line}");
                 let payload = match (obj.remove("head"), obj.remove("data")) {
                     (Some(head), None) => head.to_string().into_bytes(),
                     (None, Some(data)) => BASE64_STANDARD.decode(data.as_str().unwrap()).unwrap(),
                     (None, None) => Vec::new(),
                     (Some(_), Some(_)) => panic!("head and data: {line}"),
                 };
-                obj.insert("len".into(), payload.len().into());
                 (v, payload)
             })
             .collect()
-    }
-
-    /// Parses a capture file written in `format`.
-    pub(crate) fn parse_as(
-        format: CaptureFormat,
-        bytes: &[u8],
-    ) -> Vec<(serde_json::Value, Vec<u8>)> {
-        match format {
-            CaptureFormat::Rxc => parse(bytes),
-            CaptureFormat::Jsonl => parse_jsonl(bytes),
-        }
     }
 
     /// A secret generation holding `values`.
@@ -460,17 +357,12 @@ pub(crate) mod tests {
     }
 
     fn log(dir: &Path, max_body: u64) -> Arc<CaptureLog> {
-        log_as(dir, max_body, CaptureFormat::Rxc)
-    }
-
-    fn log_as(dir: &Path, max_body: u64, format: CaptureFormat) -> Arc<CaptureLog> {
         Arc::new(
             CaptureLog::open(
                 dir,
                 CaptureOptions {
                     max_body_bytes: max_body,
                     all: false,
-                    format,
                     writer: WriterOptions::default(),
                     rotate: RotateOptions::default(),
                 },
@@ -576,12 +468,13 @@ pub(crate) mod tests {
         assert_eq!(head["headers"], serde_json::json!([["x-echo", REDACTED]]));
     }
 
-    /// One exchange's worth of records through a log in `format`: a
-    /// redacted head, data with a newline and a non-UTF-8 byte, a
-    /// truncation, and an aborted direction.
-    fn sample(format: CaptureFormat) -> (Arc<CaptureLog>, tempfile::TempDir) {
+    /// The line shape, pinned: a redacted head, data with a newline and a
+    /// non-UTF-8 byte, a truncation, and an aborted direction.
+    #[test]
+    fn records_are_one_line_each() {
         let dir = tempfile::tempdir().unwrap();
-        let log = log_as(dir.path(), 8, format);
+        let log = log(dir.path(), 8);
+        assert!(log.path().ends_with(CAPTURE_FILE));
         let mut res = CanonicalResponse::new(http::StatusCode::OK);
         res.headers.append("x-echo", "sk-1").unwrap();
         let mut t = Tap::new(log.clone(), secrets(&["sk-1"]), "F1", Dir::Response);
@@ -593,18 +486,6 @@ pub(crate) mod tests {
         r.data(b"x");
         drop(r);
         assert!(log.flush());
-        (log, dir)
-    }
-
-    /// The `jsonl` shape, pinned line for line.
-    #[test]
-    fn jsonl_records_are_one_line_each() {
-        let (log, _dir) = sample(CaptureFormat::Jsonl);
-        assert!(
-            log.path().ends_with("capture.jsonl"),
-            "{}",
-            log.path().display()
-        );
         let text = String::from_utf8(std::fs::read(log.path()).unwrap()).unwrap();
         let expected = [
             format!(
@@ -622,41 +503,29 @@ pub(crate) mod tests {
         assert!(text.ends_with('\n'));
     }
 
-    /// The same records written in either format read back the same.
+    /// A chunk larger than [`DATA_RECORD_MAX`] spans several data records,
+    /// so a line never outgrows the documented bound.
     #[test]
-    fn formats_carry_the_same_records() {
-        let (rxc, _a) = sample(CaptureFormat::Rxc);
-        let (jsonl, _b) = sample(CaptureFormat::Jsonl);
-        assert!(rxc.path().ends_with(CAPTURE_FILE));
-        let rxc = parse(&std::fs::read(rxc.path()).unwrap());
-        let jsonl = parse_jsonl(&std::fs::read(jsonl.path()).unwrap());
-        assert_eq!(rxc.len(), 7);
-        assert_eq!(rxc, jsonl);
-    }
-
-    /// A chunk larger than [`JSONL_DATA_MAX`] spans several `jsonl` data
-    /// records, so a line never outgrows the documented bound; `rxc` keeps
-    /// it as one.
-    #[test]
-    fn a_large_chunk_is_split_across_jsonl_lines() {
-        let chunk: Vec<u8> = (0..=255u8).cycle().take(JSONL_DATA_MAX * 2 + 1).collect();
-        for (format, records) in [(CaptureFormat::Rxc, 1), (CaptureFormat::Jsonl, 3)] {
-            let dir = tempfile::tempdir().unwrap();
-            let log = log_as(dir.path(), u64::MAX, format);
-            let mut t = Tap::new(log.clone(), secrets(&[]), "F1", Dir::Request);
-            t.data(&chunk);
-            t.end(false);
-            assert!(log.flush());
-            let bytes = std::fs::read(log.path()).unwrap();
-            let recs = parse_as(format, &bytes);
-            let data: Vec<_> = recs.iter().filter(|(h, _)| h["kind"] == "data").collect();
-            assert_eq!(data.len(), records, "{format:?}");
-            let body: Vec<u8> = data.iter().flat_map(|(_, p)| p.iter().copied()).collect();
-            assert_eq!(body, chunk);
-            if format == CaptureFormat::Jsonl {
-                let longest = bytes.split(|&b| b == b'\n').map(<[u8]>::len).max().unwrap();
-                assert!(longest < (64 << 10) + 128, "{longest}");
-            }
-        }
+    fn a_large_chunk_is_split_across_lines() {
+        let chunk: Vec<u8> = (0..=255u8).cycle().take(DATA_RECORD_MAX * 2 + 1).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let log = log(dir.path(), u64::MAX);
+        let mut t = Tap::new(log.clone(), secrets(&[]), "F1", Dir::Request);
+        t.data(&chunk);
+        t.end(false);
+        assert!(log.flush());
+        let bytes = std::fs::read(log.path()).unwrap();
+        let recs = parse(&bytes);
+        let data: Vec<_> = recs.iter().filter(|(h, _)| h["kind"] == "data").collect();
+        assert_eq!(data.len(), 3);
+        let seqs: Vec<_> = data
+            .iter()
+            .map(|(h, _)| h["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, [0, 1, 2]);
+        let body: Vec<u8> = data.iter().flat_map(|(_, p)| p.iter().copied()).collect();
+        assert_eq!(body, chunk);
+        let longest = bytes.split(|&b| b == b'\n').map(<[u8]>::len).max().unwrap();
+        assert!(longest < (64 << 10) + 128, "{longest}");
     }
 }

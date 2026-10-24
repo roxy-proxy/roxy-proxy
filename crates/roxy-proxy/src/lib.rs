@@ -65,7 +65,7 @@ mod view;
 
 pub use addrlist::{AddressList, AddressLists, ListError};
 pub use ca_server::{PEM_CONTENT_TYPE, POLICY_HEADER};
-pub use capture::{CAPTURE_FILE, CaptureFormat, CaptureLog, CaptureOptions};
+pub use capture::{CAPTURE_FILE, CaptureLog, CaptureOptions};
 pub use config::{HttpBehaviour, ListenerSpec, PolicyUpdate, RuntimeConfig};
 pub use conn::INTERNAL_HOST;
 pub use flowlog::{

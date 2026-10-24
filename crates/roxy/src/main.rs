@@ -585,9 +585,8 @@ fn check(path: &Path) -> ExitCode {
             if let Some(dir) = &config.capture_dir {
                 let c = &config.log.capture;
                 println!(
-                    "capture: {} ({}, {})",
-                    dir.join(c.format.file_name()).display(),
-                    c.format.as_str(),
+                    "capture: {} ({})",
+                    dir.join(roxy_proxy::CAPTURE_FILE).display(),
                     if c.all {
                         "every forwarded exchange"
                     } else {
