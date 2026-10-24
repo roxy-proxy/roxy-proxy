@@ -66,7 +66,7 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
     };
     let Some(outcome) = outcome else {
         if lease.cx().record.decision.is_some() {
-            st.chain().upstream_abandoned();
+            st.attribution.upstream_abandoned();
         }
         return;
     };
@@ -82,7 +82,7 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
             if let Some(delivery) = lease.cx().request_delivery.take() {
                 tokio::select! {
                     biased;
-                    () = torn_down.cancelled() => st.chain().upstream_abandoned(),
+                    () = torn_down.cancelled() => st.attribution.upstream_abandoned(),
                     complete = delivery.wait() => {
                         if !complete {
                             lease.cx().completion.upload_timed_out = true;
@@ -271,7 +271,7 @@ mod tests {
     #[tokio::test]
     async fn cancelling_upload_after_response_head_records_abandonment() {
         for (client_gone, earlier_reason, expected) in [
-            (false, None, "upstream_aborted"),
+            (false, None, "layer_aborted"),
             (true, None, "client_gone"),
             (true, Some("policy_failure"), "policy_failure"),
         ] {

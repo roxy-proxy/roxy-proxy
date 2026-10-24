@@ -2,8 +2,8 @@
 
 ## Flow log
 
-One JSON object per line, to stdout or `log.flow.path`. Every exchange
-produces a `request` event:
+The flow log is one JSON object per line, written to stdout or to
+`log.flow.path`. Every exchange produces a `request` event:
 
 ```json
 {"ts":"2026-10-03T10:12:00.123Z","event":"request","flow":"01J9…","conn":"01J9…",
@@ -23,113 +23,85 @@ produces a `request` event:
 
 | field | meaning |
 |---|---|
-| `client.ip`, `client.peer` | the client as the rules see it, and the TCP peer (`ip`, `port`) the request arrived from. `client.ip` is canonical: an IPv4 client on a dual-stack listener is `a.b.c.d` while `client.peer.ip` keeps the socket's `::ffff:a.b.c.d`. Otherwise they differ only on a listener with `forwarded_for`, where `client.ip` is read from `X-Forwarded-For` ([HTTP](/reference/http#clients-behind-a-load-balancer)); an event with no request behind it (`connect`, `connection_refused`, and a `parse_error` with no `flow`) has the peer's canonical address as `client.ip`; a `parse_error` with a `flow` carries the same `client` as that flow's `request` event |
-| `req.body_bytes`, `res.body_bytes` | body bytes roxy forwarded in each direction |
-| `req.body_sha256`, `res.body_sha256` | lower-case hex SHA-256 of those bytes, only for the sides an admission rule's `digest` action selected ([actions](/reference/rule-language#actions)); present once the body completed, absent if the exchange ended first (a cut body, an in-flight stop, a client that left). An empty body has the empty-string digest; a relayed WebSocket has counts but no digests. Hashing is opt-in because a digest nobody compares against is wasted work: software SHA-256 costs about one core per 400 MB/s on CPUs without SHA-NI |
-| `timing.upstream_connect_ms` | how long opening the upstream connection took (DNS, TCP and TLS); `null` when the request reused a pooled connection, or none was opened |
-| `timing.upstream_ttfb_ms` | from the forwarding decision to the upstream's response head |
-| `decision` | `allow`, `deny`, or `answered` when an addon layer answered itself |
-| `terminal_rule` | what decided: a rule id, or `_default`, `_fail_closed`, `_address_policy`, `_expired`, `_quarantined`, `_sign`, `_websocket` or `layer:<name>` |
-| `stage` | `head`, or where an in-flight rule stopped the exchange: `request_body`, `response_head`, `response_body`, `websocket` |
-| `addons` | the layers that ran, from downstream to upstream; one skipped by its `when` or `sample` is not listed ([choosing exchanges](/reference/addon-configuration#choosing-exchanges)) |
-| `rules`, `decision`, `terminal_rule` with addons | describe the request that left the stack; `req` is what the client sent and `res.status` what it got, which a layer downstream of the core stage may have replaced ([addons](/reference/addon-configuration#in-the-proxy)) |
-| `reason` | a stable code when the exchange failed closed or failed, by `terminal_rule`: |
+| `client.ip` | the client, as the rules see it |
+| `client.peer` | the TCP peer the request came from. It differs from `client.ip` behind a load balancer ([HTTP](/reference/http#clients-behind-a-load-balancer)) |
+| `req`, `res` | the request as the client sent it, and the response it got |
+| `body_bytes` | body bytes forwarded in each direction |
+| `body_sha256` | a SHA-256 of the body, only when a rule's `digest` action asked for it ([actions](/reference/rule-language#actions)) |
+| `timing.upstream_connect_ms` | time to open the upstream connection; `null` if an existing one was reused |
+| `timing.upstream_ttfb_ms` | time from forwarding the request to the response head |
+| `decision` | `allow`, `deny`, or `answered` when an addon answered the request itself |
+| `rules` | the rules that matched |
+| `terminal_rule` | what decided: a rule id, or one of `_default`, `_fail_closed`, `_address_policy`, `_expired`, `_quarantined`, `_sign`, `_websocket` or `layer:<name>` |
+| `stage` | `head`, or where a rule stopped the exchange: `request_body`, `response_head`, `response_body` or `websocket` |
+| `addons` | the addons that ran, in order |
+| `reason` | why the exchange was refused or failed, when it was |
+
+Common reasons, by `terminal_rule`:
 
 | `terminal_rule` | `reason` |
 |---|---|
-| `_fail_closed` | `metric_unavailable`, `metric_key_unavailable`, `metric_table_full`, `address_list_unavailable`, `secret_missing`, `secret_invalid`, `body_too_large_to_inspect`, `body_unavailable`, `buffer_budget_exhausted`, `unsupported_content_encoding`, `body_decode_failed`, `missing_value`, `wrong_type`, `effect_invalid`, `unsupported_effect`, `state_unavailable`, `capture_unavailable`, `sign_conflict`, `in_flight_missing`, `in_flight_stopped` |
+| `_fail_closed` | `metric_unavailable`, `metric_table_full`, `address_list_unavailable`, `secret_missing`, `secret_invalid`, `body_too_large_to_inspect`, `body_decode_failed`, `unsupported_content_encoding`, `buffer_budget_exhausted`, `missing_value`, `state_unavailable`, `sign_conflict`, `effect_invalid` |
 | `_address_policy` | `address_policy` |
 | `_expired` | `policy_expired` ([lease](/guides/operations#lease)) |
 | `_quarantined` | `quarantined` ([quarantine](/guides/operations#quarantine)) |
 | `_sign` | `sign_body_too_large`, `sign_header_invalid` ([signing AWS requests](/reference/secrets#signing-aws-requests)) |
 | `_websocket` | `ws_bad_handshake` ([WebSockets](/reference/websockets)) |
 | `layer:<name>` | `layer_error` |
-| an upstream failure | the `upstream_error` reason ([upstream](/reference/upstream#errors)) |
-| roxy could not finish the exchange (its connection ended, or the server stopped, mid-flight) | `aborted` |
-| an addon layer dropped the exchange after the rules had forwarded it | `upstream_aborted` |
-| the upload made no progress after the upstream returned its response head | `upstream_body_timeout` ([upload progress](/reference/limits#timeouts)) |
-| an addon layer cut a lane of its own: the request it was forwarding, or the response it was giving | `forward_aborted`, `answer_aborted` (unless another reason stands) |
-| the client went away | `client_gone` |
-| the HTTP/2 stream failed during cleanup after the response was written, without a client reset or connection loss | `h2_stream_error` |
-| an HTTP/2 client stopped taking the response | `client_stalled` |
-| the response body was cut after its head went out | why it was cut, when roxy knows: `buffer_budget_exhausted` (a decoder window the [buffer budget](/reference/limits#limits) could not cover), `upstream_body_failed` (the upstream's body failed into an addon layer), `layer_error` (a layer failed; the `layer_error` event names it), or the client's `parse_error` reason when its request body was rejected while the response was being written; otherwise `response_write_failed` |
+| none, the upstream failed | the `upstream_error` reason ([upstream](/reference/upstream#errors)) |
+| none, the exchange did not finish | `client_gone` (the client left), `client_stalled` (it stopped reading), `upstream_body_timeout` ([timeouts](/reference/limits#timeouts)), `aborted` (roxy stopped) |
+| none, an addon gave up part of the exchange | `layer_aborted`: it ended the request it was passing on or the response it was giving early, or stopped reading the response from upstream |
 
 ### Events
-
-A client may reset an HTTP/2 stream after its response was fully written,
-while an upload or addon is still running. roxy cancels that remaining
-work and records `client_gone`, retaining the response status and decision.
-An earlier policy or validation reason takes precedence; the fallback
-`upstream_aborted` is replaced by this observed client cancellation.
-It emits no `response_error` for an already completed response.
 
 | event | when |
 |---|---|
 | `request` | every exchange |
-| `response_error` | the response could not be written after the request was allowed; `reason` is `client_gone` (the client stopped reading or left), `client_stalled` (an HTTP/2 client kept its flow-control window shut for `limits.body_idle_timeout`), `response_body_timeout` (the upstream paused mid-body past `limits.response_body_idle_timeout`), the code for a body cut after its head (the last row of the `reason` table above; `response_write_failed` when the cause is not known) or `continue_write_failed` (roxy's `100 Continue` could not be written) |
-| `parse_error` | the client sent something roxy refused to parse; `reason` is a stable code |
-| `upstream_error`, `upstream_denied` | [upstream](/reference/upstream#errors) failures and address-floor hits; `upstream_denied.reason` is `private_range:<class>`, `deny_cidrs` or `list:<name>` ([address floor](/reference/address-lists#address-floor)) |
-| `policy_input_unavailable`, `metric_table_full` | a flow failed closed for want of an input |
-| `policy_expired` | the policy's `valid_until` passed; once per loaded policy, with `valid_until` ([lease](/guides/operations#lease)) |
-| `quarantined` | the process went into [quarantine](/guides/operations#quarantine), or started in one (`restored: true`): `id` (the incident a release must name), `since`, and `cause`, which is `{"kind": "rule", "rule", "flow"}`, `{"kind": "threshold", "listener", "counter": "parse_errors", "count", "window_seconds"}`, `{"kind": "layer", "layer", "flow"}` (with `call`, the service's id for the call, when a [service layer](/reference/service-layers#host-services) tripped it) or `{"kind": "secret_in_response", "flow", "part"}` ([secrets](/reference/secrets#redacting-responses)) |
-| `quarantine_released` | the control plane released the quarantine named by `id` ([node mode](/guides/node-mode#the-lease)) |
-| `upgrade_stripped` | an upgrade was not allowed, so the request went upstream as plain HTTP ([WebSockets](/reference/websockets)) |
-| `ws_open`, `ws_close` | a relayed WebSocket, with byte counts; `ws_close` has `close_code` and `close_reason` when roxy ended it |
+| `response_error` | the response could not be delivered after the request was allowed, for example because the client left or the upstream stalled |
+| `parse_error` | the client sent a malformed request; `reason` says how |
+| `upstream_error` | the upstream could not be reached ([upstream](/reference/upstream#errors)) |
+| `upstream_denied` | the address floor refused an upstream address ([address floor](/reference/address-lists#address-floor)) |
+| `policy_input_unavailable`, `metric_table_full` | an exchange was denied because a policy input was unavailable |
+| `policy_expired` | the policy's `valid_until` passed ([lease](/guides/operations#lease)) |
+| `quarantined` | roxy was quarantined, or started quarantined (`restored: true`), with the incident `id`, `since` and `cause` ([quarantine](/guides/operations#quarantine)) |
+| `quarantine_released` | the control plane lifted the quarantine ([node mode](/guides/node-mode#the-lease)) |
+| `upgrade_stripped` | a WebSocket upgrade was not allowed, so the request went upstream as plain HTTP |
+| `ws_open`, `ws_close` | a WebSocket opened or closed, with byte counts |
 | `ws_message` | a WebSocket message a rule denied, or one sampled by `log.flow.ws_message_every` ([WebSockets](/reference/websockets#message-rules)) |
 | `log` | a rule's `log` action |
-| `layer_error` | an addon layer failed; `kind` is `trap`, `budget:<limit>`, `capability:<name>`, `invalid_request`, `invalid_response`, `no_response`, `no_instance` (none of its `max_instances` came free within `first_byte_timeout`), `unsubscribed:<direction>`, `service:<code>`, `when:<code>`, ... In enforce mode it names the one layer blamed for the exchange ([who is blamed](/design/addon-model#who-is-blamed)), once; a client's broken upload, an upstream body or the buffer budget failing a layer logs none. In observe mode every failure of the observer's own is logged. When a [service layer's](/reference/service-layers#host-services) host-service call failed, `call` is the service's id for it |
-| `layer_record` | an addon's `flow.record`; a [service layer's](/reference/service-layers#host-services) carries the service's id for the call as `call` ([addons](/design/addon-model)) |
-| `endpoint_call` | [addons](/design/addon-model) |
-| `observer_lagged` | an observe-mode addon's copy of a stream was cut; `reason` is `observer_behind` (it fell `max_observer_lag_bytes` behind), `buffer_budget_exhausted` (the [buffer budget](/reference/limits#limits) could not cover the copy) or `no_instance` (no instance of the layer came free within its `first_byte_timeout`) |
-| `connect` | a CONNECT, when `log.flow.connection_events` is on: `conn`, `listener`, `client` and `dst` (`host`, `port`; `ip` is always `null`), `decision: allow`, `rules: []` and `tls: null`, since no rule runs at CONNECT. A tunnel closed at its first bytes (`sni_mismatch`, `bad_sni`, neither TLS nor HTTP) is a `parse_error` |
-| `connection_refused` | a connection cap was hit ([limits](/reference/limits#connections)) |
+| `layer_error` | an addon failed; `kind` says how ([failure](/reference/addon-configuration#failure)) |
+| `layer_record` | an addon's `flow.record` ([host services](/reference/host-services)) |
+| `endpoint_call` | an addon called an endpoint |
+| `observer_lagged` | an observing addon fell too far behind and stopped getting a copy |
+| `connect` | a CONNECT, when `log.flow.connection_events` is on |
+| `connection_refused` | a connection cap was reached ([limits](/reference/limits#connections)) |
 | `config_loaded`, `config_reloaded`, `config_reload_failed` | startup and [reload](/guides/operations#reload) |
 
 ### Redaction
 
-Every injected secret value is masked in any logged string, the
-operational log (`tracing`) included: each of its bytes becomes `*`, so
-the string keeps its length. A string is masked once, with the secret
-generation the exchange loaded, and that one copy goes to every sink.
-Values of `authorization`, `proxy-authorization`, `cookie`, `set-cookie`
-and `x-api-key` are never logged; `log.redact_headers` adds more. Their
-values, and query values, are logged as a fixed `******`, which says
-nothing of their length.
+Secret values that roxy injects are masked in everything it logs: each
+byte becomes `*`, so the text keeps its length. The values of
+`authorization`, `proxy-authorization`, `cookie`, `set-cookie` and
+`x-api-key` are never logged, and `log.redact_headers` adds more. These
+values, and query values, are logged as `******`.
 
 ### Writing
 
-The write path never drops a record while roxy runs
+The flow log never drops a record while roxy runs
 ([audit backpressure](/design/threat-model#audit-backpressure)).
 
-- **One writer per destination.** Emitters serialise each event on their
-  own thread and enqueue the bytes; one writer thread owns the file and
-  writes everything queued in one batch. The writer waits a moment for
-  more records before each write, so a burst is one write and a record is
-  written within a couple of milliseconds of being emitted.
-- **Backpressure.** Emitting never blocks or drops. Once unwritten bytes
-  pass `log.flow.high_water` (8 MiB) the log reports not ready and every
-  traffic producer waits for it: each new client connection, exchange and
-  HTTP/2 stream, each forwarded body chunk and each WebSocket read. A
-  failing destination (disk full, I/O error) holds traffic the same way, and
-  is reported.
-- **Rotation** happens at a batch boundary, so a record never spans two
-  files: the file is renamed to `<path>.<UTC timestamp>-<seq>`, a new one
-  is opened, files beyond `max_files` are deleted (oldest first), and
-  rotated files are optionally gzipped in the background. Names sort in
-  rotation order even across a restart on a clock behind the previous run's:
-  a rotation on a clock behind the newest existing name reuses its stamp
-  with a higher sequence. Only files of that name shape count towards
-  `max_files` or are deleted. A
-  failed rotation is a failed write: traffic is held and it is retried.
-  `SIGHUP` reopens the file, for external rotation.
-- **Shutdown.** Everything queued is written before exit, with up to 10
-  seconds of retries for a failing destination; whatever is still unwritten
-  when roxy then exits is lost, and an error logged. This is the one point
-  at which a record can be dropped.
-- **Durability.** Each batch is flushed to the operating system, and
-  `max_file_bytes` checked, at the batch boundary. roxy does not `fsync`: a
-  roxy crash loses nothing queued; a kernel crash or power loss can lose
-  batches the OS had not yet written to disk.
+- One thread writes each log file, in batches, so a record is written
+  within a few milliseconds.
+- When more than `log.flow.high_water` (8 MiB) is waiting to be written,
+  or the disk fails, roxy holds traffic until the log catches up.
+- With `max_file_bytes`, the file is rotated to
+  `<path>.<UTC timestamp>-<seq>`, optionally gzipped, and files beyond
+  `max_files` are deleted. `SIGHUP` reopens the file, for external
+  rotation.
+- On shutdown roxy writes everything queued, retrying a failing
+  destination for up to 10 seconds. Records still unwritten after that are
+  lost.
+- roxy does not `fsync`, so a power loss can lose recent records.
 
 ```yaml
 log:
@@ -139,40 +111,29 @@ log:
     connection_events: false
     ws_message_every: 0             # also log every Nth WebSocket message; 0 = denied only
     high_water: 8mb                 # at least 64kb
-    max_file_bytes: 100mb           # absent = never rotate; at least 4kb
-    max_files: 10                   # absent = keep all; at least 1
+    max_file_bytes: 100mb           # absent = never rotate
+    max_files: 10                   # absent = keep all
     compress: true
 ```
 
-`roxy check` refuses `max_file_bytes`, `max_files` or `compress` without
-`path` (stdout cannot rotate), and `max_files` or `compress` without
-`max_file_bytes`. The same floors apply under `log.capture`.
-
-roxy's own operational logs go to stderr through `tracing`: `--log-format
-json|pretty` and `--log-level` (or `RUST_LOG`).
+Rotation needs `path`, since stdout cannot be rotated.
 
 ## Capture
 
-roxy tees the heads and bodies of exchanges, exactly as forwarded, to
-`<capture_dir>/capture.jsonl`: those an admission rule selects with `capture:
-request | response | both`, or every forwarded exchange with
-`log.capture.all: true`. Capture is decided at admission and covers
-the exchange from its first byte; the taps sit after the in-flight rules
-allowed a chunk. WebSocket relays are captured both ways at the relay next
-to the upstream, not as an addon layer changes them for the client.
+Capture records whole requests and responses, as forwarded, to
+`<capture_dir>/capture.jsonl`. It records the exchanges a rule selects
+with `capture: request | response | both`, or every exchange with
+`log.capture.all: true`. It is written like the flow log, with the same
+batching, rotation and backpressure.
 
-Capture is written like the flow log (one writer, batching, rotation,
-backpressure). Injected secret values are masked with `*` in every string
-of a captured head (URL, header names and values); nothing else is: the
-header-name redaction above is flow-log only, and bodies are captured
-**unredacted**, except that a response
+Secret values are masked in captured headers and URLs. **Bodies are
+captured unredacted**, except a response that
 [`http.redact_response_secrets.bodies`](/reference/secrets#redacting-responses)
-masked is captured as masked. A body roxy decoded for the layers or for
-masking is captured in its coding, as it travels
-([content codings](/reference/http#content-codings)).
+masked. A body roxy decompressed for addons or for masking is captured
+compressed again, as sent.
 
 ```yaml
-capture_dir: /var/lib/roxy/capture   # absent = capture disabled; restart to change
+capture_dir: /var/lib/roxy/capture   # absent = capture off; restart to change
 log:
   capture:
     all: false
@@ -184,14 +145,9 @@ limits:
   max_capture_body_bytes: 16mb       # per direction per exchange
 ```
 
-Every `log.capture` setting needs `capture_dir`; `roxy check` reports
-settings given without it.
-
 ### Capture format
 
-One JSON object per line, so a line-oriented shipper such as Vector or
-Fluent Bit can take the file as it is. Rotated files are
-`capture.jsonl.<UTC>-<seq>` (plus `.gz` with `compress`).
+One JSON object per line:
 
 ```text
 {"flow":"01J9…","dir":"request","kind":"head","seq":0,"head":{"headers":[["content-type","application/json"]],"method":"POST","url":"https://api.example.com/v1/x"}}
@@ -201,16 +157,11 @@ Fluent Bit can take the file as it is. Rotated files are
 
 | field | meaning |
 |---|---|
-| `flow` | joins records to the flow log |
-| `dir` | `request` (client to upstream) or `response` |
-| `kind` | `head` (the canonical head as forwarded, as an object under `head`), `data` (forwarded bytes, base64 under `data`), `truncated` (`limits.max_capture_body_bytes` reached for this direction; nothing more is captured; carries `cap`, or `reason: buffer_budget_exhausted` when the budget could not cover the encoder that captures a decoded body in its coding), or `end` (carries the total forwarded `bytes`, and `aborted: true` if the direction did not complete) |
-| `seq` | counts records per flow and direction |
+| `flow` | the exchange's id in the flow log |
+| `dir` | `request` or `response` |
+| `kind` | `head`, `data` (body bytes, base64), `truncated` (`max_capture_body_bytes` reached, or `reason: buffer_budget_exhausted` when the budget could not cover compressing a body again for the capture; nothing more is recorded) or `end` (with the total `bytes`, and `aborted: true` if the body did not complete) |
+| `seq` | the record's position for this flow and direction |
 
-`data` is standard base64 with padding, which makes captured bodies about
-a third larger than the bytes forwarded. `limits.max_capture_body_bytes`
-counts body bytes, before encoding. A `data` record holds at most
-48 KiB of body, so a larger forwarded chunk spans several records with
-consecutive `seq`, and a body is its `data` records joined in `seq` order.
-A data line is therefore under 64 KiB plus about 100 bytes of fields. A
-head line is bounded by `limits.max_header_bytes`, plus JSON escaping. Set
-a shipper's line limit above both.
+A body is its `data` records joined in `seq` order. Each `data` record
+holds at most 48 KiB of body, so lines stay under 64 KiB plus a little
+JSON, apart from head lines, which can be up to `limits.max_header_bytes`.

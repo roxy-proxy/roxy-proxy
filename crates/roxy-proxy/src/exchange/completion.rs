@@ -6,7 +6,8 @@
 use roxy_http::{BodyError, Reason};
 
 use super::WriteFailure;
-use crate::addons::{Cancellation as StackCancellation, StackFlow};
+use crate::addons::StackFlow;
+use crate::addons::attribution::{Cause, Fault, LAYER_ABORTED};
 
 #[derive(Default)]
 pub(crate) struct Completion {
@@ -64,70 +65,72 @@ impl Completion {
         });
     }
 
-    /// A written and a discarded response consult the same recorded fault.
-    /// A fault recovered by a layer does not taint a successful response.
+    /// Why the response failed, if it did. A written and a discarded
+    /// response consult the same recorded fault; a fault a layer recovered
+    /// from does not taint a successful response.
     pub(crate) fn response_reason(&self, stack: Option<&StackFlow>) -> Option<String> {
-        let failure = self.response.as_ref()?;
-        if matches!(failure, ResponseFailure::Body | ResponseFailure::Write)
-            && let Some(reason) = stack.and_then(StackFlow::fault_reason)
-        {
-            return Some(reason);
-        }
-        Some(
-            match failure {
-                ResponseFailure::Body => "response_body_failed",
-                ResponseFailure::Write => "response_write_failed",
-                ResponseFailure::Timeout => "response_body_timeout",
-                ResponseFailure::ClientGone => "client_gone",
-                ResponseFailure::ClientStalled => "client_stalled",
-                ResponseFailure::Request(reason) => reason.as_str(),
-            }
-            .to_owned(),
-        )
+        let cause = stack.map(StackFlow::cause);
+        self.fault_behind_cut(cause.as_ref())
+            .or(self.response_failure())
+            .map(str::to_owned)
     }
 
-    /// Known body faults, deliberate lane aborts, observed cancellation,
-    /// response failures, upload deadlines, then provisional abandonment.
-    /// This ordering is independent of which adapter finished first.
+    /// The record's reason, once the exchange is over. In order: a fault
+    /// that cut the response, a layer's abort, observed cancellation, the
+    /// response's own failure, an upload deadline, then upstream work
+    /// nothing waited for. The order is independent of which adapter
+    /// finished first.
     pub(crate) fn reason(&self, stack: Option<&StackFlow>) -> Option<String> {
-        if matches!(
-            self.response,
-            Some(ResponseFailure::Body | ResponseFailure::Write)
-        ) && let Some(reason) = stack.and_then(StackFlow::fault_reason)
-        {
-            return Some(reason);
-        }
-        if let Some(reason) = stack.and_then(StackFlow::abort_reason) {
-            return Some(reason.to_owned());
-        }
-        if let Some(cancellation) = &self.cancellation {
-            return Some(
-                match cancellation {
-                    Cancellation::ClientGone => "client_gone",
-                    Cancellation::ClientStalled => "client_stalled",
-                    Cancellation::Request(reason) => reason.as_str(),
-                    Cancellation::Stopped => "in_flight_stopped",
-                    Cancellation::ResponseTimeout => "response_body_timeout",
-                    Cancellation::Stream => "h2_stream_error",
-                }
-                .to_owned(),
-            );
-        }
+        let cause = stack.map(StackFlow::cause);
+        let cause = cause.as_ref();
         // A flow-control timeout tears down with CLIENT_GONE too, but has
         // the more specific transport reason.
-        if matches!(self.response, Some(ResponseFailure::ClientStalled)) {
-            return self.response_reason(stack);
-        }
-        let cancellation = stack.and_then(StackFlow::cancellation);
-        if cancellation == Some(StackCancellation::ClientGone) {
-            return Some("client_gone".to_owned());
-        }
-        self.response_reason(stack)
-            .or_else(|| {
-                self.upload_timed_out
-                    .then(|| "upstream_body_timeout".to_owned())
-            })
-            .or_else(|| cancellation.map(|why| why.reason().to_owned()))
+        let stalled = matches!(self.response, Some(ResponseFailure::ClientStalled));
+        self.fault_behind_cut(cause)
+            .or(cause.is_some_and(|c| c.aborted).then_some(LAYER_ABORTED))
+            .or(self.cancellation_reason())
+            .or((cause.is_some_and(|c| c.client_gone) && !stalled).then_some("client_gone"))
+            .or(self.response_failure())
+            .or(self.upload_timed_out.then_some("upstream_body_timeout"))
+            .or(cause
+                .is_some_and(|c| c.upstream_abandoned)
+                .then_some(LAYER_ABORTED))
+            .map(str::to_owned)
+    }
+
+    /// The stack's fault, when the response body failed or could not be
+    /// written: that is what cut it.
+    fn fault_behind_cut<'a>(&self, cause: Option<&'a Cause>) -> Option<&'a str> {
+        let cut = matches!(
+            self.response,
+            Some(ResponseFailure::Body | ResponseFailure::Write)
+        );
+        cause
+            .and_then(|c| c.fault.as_ref())
+            .filter(|_| cut)
+            .map(Fault::reason)
+    }
+
+    fn response_failure(&self) -> Option<&str> {
+        Some(match self.response.as_ref()? {
+            ResponseFailure::Body => "response_body_failed",
+            ResponseFailure::Write => "response_write_failed",
+            ResponseFailure::Timeout => "response_body_timeout",
+            ResponseFailure::ClientGone => "client_gone",
+            ResponseFailure::ClientStalled => "client_stalled",
+            ResponseFailure::Request(reason) => reason.as_str(),
+        })
+    }
+
+    fn cancellation_reason(&self) -> Option<&str> {
+        Some(match self.cancellation.as_ref()? {
+            Cancellation::ClientGone => "client_gone",
+            Cancellation::ClientStalled => "client_stalled",
+            Cancellation::Request(reason) => reason.as_str(),
+            Cancellation::Stopped => "in_flight_stopped",
+            Cancellation::ResponseTimeout => "response_body_timeout",
+            Cancellation::Stream => "h2_stream_error",
+        })
     }
 }
 

@@ -1,21 +1,19 @@
 //! What a layer subscribes to: the head of each direction, or the head and
 //! the body. A body a layer is not subscribed to bypasses it: the layer gets
-//! the head with an empty body and no `content-length`, and the body goes
-//! on upstream (or downstream to the client) spliced onto the head the
-//! layer passed on. Framing is roxy's on a bypassed body, so the layer's head carries
-//! none of it; a layer that passes on bytes of a body it is not subscribed
-//! to fails the exchange closed.
+//! the head with an empty body and no `content-length`, passes on a head
+//! and no body of its own, and the body goes on upstream (or downstream to
+//! the client) with the head the layer passed on. Framing is roxy's on a
+//! bypassed body, so the layer's head carries none of it; a layer that
+//! passes on bytes or trailers for it fails the exchange closed.
 
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll, ready};
+use std::sync::{Arc, Mutex};
 
-use bytes::Bytes;
-use http_body::{Body as HttpBody, Frame, SizeHint};
-use roxy_http::{Body, BodyError};
+use http::StatusCode;
+use http_body_util::BodyExt;
+use roxy_http::Body;
 use roxy_wasm::LayerError;
 
-use super::StackFlow;
+use super::{StackFlow, lock};
 use crate::in_flight::Dir;
 
 /// How much of one direction of the exchange a layer sees.
@@ -65,107 +63,81 @@ pub(super) fn head_only(headers: &mut http::HeaderMap) {
     headers.remove(http::header::CONTENT_LENGTH);
 }
 
-/// Join a layer's own completion with the body it does not see. The own
-/// body is already complete for WASM's empty `bytes`; an open WASM stream
-/// or a service's head-only lane still owes an explicit end. Its enclosing
-/// lane withholds wire completion until both bodies end cleanly.
-pub(super) fn splice(
-    st: &Arc<StackFlow>,
-    index: usize,
-    dir: Dir,
-    own: Body,
-    bypassed: Body,
-) -> Body {
-    if own.is_end_stream() {
-        return bypassed;
+/// The bodies held back from one head-only layer on one exchange, to go on
+/// with the heads it passes on. Both kinds of layer use it, so the rules
+/// for what goes on with what are the same for each.
+#[derive(Default)]
+pub(crate) struct Bypassed {
+    request: Mutex<Option<Body>>,
+    /// With the status it came with.
+    response: Mutex<Option<(StatusCode, Body)>>,
+}
+
+impl Bypassed {
+    /// Holds the request body back; the layer gets the head alone.
+    pub(super) fn hold_request(&self, req: &mut http::Request<Body>) {
+        head_only(req.headers_mut());
+        *lock(&self.request) = Some(std::mem::take(req.body_mut()));
     }
-    // The length is unknown while the own body is open, whatever the
-    // bypassed body declared: with a `content-length` the client would have
-    // a complete body once the bypassed bytes were through, and the end
-    // held back for the own body, or its failure, nothing left to cut.
-    Body::wrap_native(
-        Spliced {
-            st: st.clone(),
-            index,
-            dir,
-            own: Some(own),
-            bypassed,
-        },
-        u64::MAX,
-        None,
-    )
+
+    /// Holds the response body from upstream back; the layer gets the
+    /// head alone.
+    pub(super) fn hold_response(&self, res: &mut http::Response<Body>) {
+        head_only(res.headers_mut());
+        let body = std::mem::take(res.body_mut());
+        *lock(&self.response) = Some((res.status(), body));
+    }
+
+    /// The body to go on with the request head the layer forwards.
+    pub(super) fn request(&self) -> Body {
+        lock(&self.request).take().unwrap_or_default()
+    }
+
+    /// The body to go on with a response head of `status` the layer
+    /// passes on: the one from upstream when the status is the same.
+    /// `None` means the answer is the layer's own, and the body from
+    /// upstream is let go of.
+    pub(super) fn response(&self, status: StatusCode) -> Option<Body> {
+        match lock(&self.response).take() {
+            Some((s, body)) if s == status => Some(body),
+            _ => None,
+        }
+    }
+
+    /// Lets go of the body held for `dir`, if one still is.
+    pub(super) fn release(&self, dir: Dir) {
+        match dir {
+            Dir::Request => drop(lock(&self.request).take()),
+            Dir::Response => drop(lock(&self.response).take()),
+        }
+    }
 }
 
-/// The bypassed body alongside the layer's own, which must end without a
-/// byte or a trailer: the layer is not subscribed to this body, so anything
-/// it passes on for it is its failure. The own body never holds the
-/// bypassed bytes back (a guest body's end waits for the handler to return,
-/// which on a WebSocket is the life of the socket), but the whole ends only
-/// once it has, and declares no length: no body completes cleanly before
-/// the exchange has settled.
-struct Spliced {
-    st: Arc<StackFlow>,
-    index: usize,
-    dir: Dir,
-    own: Option<Body>,
-    bypassed: Body,
-}
-
-impl Spliced {
-    /// Polls the layer's own body for what it must not carry. Pending is
-    /// not a reason to wait: the bypassed body is polled next.
-    fn poll_own(&mut self, cx: &mut Context<'_>) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
-        while let Some(own) = &mut self.own {
-            match ready!(Pin::new(own).poll_frame(cx)) {
-                None => self.own = None,
-                Some(Err(e)) => {
-                    if e != BodyError::Stopped {
-                        self.st
-                            .chain()
-                            .body_aborted(self.index, self.dir, e.to_string());
-                    }
-                    self.own = None;
-                    return Poll::Ready(Some(Err(e)));
-                }
-                Some(Ok(f)) if f.data_ref().is_some_and(Bytes::is_empty) => {}
-                Some(Ok(_)) => {
-                    let name = self.st.snap.addons[self.index].name.clone();
-                    self.st
-                        .fail(&name, LayerError::Unsubscribed(self.dir.as_str()));
-                    self.own = None;
-                    return Poll::Ready(Some(Err(BodyError::Stopped)));
-                }
+/// Watches what a head-only layer gave for the body of `dir`, which is not
+/// part of the lane: the bypassed body is. Bytes or trailers in it fail the
+/// layer; its end and any error are its own business, since nothing reads
+/// it. Runs until the layer's body ends or the layer is torn down, on the
+/// exchange's tracker.
+pub(super) fn watch_own(st: &Arc<StackFlow>, index: usize, dir: Dir, own: Body) {
+    if http_body::Body::is_end_stream(&own) {
+        return;
+    }
+    let st2 = st.clone();
+    let torn = st.chain().layer_torn_down(index);
+    st.chain().spawn(async move {
+        let mut own = own;
+        loop {
+            let frame = tokio::select! {
+                () = torn.cancelled() => return,
+                f = own.frame() => f,
+            };
+            let Some(Ok(frame)) = frame else {
+                return;
+            };
+            if frame.data_ref().is_none_or(|d| !d.is_empty()) {
+                st2.layer_failed(index, LayerError::Unsubscribed(dir.as_str()));
+                return;
             }
         }
-        Poll::Ready(None)
-    }
-}
-
-impl HttpBody for Spliced {
-    type Data = Bytes;
-    type Error = BodyError;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
-        let this = &mut *self;
-        if let Poll::Ready(Some(r)) = this.poll_own(cx) {
-            return Poll::Ready(Some(r));
-        }
-        match ready!(Pin::new(&mut this.bypassed).poll_frame(cx)) {
-            // The bypassed body has ended; the end waits for the own body,
-            // whose poll above registered the waker.
-            None if this.own.is_some() => Poll::Pending,
-            frame => Poll::Ready(frame),
-        }
-    }
-
-    fn is_end_stream(&self) -> bool {
-        self.own.is_none() && self.bypassed.is_end_stream()
-    }
-
-    fn size_hint(&self) -> SizeHint {
-        SizeHint::default()
-    }
+    });
 }

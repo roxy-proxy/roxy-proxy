@@ -159,30 +159,18 @@ async fn head_only_completion_conforms_across_backends_and_transports() {
     }
 }
 
+/// A head-only lane is its head: a bodiless answer completes with it, and
+/// no end from the service is waited for.
 #[tokio::test]
-async fn head_only_bodiless_h1_still_requires_a_timed_end() {
-    for (method, status) in [("GET", 204), ("HEAD", 200)] {
-        head_only_bodiless(false, false, method, status).await;
-    }
-}
-
-#[tokio::test]
-async fn head_only_bodiless_h2_still_requires_a_timed_end() {
-    for (method, status) in [("GET", 204), ("HEAD", 200)] {
-        head_only_bodiless(true, false, method, status).await;
-    }
-}
-
-#[tokio::test]
-async fn head_only_bodiless_clean_end_releases_the_exchange() {
+async fn head_only_bodiless_completes_at_its_head() {
     for h2 in [false, true] {
         for (method, status) in [("GET", 204), ("HEAD", 200)] {
-            head_only_bodiless(h2, true, method, status).await;
+            head_only_bodiless(h2, method, status).await;
         }
     }
 }
 
-async fn head_only_bodiless(h2: bool, clean_end: bool, method: &'static str, status: u16) {
+async fn head_only_bodiless(h2: bool, method: &'static str, status: u16) {
     use serde_json::json;
     let kit = testing::kit_with(
         super::ALLOW_UP,
@@ -207,23 +195,16 @@ async fn head_only_bodiless(h2: bool, clean_end: bool, method: &'static str, sta
     script.control("open").await;
     script.control("request").await;
     script.body(0).await;
+    // Nothing forwarded: nothing comes back, and the service answers.
     script.send(json!({"type":"request_end"}));
     script.control("response_end").await;
     script.send(json!({"type":"response", "status":status, "headers":[]}));
-    if clean_end {
-        script.send(json!({"type":"response_end"}));
-    }
     let (_client, answer) = call.await.unwrap();
     assert_eq!(answer.status, status);
     let event = tokio::time::timeout(Duration::from_secs(2), kit.request_event())
         .await
-        .expect("head-only response_end is still outstanding and must time out");
-    if clean_end {
-        assert!(event["reason"].is_null(), "{event:#}");
-    } else {
-        assert_eq!(event["reason"], "response_body_timeout", "{event:#}");
-        script.control("reset").await;
-    }
+        .expect("the exchange completes at the head");
+    assert!(event["reason"].is_null(), "{event:#}");
     assert_eq!(event["res"]["body_bytes"], 0, "{event:#}");
     assert!(
         kit.sink
@@ -379,7 +360,7 @@ async fn h1_declared_length_does_not_commit_a_later_cut() {
         let mut client = kit.h1().await;
         let answer = client.call("GET", path, &[], b"").await;
         let event = kit.request_event().await;
-        assert_eq!(event["reason"], "answer_aborted", "{event:#}");
+        assert_eq!(event["reason"], "layer_aborted", "{event:#}");
         assert!(
             answer.body.is_err(),
             "a cut response was accepted as complete: {answer:?}"
@@ -995,7 +976,7 @@ async fn answering_after_next_keeps_what_the_rules_decided() {
     let ev = kit.request_event().await;
     assert_eq!(ev["decision"], "answered", "{ev:#}");
     assert_eq!(ev["terminal_rule"], "layer:a");
-    assert_eq!(ev["reason"], "upstream_aborted");
+    assert_eq!(ev["reason"], "layer_aborted");
     assert!(strs(&ev["rules"]).contains(&"up".to_owned()), "{ev:#}");
     assert!(ev["req"]["body_bytes"].as_u64().unwrap() >= 8192, "{ev:#}");
 }
@@ -1222,7 +1203,7 @@ async fn h2_a_guest_answering_bodiless_still_completes_its_forward() {
 /// nothing comes back for the cut forward, so `next` fails for the guest,
 /// and the client's body is not cut with it. The cut is the guest's own
 /// doing, not a fault: the record is the layer's answer, with
-/// `forward_aborted` as its reason.
+/// `layer_aborted` as its reason.
 #[tokio::test]
 async fn a_guest_that_answered_keeps_its_answer_when_its_forward_is_cut() {
     let kit = stack(&["a"]).await;
@@ -1244,7 +1225,7 @@ async fn a_guest_that_answered_keeps_its_answer_when_its_forward_is_cut() {
     );
     let ev = kit.request_event().await;
     assert_eq!(ev["decision"], "answered", "{ev:#}");
-    assert_eq!(ev["reason"], "forward_aborted", "{ev:#}");
+    assert_eq!(ev["reason"], "layer_aborted", "{ev:#}");
     assert_eq!(ev["terminal_rule"], "layer:a", "{ev:#}");
     assert_eq!(ev["res"]["status"], 200, "{ev:#}");
     assert!(

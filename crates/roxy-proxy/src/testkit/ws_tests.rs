@@ -91,7 +91,7 @@ async fn held_upgrade_ends(end: UpgradeEnd) {
         }
         UpgradeEnd::Cut => {
             assert_eq!(message["message"], crate::addons::ENDED, "{message}");
-            "answer_aborted"
+            "layer_aborted"
         }
         UpgradeEnd::Fault => {
             assert!(
@@ -120,7 +120,6 @@ async fn held_upgrade_ends(end: UpgradeEnd) {
 async fn failed_upgrade_write_publishes_client_loss_before_releasing_lanes() {
     use crate::addons::service::testing;
     use crate::addons::{AddonMode, CLIENT_GONE, Part};
-    use serde_json::json;
 
     let kit = testing::kit(
         WS_ALLOW,
@@ -135,10 +134,9 @@ async fn failed_upgrade_write_publishes_client_loss_before_releasing_lanes() {
     client.write_all(b"GET http://up.test/ws/echo HTTP/1.1\r\nHost: up.test\r\nConnection: upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n").await.unwrap();
     let mut script = kit.upstream.service().script().await;
     script.control("open").await;
+    // A head-only request is its head: nothing follows it either way.
     let request = script.control("request").await;
-    script.body(0).await;
     script.send(request);
-    script.send(json!({"type": "request_end"}));
     let response = script.control("response").await;
     assert_eq!(response["status"], 101);
     // Keep the read pending, but make the impending handshake write fail.

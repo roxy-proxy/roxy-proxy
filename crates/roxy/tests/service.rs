@@ -1,6 +1,6 @@
 //! End-to-end tests of service layers: `roxy run` with `kind: service`
 //! addons whose exchanges stream through an in-test service over
-//! `roxy.layer.v6`. The service's behaviour is picked by its URL path (one
+//! `roxy.layer.v7`. The service's behaviour is picked by its URL path (one
 //! per connection), and for `/mixed` by the request's path (per stream).
 
 mod support;
@@ -365,6 +365,27 @@ async fn session(path: &str, mut s: Sess) {
     }
 }
 
+/// An observe stream: `/echo` reads both copies to their ends, then
+/// closes; `/mixed` closes after the request head. Either way, a stream
+/// that closes counts as `echoed`.
+async fn observe(path: &str, mut s: Sess) {
+    let mut ends = 0;
+    loop {
+        match s.recv().await {
+            Got::Ctl(v) if v["type"] == "request_end" || v["type"] == "response_end" => ends += 1,
+            Got::Ctl(_) if path == "/mixed" => break,
+            Got::End => return,
+            Got::Ctl(_) | Got::Bytes(..) => {}
+        }
+        if ends == 2 {
+            break;
+        }
+    }
+    s.send(json!({"type": "close"}));
+    s.st.echoed.lock().unwrap().push(s.id);
+    s.st.changed.notify_waiters();
+}
+
 /// Per stream, by the request's path: `/hold…` waits for `release`, then
 /// echoes; `/bad…` sends an invalid head; `/kill` ends the connection;
 /// `/hang` never answers; `/big` answers with 1 MiB; `/flood` sends four
@@ -444,7 +465,7 @@ where
         let mut conns = state.connections.lock().unwrap();
         if path != "/no-protocol" {
             res.headers_mut()
-                .insert("sec-websocket-protocol", "roxy.layer.v6".parse().unwrap());
+                .insert("sec-websocket-protocol", "roxy.layer.v7".parse().unwrap());
         }
         *record.lock().unwrap() = (path, conns.len());
         conns.push(
@@ -504,7 +525,11 @@ impl Demux {
                     st: self.st.clone(),
                 };
                 let path = self.path.clone();
-                tokio::spawn(async move { session(&path, sess).await });
+                if v["mode"] == "observe" && matches!(path.as_str(), "/echo" | "/mixed") {
+                    tokio::spawn(async move { observe(&path, sess).await });
+                } else {
+                    tokio::spawn(async move { session(&path, sess).await });
+                }
             }
             "credit" => {
                 let n = v["bytes"].as_u64().unwrap();
@@ -1262,8 +1287,7 @@ async fn a_rotated_secret_reaches_new_streams_and_old_connections_drain() {
 }
 
 /// An observe stream sees an exchange with no body through to the end
-/// (an empty copy is not a cut one), and roxy credits back what it
-/// ignores, so a service that sends more than a window is never stalled.
+/// (an empty copy is not a cut one), and its `close` ends it cleanly.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_observer_sees_exchanges_through() {
     let (h, st) = start("/echo", "    mode: observe\n", ALLOW_UPSTREAM).await;
@@ -1277,22 +1301,22 @@ async fn an_observer_sees_exchanges_through() {
     assert_eq!(st.resets.lock().unwrap().len(), 0);
     h.stop().await;
 
-    // An observe stream ends on the service's last message, however far
-    // roxy's copies have got: the client's upload stays open until the
-    // service has sent all it wants to, and nothing is logged against it.
+    // A service may close an observe stream however far roxy's copies
+    // have got: the client's upload is still open when it closes, and
+    // nothing is logged against it.
     let (h, st) = start("/mixed", "    mode: observe\n", ALLOW_UPSTREAM).await;
     let (body_tx, body_rx) = mpsc::unbounded_channel::<Result<Vec<u8>, std::io::Error>>();
     body_tx.send(Ok(b"x".to_vec())).unwrap();
     let req = h
         .client()
-        .post(h.https_url("/flood"))
+        .post(h.https_url("/upload"))
         .body(reqwest::Body::wrap_stream(futures_util::stream::unfold(
             body_rx,
             |mut rx| async move { rx.recv().await.map(|b| (b, rx)) },
         )))
         .send();
     let res = tokio::spawn(req);
-    st.until("the service to send it all", |s| {
+    st.until("the observer to close", |s| {
         s.echoed.lock().unwrap().len() == 1
     })
     .await;

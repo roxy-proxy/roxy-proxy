@@ -1,221 +1,113 @@
 # Resource limits
 
-Every limit resolves in the closed direction: an error anywhere between
-accept and the upstream connect produces a deny response or a closed socket
+When something goes wrong, roxy refuses the request or closes the
+connection rather than letting traffic through
 ([fail closed](/design/threat-model#fail-closed)).
 
 ## Fail-closed outcomes
 
 | condition | result |
 |---|---|
-| the process is quarantined | `403`, `_quarantined`, close ([quarantine](/guides/operations#quarantine)) |
-| parse or canonicalisation error | close the connection (`400` if a response can still be written), `parse_error` |
-| a rule denies | deny response, then close |
-| policy input unavailable (metric store, address list, secret) | `503`, `_fail_closed` |
-| metric key table full or byte budget exhausted | deny, `metric_table_full` |
-| body too large to inspect, as sent or decoded | deny, `_fail_closed`, `body_too_large_to_inspect` |
-| body to inspect cannot be decoded | deny, `_fail_closed`, `body_decode_failed` or `unsupported_content_encoding` |
-| body to sign over `max_sign_body_bytes` | `413`, `_sign`, `sign_body_too_large` |
-| buffer budget cannot cover the exchange's inspection, decoding, signing or WebSocket buffers | deny, `_fail_closed`, `buffer_budget_exhausted`; an observer's copy is cut instead (`observer_lagged`), an endpoint call refused, a body decoded for a layer failed |
-| body or header limit exceeded mid-stream | close both sides |
-| request trailers without `http.allow_request_trailers`, or a forbidden field in a trailer section | request: `400` and close, or a stream reset, `parse_error` reason `trailers`; on a request a layer passes on: `503`, `layer_error`, the layer's `invalid_request` (logged if a response head is already out); response: body cut, `response_error` ([trailers](/reference/http#trailers)) |
-| upstream DNS, connect or TLS failure | `502`, `upstream_error` |
-| upstream connect, TLS handshake or response-header timeout | `504`, `upstream_error`, reason `timeout` |
-| address floor | `403`, `_address_policy` |
-| addon trap, budget exceeded, invalid output, or no instance free within `first_byte_timeout` (enforce mode) | deny, `layer_error`; observe-mode addons only log |
-| config reload fails | keep the old policy |
-| connection cap | refuse the new connection |
-| flow log or capture behind, or its disk failing | hold traffic until it catches up; never drop records |
-| WebSocket message that breaks the protocol or is over `max_ws_message_bytes`, when rules read messages | close both sides with `1002`, `1007` or `1009` ([WebSockets](/reference/websockets#message-rules)) |
+| roxy is quarantined | `403`, `_quarantined` ([quarantine](/guides/operations#quarantine)) |
+| a malformed request | the connection is closed, with a `400` if possible, and a `parse_error` event |
+| a rule denies | the deny response, then the connection is closed |
+| a metric, address list or secret is unavailable | `503`, `_fail_closed` |
+| a metric table is full | `503`, `_fail_closed`, `metric_table_full` |
+| a body is too large to inspect, or cannot be decoded | `503`, `_fail_closed` |
+| a body to sign is over `max_sign_body_bytes` | `413`, `_sign` |
+| the buffer budget is used up | `503`, `_fail_closed`, `buffer_budget_exhausted` |
+| a body or header limit is exceeded mid-stream | both sides are closed |
+| the upstream cannot be resolved or reached, or fails TLS | `502` ([upstream](/reference/upstream#errors)) |
+| the upstream times out | `504` |
+| the address floor refuses the upstream | `403`, `_address_policy` |
+| an enforcing addon fails | `503`, `layer:<name>` |
+| a config reload fails | the old policy stays |
+| a connection cap is reached | the new connection is refused |
+| the flow log or capture falls behind | traffic waits until it catches up |
 
-The policy reason codes appear in the flow log only, never in the deny
-response; a parse error's code is also in its `400` body
-([deny responses](/reference/http#deny-responses)).
+Reason codes are in the flow log only, never in the response.
 
 ## Limits
 
-All under `limits:`; defaults shown. Sizes are 1024-based.
+All are under `limits:`. Defaults are shown. Sizes are 1024-based.
 
 ```yaml
 limits:
-  # client requests (HTTP)
+  # client requests
   max_header_bytes: 64kb
   max_url_bytes: 8kb
   max_headers: 100
   max_request_body_bytes: 1gb
-  header_timeout: 10s             # the slowloris guard: each step before a request head (CONNECT, TLS handshake, the head itself)
-  body_idle_timeout: 10m          # the client's stall: sending its body, or taking the response
-  idle_timeout: 1h                # keep-alive idle; also a relayed WebSocket's idle timeout
+  header_timeout: 10s             # to send each request head (and CONNECT, and the TLS handshake)
+  body_idle_timeout: 10m          # the client stalls sending its body, or reading the response
+  idle_timeout: 1h                # an idle keep-alive connection or WebSocket
   h2_max_concurrent_streams: 100
   h2_max_header_list_bytes: 64kb
 
   # responses
   max_response_body_bytes: 1gb
-  response_header_timeout: 15m    # from when the request body has been sent; a WebSocket upgrade's whole upstream handshake
-  response_body_idle_timeout: 30m # the upstream's stall between parts of the response body
+  response_header_timeout: 15m    # the upstream's response head, once the request body is sent
+  response_body_idle_timeout: 30m # the upstream stalls mid-body
 
   # buffering
-  max_inspect_body_bytes: 1mb     # body.text / response.body.text, and addons' default
-  max_sign_body_bytes: 100mb      # a request body hashed for sign: aws_sigv4; larger is 413
+  max_inspect_body_bytes: 1mb     # body.text, response.body.text, and addons' default
+  max_sign_body_bytes: 100mb      # a body hashed for sign: aws_sigv4
   max_capture_body_bytes: 16mb    # per direction per exchange
-  max_ws_message_bytes: 16mb      # a reassembled WebSocket message, when rules read ws.*
-  max_observer_lag_bytes: 16mb    # how far behind an observe-mode addon may fall, per direction
+  max_ws_message_bytes: 16mb      # a WebSocket message, when rules read messages
+  max_observer_lag_bytes: 16mb    # how far an observing addon may fall behind
   max_buffered_bytes: 1gb         # all of the above together, across the process
 
   # connections
-  max_connections: 10000              # to the proxy listeners; ca_server has its own cap of the same size
-  max_connections_per_client: 10000   # per client IP; omitted, it is max_connections, so off unless lowered
+  max_connections: 10000
+  max_connections_per_client: 10000   # per client IP; defaults to max_connections
 
   # policy state
   max_metric_keys: 100000
-  max_metric_bytes: 256mb         # at most 64gb
+  max_metric_bytes: 256mb
   max_state_entries: 100000
   max_address_list_bytes: 256mb
 ```
 
-| limit | on overrun |
-|---|---|
-| `body_idle_timeout` | the request is cut (`parse_error`, `body_timeout`) or the response is cut (`response_error`; `client_gone` on HTTP/1.1, `client_stalled` on HTTP/2) |
-| `response_body_idle_timeout` | the exchange ends (`response_error`, `response_body_timeout`): the connection closes on HTTP/1.1, the stream is reset with `CANCEL` on HTTP/2; while rules are still reading the body (`response.body.text`), nothing has been sent and the client gets a `504` instead |
-| `max_ws_message_bytes` | both sides close with `1009`; applies only when rules read messages ([WebSockets](/reference/websockets#message-rules)) |
-| `max_observer_lag_bytes` | the observer's copy is cut ([addon modes](/design/addon-model#modes)) |
-
-The upstream dial is timed by `upstream.connect_timeout` (10 s), not a
-`limits` key: once for the TCP connect over all of a name's addresses and
-once more for the TLS handshake, so an upstream that accepts the connection
-but never completes TLS is cut after a second `connect_timeout` (`504`,
-`upstream_error`, reason `timeout`, message `upstream TLS handshake`;
-[upstream](/reference/upstream#upstream-tls)).
-
-Addons have their own limits, and fixed caps on what the host holds for a
-guest ([addon limits](/reference/addon-configuration#limits)).
+The upstream connection timeout is `upstream.connect_timeout`
+([upstream](/reference/upstream)). Addons have their own limits
+([addon limits](/reference/addon-configuration#limits)).
 
 ### Timeouts
 
-The timeouts are permissive by default: roxy decides what passes, not how
-long a well-behaved exchange may take, and a model call with minutes to its
-first byte, a quiet WebSocket or a stream with long gaps should not hit one
-unless the operator chose it. Only `header_timeout` is tight. Memory is
-bounded by the buffer budget and the per-connection caps, not by the
-timeouts, so a long timeout costs only the idle connection it keeps:
+The timeouts are generous by default. roxy decides what passes, not how
+long a well-behaved exchange may take: a model call that takes minutes to
+start answering, or a quiet WebSocket, should not hit one. Only
+`header_timeout` is tight, to stop clients that open connections and send
+nothing. A long timeout costs a connection slot, not memory, so if idle
+connections run out, raise `max_connections` rather than shortening the
+timeouts.
 
-| timeout | a long value holds |
-|---|---|
-| `header_timeout` | a connection slot (one of `max_connections`, or of the `ca_server` cap) and its socket, with no request to show for it |
-| `body_idle_timeout` | a connection slot and the exchange's buffers (its reservations under `max_buffered_bytes`, and up to 4 MiB of HTTP/2 receive window) while the client is silent |
-| `idle_timeout` | a connection slot and its socket between requests, or a relayed WebSocket's two sockets and its reserved message buffers while nothing is sent |
-| `response_header_timeout` | a connection slot, the upstream connection, and the exchange's buffers while the upstream thinks |
-| `response_body_idle_timeout` | the same as above while the upstream pauses mid-body |
-
-Tightening one trades those idle connections for cut exchanges; raise
-`max_connections` instead if idle connections are what runs out.
-
-An upstream may return its response before consuming the whole upload.
-The response can reach the client immediately, but the final flow record
-waits until upload accounting finishes. After that response head, roxy
-checks upload progress every twice `body_idle_timeout`. If no bytes were
-consumed during an interval, roxy cancels the remaining upload and records
-`upstream_body_timeout`, unless another failure already supplies the reason.
-This check runs while response rules and response writing are still in
-progress, including exchanges without addon layers.
-The timeout measures bytes consumed from the forwarded body, not which
-participant caused the delay. It also covers an addon holding the upload
-or an HTTP/1.1 response rule waiting while the client socket is not being
-pumped. It can therefore accompany a successful response status.
-A client cancellation also cancels the upload and releases its buffers.
+If the upstream answers before it has read the whole upload, and then
+stops reading it for twice `body_idle_timeout`, roxy cancels the upload
+and records `upstream_body_timeout`.
 
 ### Buffer budget
 
-`max_buffered_bytes` bounds inspection and copy payloads in aggregate.
-An exchange reserves before it fills a charged buffer; a reservation the
-budget cannot cover fails at once, with no waiting and no eviction (`503`,
-`_fail_closed`, `buffer_budget_exhausted`). This is the whole list of what
-is charged:
+`max_buffered_bytes` bounds everything roxy buffers to inspect or copy:
+bodies that rules read, bodies being decoded, compressed again or signed,
+WebSocket messages that rules read, endpoint call bodies, and copies for observing addons.
+Each exchange reserves what it needs before it buffers. If the budget
+cannot cover a reservation, the exchange fails at once
+(`buffer_budget_exhausted`). Nothing waits and nothing is evicted.
 
-| buffer | reservation |
-|---|---|
-| a body a rule reads (`body.text`, `response.body.text`) | `max_inspect_body_bytes`, or its `content-length` if smaller; a body with a `content-encoding` reserves the whole cap, whatever its length, since its decoded size is not known until it is; nothing for a body known to be empty (no request body, a `HEAD` response, a `1xx`, `204` or `304`). Once buffered, it shrinks to what is held (the body as sent with its trailers, or its decoded text if larger) and stays until the exchange ends. A body over the cap holds only what was read before that was known: nothing when its `content-length` said so, the prefix read when it was found out mid-stream |
-| a content decoder | each decoder's window, charged before the decoder is created: 32 KiB for `gzip` or `deflate`, the window a `br` stream's first byte declares (1 KiB to 16 MiB), 8 MiB for `zstd` (the largest window accepted, which each frame may use). Stacked codings add up. Held while the decoder runs: for the rule's decision on an inspected body, for the whole body when it is decoded for the addon stack (`http.decode_for_addons`) or to mask secrets in it (`http.redact_response_secrets.bodies`). A window the budget cannot cover fails closed before it is allocated |
-| a content encoder, re-encoding a body decoded for the addon layers or for masking ([content codings](/reference/http#content-codings)), and one more for the capture of such a response | 512 KiB for `gzip` or `deflate`, 2 MiB for `br`, 4 MiB for `zstd`, stacked codings adding up; charged before the first chunk is encoded and held for the whole body. A charge the budget refuses fails the body; for the capture's encoder, it ends the capture of that body with a `truncated` record |
-| a request body hashed for `sign: aws_sigv4` | its `content-length` (at most `max_sign_body_bytes`) up front; a chunked body reserves chunk by chunk up to that cap and is refused at the chunk the budget cannot cover. Held until the exchange ends. `unsigned_payload: true` reserves nothing ([signing AWS requests](/reference/secrets#signing-aws-requests)) |
-| an endpoint call's request body | what the guest sends, frame by frame as it is read (at most 16 MiB), held until the call is answered. A body the budget cannot cover refuses the call ([host services](/reference/host-services#endpoints-endpoints)) |
-| a WebSocket whose messages rules read | twice `max_ws_message_bytes` at the upgrade, held for the session. Reading bodies but not messages holds nothing for a WebSocket |
-| an observer's copy | the bytes queued and not yet read, frame by frame, given back as the observer reads them (or drops the copy). A copy whose next frame would overrun the budget is cut (`observer_lagged`, `reason: buffer_budget_exhausted`): the budget bounds how far behind observers are in total, not how many exchanges are observed. A copy whose observer gets no instance within its `first_byte_timeout` is dropped the same way (`reason: no_instance`), so a busy observer cannot pin budget that enforce flows need |
-
-Streaming buffers have separate bounds and are outside this budget:
-HTTP/2 receive windows ([connections](/reference/limits#connections)), codec
-parse buffers, depth-two lane channels, WASM output queues (two 64 KiB
-frames), and [service layer](/reference/service-layers) feeder staging.
-A service input can retain two queued lane frames plus its 256 KiB credit
-window; with 256 KiB frames that is 768 KiB of unread payload per body.
-Credit returns when the feeder enqueues a frame, before the final consumer
-reads it. In the other direction, each blocked pump retains one source
-frame and shares a 64-message socket queue; body messages are at most
-64 KiB each. These bounds scale with live streams and layers. Socket buffers,
-metadata, allocation overhead, guest memory and external service memory
-are additional: `max_buffered_bytes` is not a process RAM ceiling.
-
-While reclaiming an HTTP/1.1 exchange, further reads stop at
-`max_header_bytes`, plus one byte to observe EOF at the boundary; existing
-codec read-ahead is retained too. This watch also runs while an unread
-upload fills its body queue. Once the read-ahead buffer is full,
-the upload consumer must make room or the exchange must finish within
-`header_timeout`, otherwise the connection closes;
-queued bytes cannot disable cancellation indefinitely. Ordinary pipelined
-requests remain buffered until the preceding exchange releases its work.
-
-Backpressure still obeys timeout policy. HTTP/1.1 bounds a stalled request
-consumer by `body_idle_timeout`; HTTP/2 arms its request input-idle timer
-when a consumer waits for data. An approval addon holding an unread upload
-can therefore reach the HTTP/1.1 deadline even while sending keepalives.
-After the upstream head, the upload-progress deadline described above
-applies to both transports.
-
-Budget ÷ cap is how many exchanges can hold a buffer at once (defaults:
-1024 bodies of unknown length under inspection, 32 WebSockets with message
-rules, 1 GiB of unread observer copy). It must be at least the largest
-single reservation.
-
-### Reload
-
-| setting | takes effect |
-|---|---|
-| `max_header_bytes`, `max_url_bytes`, `max_headers`, `max_request_body_bytes`, `header_timeout`, `body_idle_timeout`, `response_body_idle_timeout`, `idle_timeout`, the `h2_*` limits, the `http.*` flags | fixed when a connection is accepted; new connections only. A relayed WebSocket takes `idle_timeout` from its exchange's snapshot instead |
-| `max_inspect_body_bytes`, `max_sign_body_bytes`, `max_response_body_bytes`, `response_header_timeout`, the WebSocket limits, `max_observer_lag_bytes`, the policy itself | per exchange, from the snapshot the exchange starts under, on old connections too |
-| `max_buffered_bytes` | process-wide: each reservation is checked against the value in force at that moment; reservations already held stay as they are |
+A body of unknown length that a rule reads reserves the whole
+`max_inspect_body_bytes`, so the defaults allow 1024 such bodies at once.
+The budget is not a cap on the process's memory: socket buffers, streaming
+buffers and addon memory are separate.
 
 ## Connections
 
 - A connection over `max_connections` or `max_connections_per_client` is
-  accepted and closed at once, with a `connection_refused` event. The
-  per-client cap counts TCP peers: it is applied when the connection is
-  accepted, before any `X-Forwarded-For` is read, so a listener's
-  `forwarded_for` does not change what it counts. The `ca_server` listener counts separately, `max_connections` in
-  total with no per-client cap, and logs its refusals to roxy's own log
-  rather than the flow log. A client that fills it starves the health
-  probes, so that port should not be reachable by untrusted clients.
-- Every read is bounded (head size, body size, ClientHello size) and every
-  stage has a timeout. Nothing is allocated in proportion to an
-  attacker-supplied number before it is validated (`content-length: 10^18`
-  does not pre-allocate).
-- Request bytes in flight on an HTTP/2 connection (sent by the client, not
-  yet taken by the upstream) sit outside `max_buffered_bytes`: the
-  connection's receive window caps them at 4 MiB, so one client IP can hold
-  at most `max_connections_per_client` × 4 MiB. Omitted, it is whatever
-  `max_connections` is, so behind a load balancer (one source IP for every
-  client, whatever `forwarded_for` resolves) the cap is the fleet's; lower
-  it on a proxy port where each client has its own address.
-- Upstream connections are bounded by the clients: HTTP/1.1 origins get
-  one connection per concurrent request, HTTP/2 origins at most
-  `upstream.max_h2_connections_per_origin` (4 by default), each with an
-  8 MiB receive window ([upstream](/reference/upstream#connections)).
-- Bounded policy tables (metrics, state) never evict
+  closed at once and logged as `connection_refused`. The per-client cap
+  counts TCP peers, so behind a load balancer it counts the load
+  balancer.
+- The `ca_server` listener has a separate cap of `max_connections`.
+- Each HTTP/2 connection can hold up to 4 MiB of request data not yet
+  sent upstream, outside the buffer budget.
+- Metric and state tables never evict entries
   ([never evict](/design/threat-model#never-evict)).
-- The proxy port serves only proxy semantics and `roxy.internal`; health
-  and CA download live on the separate `ca_server` listener, with a cap of
-  its own, so the two hold at most 2 × `max_connections` connection slots
-  between them.
-- A panic in a connection task closes that connection only.
-- On `SIGTERM` or Ctrl-C roxy stops accepting, drains exchanges in flight
-  for up to 10 seconds, and flushes the flow log and capture before
-  exiting.

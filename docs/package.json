@@ -13,8 +13,8 @@
   "dependencies": {
     "@fontsource/inter": "^5.3.0",
     "@fontsource/jetbrains-mono": "^5.3.0",
-    "react": "~19.3.0",
-    "react-dom": "~19.3.0",
+    "react": "~19.3.1",
+    "react-dom": "~19.3.1",
     "vite": "^8.3.4",
     "vocs": "2.10.3",
     "waku": "1.0.0-rc.3"

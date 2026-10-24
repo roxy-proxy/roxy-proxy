@@ -44,6 +44,18 @@ impl Recorder for Record {
             Some((parts, body))
         })
     }
+
+    fn aborted(&self) {
+        if let Some(st) = self.0.upgrade() {
+            st.attribution.aborted();
+        }
+    }
+
+    fn client_gone(&self) {
+        if let Some(st) = self.0.upgrade() {
+            st.attribution.client_gone();
+        }
+    }
 }
 
 /// A chain for `st`, its ends in hand, for tests that drive the stack's

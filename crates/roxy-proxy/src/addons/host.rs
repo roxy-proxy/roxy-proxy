@@ -10,8 +10,6 @@ use roxy_wasm::{
 
 use std::sync::Mutex;
 
-use roxy_http::Body;
-
 use super::chain::{Head, Headless, LaneTx};
 use super::{AddonMode, AddonSpec, Part, StackFlow, endpoint, lock, subscribe};
 use crate::flowlog::{FlowEvent, sink_ready};
@@ -61,10 +59,8 @@ pub(crate) struct StackHost {
     /// the layer's own failure is recorded.
     pub(crate) answer: Arc<Mutex<Option<LaneTx>>>,
     /// The bodies a head-only layer does not see, to go on with the heads
-    /// it passes on: the request body, and the response body from upstream
-    /// with its status.
-    pub(crate) held_request: Mutex<Option<Body>>,
-    pub(crate) held_response: Mutex<Option<(http::StatusCode, Body)>>,
+    /// it passes on.
+    pub(crate) bypassed: subscribe::Bypassed,
 }
 
 impl StackHost {
@@ -82,8 +78,7 @@ impl StackHost {
             observer,
             call,
             answer: Arc::default(),
-            held_request: Mutex::new(None),
-            held_response: Mutex::new(None),
+            bypassed: subscribe::Bypassed::default(),
         }
     }
 }
@@ -123,24 +118,21 @@ impl LayerHost for StackHost {
             };
         }
         let subscribe = self.addon().subscribe;
-        // A head-only layer passes the head on; the body it did not see
-        // goes on with it, retaining its validation and clean-end check.
-        let held = lock(&self.held_request).take();
-        let req = match held {
-            Some(held) => {
-                let mut req = req;
-                req.extensions_mut().remove::<GuestBody>();
-                req.map(|own| subscribe::splice(&self.st, self.index, Dir::Request, own, held))
-            }
-            None => req,
+        // A head-only layer passes the head on, and the body it did not see
+        // goes on with it. What the layer gave for the body is not part of
+        // the lane: it is only watched for bytes it may not send.
+        let req = if subscribe.request == Part::Head {
+            let (mut parts, own) = req.into_parts();
+            parts.extensions.remove::<GuestBody>();
+            subscribe::watch_own(&self.st, self.index, Dir::Request, own);
+            LayerRequest::from_parts(parts, self.bypassed.request())
+        } else {
+            req
         };
-        let own = req.extensions().get::<GuestBody>().is_some();
-        match super::layer::forward_lanes(&self.st, self.index, Ok(req), own).await {
+        match super::layer::forward_lanes(&self.st, self.index, Ok(req)).await {
             Ok(mut res) => {
                 if subscribe.response == Part::Head {
-                    let body = std::mem::take(res.body_mut());
-                    subscribe::head_only(res.headers_mut());
-                    *lock(&self.held_response) = Some((res.status(), body));
+                    self.bypassed.hold_response(&mut res);
                 }
                 Ok(Some(res))
             }
@@ -157,24 +149,20 @@ impl LayerHost for StackHost {
             return;
         };
         // A head-only layer passing the response from upstream on (the
-        // same status) gets its body back; any other status is an answer
-        // of the layer's own, whole.
-        let held = lock(&self.held_response).take();
-        let res = match held {
-            Some((status, body)) if status == res.status() => {
-                let mut res = res;
-                res.extensions_mut().remove::<GuestBody>();
-                res.map(|own| subscribe::splice(&self.st, self.index, Dir::Response, own, body))
+        // same status) gets its body back, and what it gave for the body is
+        // only watched; any other status is an answer of the layer's own,
+        // whole.
+        let res = match self.bypassed.response(res.status()) {
+            Some(body) => {
+                let (mut parts, own) = res.into_parts();
+                parts.extensions.remove::<GuestBody>();
+                subscribe::watch_own(&self.st, self.index, Dir::Response, own);
+                LayerResponse::from_parts(parts, body)
             }
-            _ => res,
+            None => res,
         };
-        let own = res.extensions().get::<GuestBody>().is_some();
         let (parts, body) = res.into_parts();
-        if own {
-            answer.produced(Head::Response(parts), body);
-        } else {
-            answer.whole(Head::Response(parts), body);
-        }
+        answer.whole(Head::Response(parts), body);
     }
 
     async fn endpoint_permit(&self) -> Result<EndpointPermit, EndpointError> {

@@ -16,7 +16,7 @@
 //! Reclamation waits for lane consumers, drivers, and accounting to finish
 //! before returning the context to the transport handler for the final log.
 
-mod attribution;
+pub(crate) mod attribution;
 mod chain;
 mod client_edge;
 mod core_edge;
@@ -31,7 +31,6 @@ mod subscribe;
 mod tee;
 mod ws;
 
-pub(crate) use chain::Cancellation;
 pub(crate) use client_edge::run;
 pub(crate) use reclaim::Reclaim;
 pub use service::{ServiceError, ServiceSpec};
@@ -397,21 +396,27 @@ impl StackFlow {
         });
     }
 
+    /// What the stack's part of the record is made from.
+    pub(crate) fn cause(&self) -> attribution::Cause {
+        self.attribution.cause()
+    }
+
+    /// The client's loss, or upstream work nothing waited for, as the
+    /// record would name it.
     #[cfg(test)]
     pub(crate) fn cancellation_reason(&self) -> Option<&'static str> {
-        self.cancellation().map(Cancellation::reason)
+        let cause = self.cause();
+        if cause.client_gone {
+            Some("client_gone")
+        } else {
+            cause
+                .upstream_abandoned
+                .then_some(attribution::LAYER_ABORTED)
+        }
     }
 
-    pub(crate) fn cancellation(&self) -> Option<Cancellation> {
-        self.chain().cancellation()
-    }
-
-    pub(crate) fn abort_reason(&self) -> Option<&'static str> {
-        self.chain().abort_reason()
-    }
-
-    /// The flow log's code for the fault that cut the exchange's response
-    /// body after its head was out, if one is recorded.
+    /// The flow log's code for the fault recorded, if one is.
+    #[cfg(test)]
     pub(crate) fn fault_reason(&self) -> Option<String> {
         self.attribution.fault().map(|f| f.reason().to_owned())
     }
@@ -702,48 +707,6 @@ mod tests {
         );
     }
 
-    /// The guest's own abort remains visible when its body is combined
-    /// with bytes it never sees.
-    #[tokio::test]
-    async fn a_spliced_guests_own_body_failure_is_still_its_abort() {
-        let kit = Kit::builder()
-            .addon(AddonDef::test_layer("a"))
-            .start()
-            .await;
-        for dir in [
-            crate::in_flight::Dir::Request,
-            crate::in_flight::Dir::Response,
-        ] {
-            let (st, _cx, mut ends) = test_flow(&kit);
-            let layer = ends.layers.pop().unwrap();
-            layer.stage.enforcing();
-            let (sender, own) = Body::channel(u64::MAX, None);
-            sender.abort(roxy_http::BodyError::Incomplete);
-            let body = subscribe::splice(&st, 0, dir, own, Body::empty());
-            let body = match dir {
-                crate::in_flight::Dir::Request => {
-                    layer
-                        .req_out
-                        .whole(Head::Request(http::Request::new(()).into_parts().0), body);
-                    ends.core.req_in.head().await.unwrap().1
-                }
-                crate::in_flight::Dir::Response => {
-                    layer
-                        .res_out
-                        .whole(Head::Response(http::Response::new(()).into_parts().0), body);
-                    ends.edge.res_in.head().await.unwrap().1
-                }
-            };
-            assert!(body.collect_up_to(u64::MAX).await.is_err());
-            let expected = match dir {
-                crate::in_flight::Dir::Request => "forward_aborted",
-                crate::in_flight::Dir::Response => "answer_aborted",
-            };
-            assert_eq!(st.chain().abort_reason(), Some(expected));
-            assert!(!st.attribution.is_faulted());
-        }
-    }
-
     /// A cancellation already observed in the same wake as completion
     /// remains part of the final record, with or without addon lanes.
     #[tokio::test]
@@ -893,9 +856,8 @@ mod tests {
         assert!(st.torn_down().is_cancelled());
     }
 
-    /// Which layer answered is read as its head lands on its lane: a
-    /// response from upstream landing after that does not turn the answer
-    /// into a response passed on.
+    /// Which layer answered is read as its head lands on its lane: the
+    /// answer is its own unless it had taken the upstream's first.
     #[tokio::test]
     async fn the_answering_layer_is_read_when_it_answers() {
         let kit = Kit::builder()
@@ -919,6 +881,8 @@ mod tests {
             .whole(Head::Response(answer(200)), Body::empty());
         assert_eq!(st.answered_by(), Some(0));
 
+        // Upstream's answer on the lane, but not yet taken: still the
+        // layer's own.
         let (st, _cx, mut ends) = test_flow(&kit);
         let a = ends.layers.pop().unwrap();
         a.stage.enforcing();
@@ -926,6 +890,16 @@ mod tests {
             .res_out
             .whole(Head::Response(answer(200)), Body::empty());
         a.res_out.whole(Head::Response(answer(200)), Body::empty());
+        assert_eq!(st.answered_by(), Some(0));
+
+        let (st, _cx, mut ends) = test_flow(&kit);
+        let mut a = ends.layers.pop().unwrap();
+        a.stage.enforcing();
+        ends.core
+            .res_out
+            .whole(Head::Response(answer(200)), Body::empty());
+        let (head, body) = a.res_in.head().await.unwrap();
+        a.res_out.whole(head, body);
         assert_eq!(
             st.answered_by(),
             None,

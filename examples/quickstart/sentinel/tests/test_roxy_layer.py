@@ -303,3 +303,40 @@ async def test_accepted_call_gets_its_result_after_the_handler_finishes() -> Non
     await roxy.until_closed(1)
     assert await calls[0] is None
     assert stray_tasks(roxy.task) == set()
+
+
+async def test_a_head_only_exchange_is_heads_alone_each_way() -> None:
+    roxy = FakeRoxy(forward_and_answer)
+    roxy.open(1, subscribe={"request": "head", "response": "head"})
+    forwarded = await roxy.ws.next_sent()
+    assert isinstance(forwarded, dict) and forwarded["type"] == "request"
+    roxy.ws.control(1, "response", status=204, headers=[])
+    answer = await roxy.ws.next_sent()
+    assert isinstance(answer, dict) and answer["type"] == "response" and answer["status"] == 204
+    await roxy.until_closed(1)
+    assert 1 not in roxy.conn.streams
+    # No bytes, ends or stops follow either head.
+    with pytest.raises(TimeoutError):
+        await roxy.ws.next_sent(timeout=0.01)
+
+
+async def test_an_observer_sends_nothing_on_its_lanes_then_closes() -> None:
+    seen: list[bytes] = []
+
+    async def handle(ex: Exchange) -> None:
+        seen.append(await ex.read_body())
+        res = await ex.forward(ex.request, b"ignored")
+        seen.append(await ex.read_response_body())
+        await ex.respond(res, b"ignored")
+
+    roxy = FakeRoxy(handle)
+    roxy.open(1, mode="observe")
+    roxy.ws.body(1, b"up")
+    roxy.ws.control(1, "request_end")
+    roxy.ws.control(1, "response", status=200, headers=[])
+    roxy.ws.body(1, b"down", RESPONSE)
+    roxy.ws.control(1, "response_end")
+    assert await roxy.ws.next_sent() == {"stream": 1, "type": "close"}
+    await roxy.until_closed(1)
+    assert seen == [b"up", b"down"]
+    assert 1 not in roxy.conn.streams

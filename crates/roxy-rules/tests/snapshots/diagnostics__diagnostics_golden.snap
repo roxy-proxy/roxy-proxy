@@ -132,7 +132,7 @@ rules[0].when:1:9: unterminated string  [rule a]
     |         ^^^^^^^^^^^^^^^
 
 == allow in an in-flight rule
-rules[0].then[0]: `allow` is only possible in admission rules; this rule reads `response.status`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation). Write the allow as an admission rule and this rule as a `deny`  [rule a]
+rules[0].then[0]: `allow` is only possible in admission rules; this rule reads `response.status`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#when-rules-run). Write the allow as an admission rule and this rule as a `deny`  [rule a]
 
 == connect-time fields are gone
 rules[0].when:1:1: unknown field `dst.port`  [rule a]
@@ -183,7 +183,7 @@ rules[0].then[0]: reference to undefined secret "missing" (define it under `secr
 rules[0].then[0]: sign aws_sigv4: `secret_access_key` must not be empty  [rule a]
 
 == sign in an in-flight rule
-rules[0].then[0]: `sign` changes the request, which is already on its way; this rule reads `response.status`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation)  [rule a]
+rules[0].then[0]: `sign` changes the request, which is already on its way; this rule reads `response.status`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#when-rules-run)  [rule a]
 
 == passthrough is reserved
 parse: [0].then: `passthrough` is reserved: roxy has no transparent listener at line 1, column 18
@@ -221,10 +221,10 @@ rules[0].then[1]: `tag` follows the terminal action `allow` and would never run;
 parse: [0].then: unknown action `sethead`; expected one of `allow`, `deny`, `quarantine`, `set_header`, `remove_header`, `rewrite_path`, `set_query`, `remove_query`, `redirect`, `tag`, `log`, `set_state`, `capture`, `digest`, `sign` at line 1, column 18
 
 == request mutation in an in-flight rule
-rules[0].then[0]: `rewrite_path` changes the request, which is already on its way; this rule reads `body.bytes`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation)  [rule a]
+rules[0].then[0]: `rewrite_path` changes the request, which is already on its way; this rule reads `body.bytes`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#when-rules-run)  [rule a]
 
 == request header change in an in-flight rule
-rules[0].then[0]: `set_header` in this rule would change the request, which is already on its way; this rule reads `body.bytes`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#evaluation). (In a rule that reads response values it changes the response.)  [rule a]
+rules[0].then[0]: `set_header` in this rule would change the request, which is already on its way; this rule reads `body.bytes`, which is known only after the request was forwarded (https://roxy-proxy.github.io/roxy-proxy/design/policy-evaluation#when-rules-run). (In a rule that reads response values it changes the response.)  [rule a]
 
 == response header change that could fire after the head is sent
 rules[0].then[0]: `remove_header` changes the response head, so every value the rule reads must be known before the response head is sent; this rule also reads response.body.bytes, which can change after that  [rule a]

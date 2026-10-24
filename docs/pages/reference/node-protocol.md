@@ -1,56 +1,49 @@
 # Node protocol
 
-The protocol between a roxy node (a roxy process in node mode) and its
-control plane (any server implementing these four operations). The contract
-is
-[`spec/node-protocol/v1/openapi.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/main/spec/node-protocol/v1/openapi.yaml):
-the example bodies here are checked against its schemas in CI and titled
-with the schema each satisfies.
+The protocol between a roxy node (roxy in [node mode](/guides/node-mode))
+and its control plane. Any server that implements these four operations
+can be a control plane. The formal definition is
+[`spec/node-protocol/v1/openapi.yaml`](https://github.com/roxy-proxy/roxy-proxy/blob/main/spec/node-protocol/v1/openapi.yaml),
+and each example on this page is titled with the schema it matches.
 
-A node enrols once with a bootstrap token and receives a node token, then
-authenticates with it to poll for its lease, ship its flow log and renew
-the token. The lease is the whole policy: a rendered `roxy.yaml`, the
-secret values it names, and how long it is good for. An expired lease
-denies everything. The control plane never pushes; the node polls.
+A node enrols once with an enrolment token and gets a node token back. It
+then uses the node token to poll for its lease, send its flow log and
+renew the token. The lease is the node's whole policy: a `roxy.yaml`, the
+secrets it needs, and how long it is valid. The control plane never
+contacts the node; the node always polls.
 
 ## Transport
 
-- HTTP/1.1 or HTTP/2 over TLS; all paths start with `/roxy/v1/`. Bodies
-  are JSON, `Content-Type: application/json`; unknown fields are ignored by
-  both sides. The node's `User-Agent` is `roxy/<roxy_version>`.
+- HTTPS, HTTP/1.1 or HTTP/2. All paths start with `/roxy/v1/`. Bodies are
+  JSON. Both sides ignore unknown fields.
 - Every request carries `Authorization: Bearer <token>`: the enrolment
-  token at enrolment, the node token everywhere else. The node presents no
-  client certificate, so the control plane can sit behind any TLS
-  terminator; a token only ever travels inside the server's TLS. A request
-  other than enrolment whose token the server does not recognise is
-  answered `401`.
-- Bootstrap material, given out of band: the control plane URL, an
-  enrolment token, and optionally a PEM bundle of CA certificates to verify
-  the control plane with (otherwise the system roots).
+  token when enrolling, the node token otherwise. There are no client
+  certificates, so the control plane can sit behind any TLS terminator.
+- The operator gives the node the control plane's URL, an enrolment
+  token, and optionally the CA certificates to verify the control plane
+  with.
 
 ### Errors
 
-Every non-`2xx` response carries an error body: `error` is a stable code,
-`message` is for humans, and a `426` adds `missing`
-([unsupported versions](/reference/node-protocol#unsupported-versions)). A
-node acts on the status code, not the body.
+Every error response has a body with a stable `error` code and a
+`message`. The node acts on the status code, not the body.
 
 ```json title="Error"
 {"error": "invalid_token", "message": "enrolment token not recognised"}
 ```
 
-| status | meaning | node behaviour |
+| status | meaning | what the node does |
 |---|---|---|
-| `400` | malformed request; `error` says how | logged apart from a `401`; retrying cannot help. Enrolment: retry with backoff for two minutes, then exit non-zero. Renewal: stop renewing. Lease: log once per outcome change, keep polling and let the lease run down. A flow batch is the exception ([flow upload](/reference/node-protocol#flow-upload)) |
-| `401` | at enrolment: the token was not accepted. Elsewhere: the node token is not recognised (never issued, expired or forgotten) | enrolment: retry with backoff for two minutes (a new token may not have reached every replica), then exit non-zero. Renewal: log once per run of them and retry with backoff under the current token (the replica answering may not yet know the token the last renewal issued). Lease: log once per outcome change, keep polling and let the lease run down. Flows: retry the batch with backoff, as a failure. Never re-enrol unasked: re-enrolment is an operator action |
-| `410` | the node is revoked; definite and terminal | at enrolment: exit non-zero at once. Elsewhere: expire the lease at once (deny everything, clear the secrets), stop polling, keep `/healthz` up and `/readyz` not ready, and offer what is spooled to `/flows` for up to thirty seconds |
-| `426` | the server will not serve this node's `protocol_version` or `roxy_version` | enrolment: exit non-zero at once. Renewal: stop renewing. Lease: treat as `5xx`; log the `missing` list distinctly |
-| `507` | flow quota exhausted | stop shipping until a lease with a new `lease_id` arrives ([flow upload](/reference/node-protocol#flow-upload)) |
-| `5xx`, timeout, connection or TLS error | the control plane is unavailable | retry with backoff; the lease runs down |
+| `400` | the request was malformed | Enrolment: retries for two minutes, then exits. Renewal: stops renewing. Lease: keeps polling, and the lease expires if this continues. |
+| `401` | the token is not recognised | Enrolment: retries for two minutes, then exits. Renewal and flows: retries, since another replica may not know the new token yet. Lease: keeps polling, and the lease expires if this continues. The node never re-enrols by itself. |
+| `410` | the node is revoked | Enrolment: exits. Otherwise: denies everything at once, forgets its secrets, stops polling, and tries for thirty seconds to send its remaining flow log. |
+| `426` | the server will not serve this node's version | Enrolment: exits. Renewal: stops renewing. Lease: treated like `5xx`. |
+| `507` | the node's flow quota is used up | stops sending flows until a new lease arrives |
+| `5xx`, timeout, connection or TLS error | the control plane is unavailable | retries with backoff; the lease expires if this continues |
 
 ## Enrol
 
-`POST /roxy/v1/enrol` with `Authorization: Bearer <enrolment token>`.
+`POST /roxy/v1/enrol` with the enrolment token.
 
 ```json title="EnrolRequest"
 {
@@ -61,8 +54,8 @@ node acts on the status code, not the body.
 
 | field | meaning |
 |---|---|
-| `roxy_version` | the node's roxy release; a server may refuse one below its floor with `426` |
-| `protocol_version` | `1`; a server that does not speak it answers `426` with `missing: ["protocol_version:1"]` |
+| `roxy_version` | the node's roxy version |
+| `protocol_version` | `1` |
 
 ```json title="EnrolResponse"
 {
@@ -75,40 +68,31 @@ node acts on the status code, not the body.
 
 | field | meaning |
 |---|---|
-| `node_id` | chosen by the server: 1 to 128 characters from `A-Z a-z 0-9 . _ -`; stable for the life of the node |
-| `token` | the node token: 1 to 512 bytes of RFC 6750 `b64token` text (`A-Z a-z 0-9 - . _ ~ + /`, then any number of `=`), opaque to the node, which stores it and presents it unchanged as `Authorization: Bearer` on every later request. Its lifetime and storage (hashed at rest is recommended) are the server's decisions |
-| `not_after` | when the server stops accepting the token, RFC 3339 in UTC |
-| `renew_after_seconds` | counted from receipt; once passed, the node [renews](/reference/node-protocol#renew). Well inside the token lifetime, so a failed renewal can be retried. Whatever the value, the node renews no later than two thirds of the way to `not_after` and no sooner than one second after receipt; it does not check the schema's minimum, so `0` renews once a second |
+| `node_id` | chosen by the server: 1 to 128 characters from `A-Z a-z 0-9 . _ -`, fixed for the life of the node |
+| `token` | the node token: 1 to 512 characters valid in a bearer token. The node stores it and sends it unchanged |
+| `not_after` | when the server stops accepting the token, in UTC |
+| `renew_after_seconds` | when the node should [renew](/reference/node-protocol#renew) the token, counted from when it received it. The node renews no later than two thirds of the way to `not_after` whatever this says |
 
-The enrolment token's lifetime and reuse (single-use, shared across a
-fleet) are the control plane's decisions; single-use with a short expiry
-is recommended. The node writes the node token, with its `node_id` and
-`not_after`, to its state directory (mode `0600`): the only credential the
-protocol puts on disk, and a revocable per-node identity.
+The control plane decides how long tokens last and how it stores them.
+We recommend single-use enrolment tokens with a short expiry, and storing
+node tokens hashed. The node keeps its token in its state dir (mode
+`0600`).
 
 ## Renew
 
-`POST /roxy/v1/renew` with the node token and the enrol body; the response
-has the enrolment response's shape, with `node_id` unchanged and a fresh
-`token`. The server keeps accepting the old token until its own
-`not_after`, so a renewal that has reached one replica but not another
-cannot lock the node out; the node switches to the new token on receipt
-and replaces the one in its state directory.
+`POST /roxy/v1/renew` with the node token and the same body as enrolment.
+The response has the same shape as the enrolment response, with the same
+`node_id` and a new `token`. The server should keep accepting the old
+token until its `not_after`, so that a renewal that reached one replica
+but not another does not lock the node out.
 
-`5xx`, timeout, connection and TLS errors are retried with backoff, and so
-is a `401`: the replica answering may not yet know the token the last
-renewal issued, so the node keeps trying under the token it has, logging
-once per run of them. `410` is terminal; a `426` or other `4xx` is logged
-once and ends renewal, and the token serves until its `not_after`. Once it
-expires the node exits non-zero with an error naming the remedy (a new
-enrolment token and an empty state dir), as it does on a start whose
-stored token has already
-expired: no control plane recognises the token, so nothing short of
-re-enrolment recovers the node.
+If the token expires without being renewed, the node exits and needs a
+new enrolment token and an empty state dir.
 
 ## Lease
 
-`POST /roxy/v1/lease` with the node token. The body is the node's state:
+`POST /roxy/v1/lease` with the node token. The body reports the node's
+state:
 
 ```json title="NodeState"
 {
@@ -125,12 +109,11 @@ re-enrolment recovers the node.
 
 | field | meaning |
 |---|---|
-| `lease_id` | the lease the node holds; `null` before the first. Lets the server notice a node that did not apply what it was sent |
-| `roxy_version` | the node's release; the server may refuse to serve it with `426` |
-| `policy_state` | `none` (no lease yet), `loaded` (a lease is in force) or `expired` (the lease ran down, or the node is revoked). A quarantine does not change it: the lease is still applied, and `quarantine` says the node refuses everything regardless |
-| `spooled_bytes` | flow-log data accepted but not yet acknowledged |
-| `seq_unreserved` | `true` while events are being tagged with `seq` values past the node's persisted reservation, because a `flow.seq` write is failing or has not caught up. A restart in that state may reuse those `seq` values, and the server would drop the reused events as duplicates; a node reporting `true` for long needs its state directory looked at. Absent from a node that predates the field |
-| `quarantine` | the [quarantine](/guides/operations#quarantine) in force, or `null`. Absent from a node that predates the field |
+| `lease_id` | the lease the node has applied, or `null` before the first. A node that reports an old `lease_id` did not apply the latest lease |
+| `policy_state` | `none` (no lease yet), `loaded` or `expired` |
+| `spooled_bytes` | flow-log data waiting to be acknowledged |
+| `seq_unreserved` | `true` if the node cannot save its flow sequence counter, so a restart might reuse sequence numbers. A node that reports this for long needs its state dir looked at |
+| `quarantine` | the node's [quarantine](/guides/operations#quarantine), or `null` |
 
 ```json title="QuarantineReport"
 {
@@ -142,13 +125,12 @@ re-enrolment recovers the node.
 
 | field | meaning |
 |---|---|
-| `id` | minted by the node per incident; what a release names |
-| `since` | when it tripped, on the node's clock |
-| `cause` | what tripped it, as the node's `quarantined` flow event carries it: `kind: rule` with the `rule` id and the `flow`, `kind: threshold` with the `listener`, the `counter` (`parse_errors`), its `count` and `window_seconds`, `kind: layer` with the `layer` name, the `flow` and, when a service layer tripped it, `call`, the service's id for the call, or `kind: secret_in_response` with the `flow` and the `part` (`headers`, `body` or `trailers`) ([flow log](/reference/flow-log#events)) |
+| `id` | the incident's id, which a release must name |
+| `since` | when it was tripped, by the node's clock |
+| `cause` | what tripped it: `kind: rule` with the `rule` and `flow`, `kind: threshold` with the `listener` and its threshold, `kind: layer` with the `layer` and `flow`, or `kind: secret_in_response` with the `flow` and the `part` (`headers`, `body` or `trailers`) |
 
-The server answers `200` with the full lease on every poll (no conditional
-fetch), or `410`, `401`, `426`, `5xx` as in the
-[errors table](/reference/node-protocol#errors).
+The server answers `200` with the whole lease on every poll, or an
+[error](/reference/node-protocol#errors).
 
 ### Lease body
 
@@ -177,44 +159,39 @@ fetch), or `410`, `401`, `426`, `5xx` as in the
 
 | field | meaning |
 |---|---|
-| `lease_id` | opaque; changes whenever any other field changes. The node reports it on every poll and quotes it in flow batches |
-| `valid_for_seconds` | a duration, not an instant: the node sets `valid_until = sent_at + valid_for_seconds` from its own clock, `sent_at` being just before it sent the request, so a slow answer shortens the lease and clock skew has no effect. The server's clock is never used |
-| `refresh_after_seconds` | when to poll next, counted the same way; leave room for several retries before `valid_for_seconds` runs out (a third of it is reasonable). The node never polls later than halfway through the lease |
-| `config` | a complete `roxy.yaml` as a string, with no secret values: every `secrets:` entry the lease supplies is `name: { lease: true }` |
-| `secrets` | each secret name the config declares, to its value, a UTF-8 string. The node reads a missing map as empty, which refuses the lease if the config declares any `lease: true` secret |
-| `state_epoch` | opaque. When it differs from the previous lease's, the node clears every rule `set_state` entry and every metric window before applying the lease (how a control plane lifts a lockout a rule imposed with `set_state`); unchanged, state survives a config change. The first lease sets it without clearing anything |
-| `flow` | [flow upload](/reference/node-protocol#flow-upload) settings. `ship: false` turns shipping off; the other fields are still required. `on_high_water` is `hold` (apply roxy's backpressure to traffic when the spool is full) or `spool` (drop the oldest spooled events, logging once) |
-| `quarantine` | releases of the node's [quarantine](/guides/operations#quarantine). `release` lists incident ids the control plane has released; the node lifts its quarantine when the `quarantine.id` it reports is among them, and ignores any other id, so a release decided before a later trip lifts nothing. Ids may stay listed indefinitely. Orthogonal to the policy: the rest of the lease is applied whether or not the node is quarantined, so the policy is current the moment the quarantine lifts. Optional; a server that has released nothing leaves it out |
-| `interception_ca` | reserved; a v1 server does not send it and a v1 node ignores it (the node accepts any value here, whatever the schema says) |
+| `lease_id` | any string that changes whenever anything else in the lease changes |
+| `valid_for_seconds` | how long the lease is valid, measured by the node's own clock from just before it sent the request. Clock differences between the node and server do not matter |
+| `refresh_after_seconds` | when to poll next. Leave room for several retries; a third of `valid_for_seconds` is reasonable. The node polls no later than halfway through the lease |
+| `config` | a complete `roxy.yaml`. Secrets the lease supplies are declared as `name: { lease: true }` |
+| `secrets` | the value of each `lease: true` secret |
+| `state_epoch` | any string. When it changes, the node clears all rule state and metric counts before applying the lease, which is how a control plane lifts a lockout a rule imposed |
+| `flow` | how to send the flow log ([flow upload](/reference/node-protocol#flow-upload)). `ship: false` turns it off. `on_high_water` says what happens when `spool_high_water_bytes` are waiting: `hold` holds traffic, `spool` drops the oldest events |
+| `quarantine` | optional. `release` lists the quarantine ids the control plane has released. The node lifts its quarantine when its id is listed |
+| `interception_ca` | reserved; not sent by a v1 server |
 
-The node applies only what differs from what it holds: a changed `config`
-rebuilds the policy (the atomic snapshot swap of a file reload); changed
-`secrets` alone swap the in-memory secret map and update the redactor,
-leaving rules, addons and upstream pools alone; neither changed only moves
-`valid_until`. A lease is applied in full or not at all: a `config` that
-`roxy check` would reject, or a `secrets` map missing a name the config
-declares, is logged and discarded, and the node keeps the lease it has. A
-node without a lease denies everything and reports not ready.
+The node applies a lease in full or not at all. A lease whose `config`
+`roxy check` would reject, or that lacks a secret the config declares, is
+logged and ignored, and the node keeps the lease it has. A change to
+`secrets` alone is applied without reloading the rest of the policy.
 
 ### Unsupported versions
 
-A node reports `protocol_version` and `roxy_version` at enrolment, renewal
-and every lease fetch. A server that does not speak the protocol version,
-or will not serve nodes below some roxy release, answers `426` naming what
-the node lacks:
+The node sends its `protocol_version` and `roxy_version` with every
+request. A server that will not serve it answers `426` and lists what the
+node lacks:
 
 ```json title="Error"
 {"error": "unsupported", "message": "roxy 0.1.0 is below this server's floor of 0.2.0", "missing": ["roxy_version:0.2.0"]}
 ```
 
-There is no other capability negotiation: the node parses `config`
-strictly, so a lease using something it does not understand fails to load,
-and the `lease_id` on its next poll shows the server it was not applied.
+There is no other capability negotiation. A lease that uses something the
+node does not understand fails to load, and the `lease_id` on the next
+poll shows it was not applied.
 
 ## Flow upload
 
-`POST /roxy/v1/flows` with the node token. The body may be gzip
-compressed, signalled with `Content-Encoding: gzip`.
+`POST /roxy/v1/flows` with the node token. The body may be gzipped, with
+`Content-Encoding: gzip`.
 
 ```json title="FlowBatch"
 {
@@ -230,30 +207,25 @@ compressed, signalled with `Content-Encoding: gzip`.
 
 | field | meaning |
 |---|---|
-| `node_id` | must match the node the token names, or the answer is `400 node_mismatch` |
-| `lease_id` | the lease in force when the batch was assembled; any lease id issued to the node is accepted |
-| `seq_first` | the `seq` of the first event; events are consecutive and in order from it, or the server answers `400` |
-| `events` | [flow log](/reference/flow-log) records with `seq` added: a per-node counter that increases by one per shipped event, persisted in the state directory in blocks so it keeps increasing across restarts (a restart skips to the end of the last reservation, at most two blocks of 1024) |
+| `node_id` | must match the token's node, or the answer is `400 node_mismatch` |
+| `lease_id` | the lease in force when the batch was put together |
+| `seq_first` | the `seq` of the first event. Events are numbered consecutively from it |
+| `events` | [flow log](/reference/flow-log) records, each with a `seq` that increases by one per event and keeps increasing across restarts |
 
-A batch is at most the lease's `batch_max_bytes` (the JSON before
-compression); the node flushes when that is reached or
-`flush_interval_seconds` has passed since the first unsent event. A server
-that refuses a batch within the size it stated is treated as `5xx`.
+The node sends a batch when it reaches `batch_max_bytes`, or
+`flush_interval_seconds` after the oldest unsent event.
 
 ```json title="FlowAck"
 {"acked_through": 1043}
 ```
 
-Delivery is at least once: the server stores the batch, deduplicating on
-`(node_id, seq)`, and answers `200` with the highest `seq` it has stored
-for the node; the node drops spooled events at or below `acked_through`. A
-gap within one run means events were dropped (`spool` mode at the high
-water): a server-side alert, not a protocol error. Restarts and `ship:
-false` also leave gaps.
+Delivery is at least once. The server stores the batch, ignoring events
+it already has for that `(node_id, seq)`, and answers with the highest
+`seq` it has stored. The node then discards events up to that number. A
+gap in `seq` within one run means the node dropped events under
+`on_high_water: spool`. Restarts and `ship: false` also leave gaps.
 
-| response | node behaviour |
-|---|---|
-| `400` (`node_mismatch`, a `lease_id` the server never issued, events not consecutive) | logged apart from an outage; the batch is unshipped audit and stays spooled, so under `hold` traffic stalls until the control plane accepts it |
-| `507` | log once and apply `on_high_water` to what accumulates until a new lease arrives; the control plane is expected to revoke the node or issue it a new lease |
-| `410` | shipping stops, and so does the drain that follows a `410` on the lease: a control plane that wants a revoked node's last events keeps accepting its batches |
-| `401`, `5xx` | as in the [errors table](/reference/node-protocol#errors) |
+A batch the server refuses with `400` stays queued on the node, so under
+`hold` traffic stops until the server accepts it. A `507` means the
+server wants no more flows until it sends a new lease. Other responses
+are handled as in the [errors table](/reference/node-protocol#errors).

@@ -1,0 +1,105 @@
+---
+title: "Node mode"
+description: "Run roxy without a config file: it enrols with a control plane, leases its policy and secrets, and sends its flow log back."
+---
+
+import nodeMode from "../../assets/node-mode.svg";
+
+# Node mode
+
+In node mode roxy has no config file. It enrols with a control plane,
+leases its policy and secrets from it, and sends its flow log back. The
+control plane is any server that implements the
+[node protocol](/reference/node-protocol).
+
+<img src={nodeMode} alt="The node protocol as a sequence between a roxy node and its control plane. Once, the node enrols with its enrolment token and gets a node token back, which it keeps in its state dir with its CA and any quarantine marker. Every refresh_after_seconds it asks for its lease, reporting its state and the lease it holds, and gets back the lease: the config, the secrets and how long it is valid; with no lease before the old one expires, the node denies everything. Every few seconds it sends a batch of flow-log events and gets back an acknowledgement up to a sequence number. Before its token expires it renews it and gets a new node token." />
+
+```sh
+roxy run --control-plane https://cp.example:8443 \
+         --enrol-token-file /run/secrets/roxy-enrol-token \
+         --state-dir /var/lib/roxy/node \
+         --control-plane-ca /etc/roxy/cp-ca.pem
+```
+
+## Flags
+
+| flag | meaning |
+|---|---|
+| `--control-plane URL` | The control plane's `https://` URL. Cannot be combined with `--config`. |
+| `--enrol-token-file PATH` | The enrolment token. Only read when the state dir holds no node token yet. |
+| `--state-dir DIR` | Where the node keeps its token, its CA and its quarantine marker. |
+| `--control-plane-ca PATH` | CA certificates to verify the control plane with. Default: the system roots. |
+| `--bootstrap-bind ADDR` | Where the proxy listens before the first lease. Default `0.0.0.0:3128`. |
+| `--bootstrap-ca-server ADDR` | Where `ca_server` listens before the first lease. Default `0.0.0.0:3130`. |
+| `--interception-ca-cert PATH`, `--interception-ca-key PATH` | A CA to use instead of generating one ([the interception CA](/guides/node-mode#the-interception-ca)). |
+| `--replace-interception-ca` | Replace a stored CA that differs from the one given. |
+
+The control plane decides how long an enrolment token lasts and whether it
+can be reused. roxy does not delete the token file.
+
+## The state dir
+
+The state dir holds the node token, a flow sequence counter, the CA in
+`ca/`, and a `quarantine` file while the node is quarantined. The rendered
+config and secrets stay in memory only. A copy of the state dir is a copy
+of the node's identity, which the control plane can revoke.
+
+### The interception CA
+
+The CA always lives in `<state-dir>/ca`. On first start roxy generates
+one, or imports the pair given with `--interception-ca-cert` and
+`--interception-ca-key`. After that the stored CA is used. If the flags
+name a different pair, roxy refuses to start, since workloads already
+trust the stored CA. Pass `--replace-interception-ca` to replace it.
+
+Workloads fetch the CA from `ca_server` as usual
+([CA distribution](/guides/ca-certificates#ca-distribution)).
+
+## Startup
+
+1. The listeners open at once with an empty policy, so every request is
+   denied and `/readyz` answers `503 no_policy`.
+2. Without a stored node token, the node enrols with the enrolment token.
+   If the control plane refuses it, the node retries for two minutes and
+   then exits, so an orchestrator sees a crash loop. An unreachable
+   control plane is retried for as long as it takes.
+3. The node fetches its lease and applies it. Settings that only apply at
+   startup ([restart-only settings](/guides/operations#restart-only-settings))
+   are taken from the first lease. A later lease that changes one is
+   logged and needs a restart.
+
+## The lease
+
+Every lease is the whole policy, applied in full or not at all. A lease
+that `roxy check` would reject, or that lacks a secret the config needs, is
+logged and the running policy stays.
+
+The lease sets the policy's expiry ([lease](/guides/operations#lease)),
+measured on the node's own clock. The node polls again before it runs
+out. If the control plane is unreachable, the lease expires and roxy
+denies everything until the next successful poll, with no restart needed.
+
+A revoked node (`410`) denies everything at once and stops polling. A
+node never enrols again on its own. To re-enrol it, empty the state dir
+and start it with a new enrolment token.
+
+A [quarantined](/guides/operations#quarantine) node keeps applying
+leases. It reports the quarantine on every poll, and lifts it when the
+control plane releases that incident in a lease.
+
+The node renews its token before it expires. If the token does expire,
+the node exits, since only re-enrolment can recover it.
+
+## Flow shipping
+
+Every flow-log event goes to the local flow log as usual, and to the
+control plane in batches, as the lease's `flow` settings say
+([flow upload](/reference/node-protocol#flow-upload)). Events wait in
+memory until the control plane acknowledges them. When too many are
+waiting, the lease decides whether roxy holds traffic (`hold`) or drops the
+oldest events (`spool`). On shutdown roxy ships what is waiting, for up to
+ten seconds.
+
+`SIGHUP` reopens the local log files. Health checks work as in
+[operations](/guides/operations#health): ready means an unexpired lease is
+in force.
