@@ -6,6 +6,7 @@ use std::io::Write as _;
 
 use bytes::Bytes;
 use roxy_http::Body;
+use roxy_http::coding::{self, Coding};
 
 use super::{AddonDef, Answer, Client, Kit};
 
@@ -32,8 +33,7 @@ fn gzip(b: &[u8]) -> Vec<u8> {
 }
 
 fn gunzip(b: &[u8]) -> Vec<u8> {
-    use roxy_http::coding::{Coding, decode, unmetered};
-    decode(&[Coding::Gzip], b, 1 << 20, unmetered()).expect("a gzip body")
+    coding::decode(&[Coding::Gzip], b, 1 << 20, coding::unmetered()).expect("a gzip body")
 }
 
 async fn post(c: &mut Client, path: &str, headers: &[(&str, &str)], body: Vec<u8>) -> Answer {
@@ -124,6 +124,63 @@ async fn an_encoded_request_body_goes_on_in_its_coding() {
     for seen in kit.upstream.wait_seen(2).await {
         assert_eq!(seen.headers["content-encoding"], "gzip");
         assert_eq!(gunzip(&seen.body), b"nothing to see");
+    }
+}
+
+/// `body` in `codings`, as a client would send it.
+async fn encode(codings: &[Coding], body: &[u8]) -> Vec<u8> {
+    let body = coding::encode_body(
+        Body::from_bytes(Bytes::copy_from_slice(body)),
+        codings,
+        coding::unmetered(),
+    );
+    http_body_util::BodyExt::collect(body)
+        .await
+        .expect("encoded")
+        .to_bytes()
+        .to_vec()
+}
+
+/// Every coding roxy decodes, alone and stacked, is read by the rules and
+/// goes on in its own codings.
+#[tokio::test]
+async fn every_coding_is_read_and_goes_on_in_it() {
+    let kit = kit().await;
+    let cases: [&[Coding]; 5] = [
+        &[Coding::Gzip],
+        &[Coding::Deflate],
+        &[Coding::Br],
+        &[Coding::Zstd],
+        &[Coding::Gzip, Coding::Br],
+    ];
+    for codings in cases {
+        let header = coding::header_value(codings);
+        let mut c = kit.h1().await;
+        let a = post(
+            &mut c,
+            "/x",
+            &[("content-encoding", &header)],
+            encode(codings, b"the SECRET").await,
+        )
+        .await;
+        assert_eq!(a.status, 403, "{header}: {a:?}");
+        let mut c = kit.h1().await;
+        let a = post(
+            &mut c,
+            "/x",
+            &[("content-encoding", &header)],
+            encode(codings, b"nothing to see").await,
+        )
+        .await;
+        assert_eq!(a.status, 200, "{header}: {a:?}");
+        let seen = kit.upstream.seen();
+        let last = seen.last().unwrap();
+        assert_eq!(last.headers["content-encoding"], header.as_str());
+        assert_eq!(
+            coding::decode(codings, &last.body, 1 << 20, coding::unmetered()).unwrap(),
+            b"nothing to see",
+            "{header}"
+        );
     }
 }
 

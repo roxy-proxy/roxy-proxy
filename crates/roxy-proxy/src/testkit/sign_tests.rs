@@ -189,6 +189,57 @@ async fn s3_signs_the_payload_hash_or_streams_an_unsigned_payload() {
     assert_eq!(seen[0].body.len(), 4096);
 }
 
+/// A body rule on a signed, encoded request reads the decoded text, and
+/// the request goes as it came: the signed hash is of the bytes sent.
+#[tokio::test]
+async fn a_body_rule_on_a_signed_encoded_request_keeps_the_signature() {
+    let rules = format!(
+        r#"
+- id: no-secret
+  when: host == "up.test" and body.text contains "SECRET"
+  then: deny
+{}"#,
+        rules("s3", "")
+    );
+    let kit = Kit::builder()
+        .secret("akid", AKID)
+        .secret("sk", SK)
+        .secret("token", TOKEN)
+        .rules(&rules)
+        .start()
+        .await;
+    let gzip = |b: &[u8]| {
+        use std::io::Write as _;
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(b).unwrap();
+        e.finish().unwrap()
+    };
+    let put = |body: Vec<u8>| {
+        let kit = &kit;
+        async move {
+            let mut c = kit.h1().await;
+            let req = c
+                .request("PUT", "/bucket/key", &[("content-encoding", "gzip")])
+                .body(Body::from_bytes(Bytes::from(body)))
+                .unwrap();
+            Answer::read(c.send(req).await.unwrap()).await
+        }
+    };
+    let a = put(gzip(b"the SECRET")).await;
+    assert_eq!(a.status, 403, "{a:?}");
+    assert!(kit.upstream.seen().is_empty());
+
+    let sent = gzip(b"nothing to see");
+    let a = put(sent.clone()).await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].body, sent);
+    assert_eq!(
+        seen[0].headers["x-amz-content-sha256"],
+        super::sha256_hex(&sent)
+    );
+}
+
 /// A presigned request goes out under its query signature alone: roxy
 /// adds no signature, strips the client's signature headers, and records
 /// the passthrough so the log shows the request left without roxy's

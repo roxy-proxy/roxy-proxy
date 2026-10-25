@@ -53,6 +53,8 @@ mod redact_tests;
 mod rules_tests;
 #[cfg(test)]
 mod sign_tests;
+#[cfg(test)]
+mod text_tests;
 mod upstream;
 #[cfg(test)]
 mod ws_tests;
