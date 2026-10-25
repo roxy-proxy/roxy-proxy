@@ -239,7 +239,7 @@ impl Body {
     }
 
     /// The whole body, when it is held in memory and not yet polled (one
-    /// built with [`Body::from_bytes`], or buffered by an inspection).
+    /// built with [`Body::from_bytes`], or buffered whole).
     pub fn as_bytes(&self) -> Option<&Bytes> {
         match &self.inner {
             Inner::Full { data, .. } => data.as_ref(),

@@ -269,12 +269,12 @@ async fn collect_body(
         return Err(exhausted());
     };
     let mut meter = |held: u64| shared.grow_buffer(&mut lease, held);
-    match collect_prefix(&mut body, MAX_ENDPOINT_REQUEST_BYTES, &mut meter, None).await {
+    match collect_prefix(&mut body, MAX_ENDPOINT_REQUEST_BYTES, &mut meter).await {
         Collected::Complete { data, .. } => {
             lease.shrink_to(data.len() as u64);
             Ok((data, lease))
         }
-        Collected::TooLarge { .. } => Err(EndpointError::Failed(format!(
+        Collected::TooLarge => Err(EndpointError::Failed(format!(
             "request body over {MAX_ENDPOINT_REQUEST_BYTES} bytes"
         ))),
         Collected::BudgetExhausted => Err(exhausted()),

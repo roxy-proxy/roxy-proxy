@@ -3646,7 +3646,7 @@ async fn service_request_trailers_reach_an_h2_origin_when_allowed() {
 }
 
 #[tokio::test]
-async fn service_request_trailers_are_validated_before_body_inspection() {
+async fn service_request_trailers_are_validated_under_a_body_rule() {
     let rules = r#"
 - id: no-secret
   when: host == "up.test" and body.text contains "SECRET"
@@ -3693,9 +3693,11 @@ async fn service_request_trailers_are_validated_before_body_inspection() {
             let errors = kit.events("layer_error", 1).await;
             assert_eq!(errors[0]["kind"], "invalid_request", "{errors:#?}");
             assert!(errors[0]["message"].as_str().unwrap().contains("trailer"));
+            let seen = kit.upstream.seen();
             assert!(
-                kit.upstream.seen().is_empty(),
-                "inspection fails before connecting to the origin"
+                seen.iter()
+                    .all(|s| s.complete != Some(true) && s.trailers.is_none()),
+                "{seen:#?}"
             );
         }
     }

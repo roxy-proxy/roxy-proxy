@@ -467,8 +467,7 @@ http:
   allow_plain_in_connect: false
 {http}limits:
   header_timeout: 5s
-{response_header_timeout}  max_inspect_body_bytes: 1kb
-{limits}upstream:
+{response_header_timeout}{limits}upstream:
   connect_timeout: 2s
 {upstream}  dns:
     resolver: ["127.0.0.1:9"]

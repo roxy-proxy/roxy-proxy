@@ -1,6 +1,7 @@
 //! The one place a body's content coding is undone and redone. A body
 //! that something must read as plain bytes (the addon layers, under
-//! `http.decode_for_addons`, or the masking of secrets) is decoded once,
+//! `http.decode_for_addons`, the rules on body text, or the masking of
+//! secrets) is decoded once,
 //! where it enters, and encoded again in the same codings where it leaves,
 //! so the client and the origin get the coding they negotiated.
 //!
@@ -49,6 +50,9 @@ pub(crate) enum Need {
     /// The addon layers. A body they cannot have decoded is passed to them
     /// as it is, for a layer to judge.
     Layers,
+    /// The rules on `response.body.text`, which must not pass a body they
+    /// cannot read. A range of a plain body is read as it is.
+    Rules,
     /// The masking of secrets, which must not pass a body it cannot read
     /// whole.
     Masking,
@@ -74,11 +78,14 @@ pub(crate) fn response_codings(
     if need == Need::Masking && partial {
         return Err(Refusal::fail_closed(PARTIAL));
     }
+    let reads = matches!(need, Need::Rules | Need::Masking);
     match coding::content_codings(&res.headers) {
-        // A range of an encoded body cannot be decoded on its own.
         Ok(codings) if !partial => Ok(codings),
-        // Masking cannot pass a body it cannot read; a layer judges it.
-        Err(_) if need == Need::Masking => Err(Refusal::fail_closed(UNDECODABLE)),
+        // A range of an encoded body cannot be decoded on its own.
+        Ok(codings) if reads && !codings.is_empty() => Err(Refusal::fail_closed(PARTIAL)),
+        // The rules and masking cannot pass a body they cannot read; a
+        // layer judges it.
+        Err(_) if reads => Err(Refusal::fail_closed(UNDECODABLE)),
         Ok(_) | Err(_) => Ok(Vec::new()),
     }
 }
@@ -158,12 +165,12 @@ pub(crate) fn encode_request(
 }
 
 /// `body` decoded from `codings`, its windows charged to the budget.
-fn decode(shared: &Arc<Shared>, body: &mut Body, codings: &[Coding], limit: u64) {
+pub(crate) fn decode(shared: &Arc<Shared>, body: &mut Body, codings: &[Coding], limit: u64) {
     *body = coding::decode_body(std::mem::take(body), codings, limit, shared.window_meter());
 }
 
 /// `body` encoded in `codings`, its encoders charged to the budget.
-fn encode(shared: &Arc<Shared>, body: &mut Body, codings: &[Coding]) {
+pub(crate) fn encode(shared: &Arc<Shared>, body: &mut Body, codings: &[Coding]) {
     *body = coding::encode_body(std::mem::take(body), codings, shared.window_meter());
 }
 

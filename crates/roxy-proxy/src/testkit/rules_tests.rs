@@ -242,10 +242,10 @@ async fn a_redirect_changes_the_target_and_the_new_address_is_checked() {
     assert_eq!(kit.upstream.wait_seen(2).await.len(), 2);
 }
 
-/// A body rule denies what it matches, and a body over
-/// `max_inspect_body_bytes` fails closed instead of going unread.
+/// A body rule denies what it matches, and lets anything else through
+/// whatever its size: nothing is buffered, so there is no cap to fail.
 #[tokio::test]
-async fn body_inspection_denies_and_fails_closed_when_too_large() {
+async fn a_body_rule_denies_what_it_matches_at_any_size() {
     let kit = Kit::builder()
         .rules(
             r#"
@@ -257,7 +257,6 @@ async fn body_inspection_denies_and_fails_closed_when_too_large() {
   then: allow
 "#,
         )
-        .limits(|l| l.max_inspect_body_bytes = 1024)
         .start()
         .await;
     let a = kit
@@ -274,22 +273,15 @@ async fn body_inspection_denies_and_fails_closed_when_too_large() {
         .await;
     assert_eq!(a.status, 200, "{a:?}");
     assert_eq!(a.json()["body_len"], 14);
+    let big = 4 << 20;
     let mut c = kit.h1().await;
     let req = c
         .request("POST", "/b", &[])
-        .body(roxy_http::Body::from_bytes(Bytes::from(vec![b'a'; 4096])))
+        .body(roxy_http::Body::from_bytes(Bytes::from(vec![b'a'; big])))
         .unwrap();
     let a = Answer::read(c.send(req).await.unwrap()).await;
-    assert_eq!(a.status, 503, "{a:?}");
-    assert_eq!(a.headers["x-roxy-rule"], "_fail_closed");
-    let ev = kit.events("request", 3).await;
-    let failed = ev
-        .iter()
-        .find(|e| e["res"]["status"] == 503)
-        .unwrap_or_else(|| panic!("{ev:#?}"));
-    assert_eq!(failed["reason"], "body_too_large_to_inspect");
-    assert_eq!(kit.events("policy_input_unavailable", 1).await.len(), 1);
-    assert_eq!(kit.upstream.seen().len(), 1);
+    assert_eq!(a.status, 200, "{a:?}");
+    assert_eq!(a.json()["body_len"], big);
 }
 
 #[tokio::test]

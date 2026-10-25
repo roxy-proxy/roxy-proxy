@@ -2,7 +2,7 @@
 //! buffering for body-inspecting rules that never loses the rest of the
 //! stream, and the gate that keeps request trailers off HTTP/1.1 upstreams.
 
-use std::future::{Future, poll_fn};
+use std::future::poll_fn;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -14,7 +14,7 @@ use http::HeaderMap;
 use http_body::{Frame, SizeHint};
 use ring::digest::{Context as Digest, SHA256};
 use roxy_http::{Body, BodyError, ParseError, Reason};
-use tokio::time::{Instant, sleep};
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 /// The upstream HTTP client may retain an upload after returning its
@@ -470,9 +470,8 @@ pub(crate) enum Collected {
     /// ended with.
     Complete { data: Bytes, held: u64 },
     /// More than `cap` bytes. Nothing was lost: the original body was
-    /// replaced by the `held` bytes read so far chained with the unread
-    /// rest; `held` is 0 for a body whose declared length said so.
-    TooLarge { held: u64 },
+    /// replaced by the bytes read so far chained with the unread rest.
+    TooLarge,
     /// The meter refused to cover the bytes read so far. Nothing was lost,
     /// as for `TooLarge`.
     BudgetExhausted,
@@ -493,46 +492,21 @@ pub(crate) fn header_bytes(h: &HeaderMap) -> u64 {
 /// Never pre-allocates from a declared length. `meter` is asked, after
 /// each frame and before the cap is judged, whether the bytes held so far
 /// (data and trailers) may be kept, so what is chained on `TooLarge` is
-/// covered too; `false` stops with [`Collected::BudgetExhausted`]. With
-/// `idle`, each frame must arrive within it of being waited for, or the
-/// body fails with [`BodyError::Timeout`] (a body whose producer times
-/// itself passes `None`).
+/// covered too; `false` stops with [`Collected::BudgetExhausted`].
 pub(crate) async fn collect_prefix(
     body: &mut Body,
     cap: u64,
     meter: &mut (dyn FnMut(u64) -> bool + Send),
-    idle: Option<Duration>,
 ) -> Collected {
     let declared = body.known_length();
     if declared.is_some_and(|n| n > cap) {
         // Known to be too large: do not touch the stream at all.
-        return Collected::TooLarge { held: 0 };
+        return Collected::TooLarge;
     }
     let mut buf = BytesMut::new();
     let mut trailers: Option<HeaderMap> = None;
-    // One timer for the whole body, re-armed each time a frame is waited on.
-    let mut stall = std::pin::pin!(idle.map(sleep));
     loop {
-        let poll_frame =
-            |body: &mut Body, cx: &mut Context<'_>| http_body::Body::poll_frame(Pin::new(body), cx);
-        let frame = match poll_fn(|cx| Poll::Ready(poll_frame(body, cx))).await {
-            Poll::Ready(frame) => frame,
-            Poll::Pending => {
-                if let (Some(idle), Some(stall)) = (idle, stall.as_mut().as_pin_mut()) {
-                    stall.reset(Instant::now() + idle);
-                }
-                poll_fn(|cx| {
-                    if let Poll::Ready(f) = poll_frame(body, cx) {
-                        return Poll::Ready(f);
-                    }
-                    match stall.as_mut().as_pin_mut() {
-                        Some(stall) => stall.poll(cx).map(|()| Some(Err(BodyError::Timeout))),
-                        None => Poll::Pending,
-                    }
-                })
-                .await
-            }
-        };
+        let frame = poll_fn(|cx| http_body::Body::poll_frame(Pin::new(&mut *body), cx)).await;
         let held = |buf: &BytesMut, trailers: &Option<HeaderMap>| {
             (buf.len() as u64).saturating_add(trailers.as_ref().map_or(0, header_bytes))
         };
@@ -559,7 +533,7 @@ pub(crate) async fn collect_prefix(
                         if !meter(held) {
                             Some(Collected::BudgetExhausted)
                         } else if buf.len() as u64 > cap {
-                            Some(Collected::TooLarge { held })
+                            Some(Collected::TooLarge)
                         } else {
                             None
                         }
@@ -791,7 +765,7 @@ mod tests {
 
     /// [`collect_prefix`] with no budget.
     async fn collect(body: &mut Body, cap: u64) -> Collected {
-        collect_prefix(body, cap, &mut |_| true, None).await
+        collect_prefix(body, cap, &mut |_| true).await
     }
 
     #[tokio::test]
@@ -820,15 +794,10 @@ mod tests {
         };
         let mut b = with_trailers().await;
         let mut asked = Vec::new();
-        let c = collect_prefix(
-            &mut b,
-            10,
-            &mut |held| {
-                asked.push(held);
-                true
-            },
-            None,
-        )
+        let c = collect_prefix(&mut b, 10, &mut |held| {
+            asked.push(held);
+            true
+        })
         .await;
         let trailer = "grpc-status".len() as u64 + 1;
         assert_eq!(asked, vec![3, 3 + trailer]);
@@ -838,7 +807,7 @@ mod tests {
         );
 
         let mut b = with_trailers().await;
-        let c = collect_prefix(&mut b, 10, &mut |held| held <= 3, None).await;
+        let c = collect_prefix(&mut b, 10, &mut |held| held <= 3).await;
         assert!(matches!(c, Collected::BudgetExhausted), "{c:?}");
         assert_eq!(drain(b).await.unwrap(), b"abc");
     }
@@ -866,34 +835,6 @@ mod tests {
         assert_eq!(frames[1].trailers_ref().unwrap()["grpc-status"], "0");
     }
 
-    /// The idle timer is per frame: a producer that keeps each gap under
-    /// it completes, one that stalls past it fails the body with
-    /// `Timeout` and the rebuilt body carries that failure.
-    #[tokio::test]
-    async fn idle_timer_is_per_frame() {
-        let idle = Some(Duration::from_millis(100));
-        let (mut tx, mut b) = Body::channel(1 << 20, None);
-        tokio::spawn(async move {
-            for _ in 0..3 {
-                tokio::time::sleep(Duration::from_millis(80)).await;
-                tx.send_data(Bytes::from_static(b"ab")).await.unwrap();
-            }
-            tx.finish().await.unwrap();
-        });
-        let c = collect_prefix(&mut b, 10, &mut |_| true, idle).await;
-        assert!(
-            matches!(&c, Collected::Complete { data, .. } if data == "ababab"),
-            "{c:?}"
-        );
-
-        let (mut tx, mut b) = Body::channel(1 << 20, None);
-        tx.send_data(Bytes::from_static(b"a")).await.unwrap();
-        let c = collect_prefix(&mut b, 10, &mut |_| true, idle).await;
-        assert!(matches!(c, Collected::Failed(BodyError::Timeout)), "{c:?}");
-        assert!(matches!(drain(b).await, Err(BodyError::Timeout)));
-        drop(tx);
-    }
-
     #[tokio::test]
     async fn too_large_keeps_whole_stream() {
         let (mut tx, mut b) = Body::channel(1 << 20, None);
@@ -905,20 +846,14 @@ mod tests {
             tx.ready().await.unwrap();
             tx.try_finish().unwrap();
         });
-        assert!(matches!(
-            collect(&mut b, 15).await,
-            Collected::TooLarge { held: 20 }
-        ));
+        assert!(matches!(collect(&mut b, 15).await, Collected::TooLarge));
         assert_eq!(drain(b).await.unwrap().len(), 40);
     }
 
     #[tokio::test]
     async fn declared_too_large_untouched() {
         let mut b = Body::from_bytes(vec![0u8; 100]);
-        assert!(matches!(
-            collect(&mut b, 10).await,
-            Collected::TooLarge { held: 0 }
-        ));
+        assert!(matches!(collect(&mut b, 10).await, Collected::TooLarge));
         assert_eq!(drain(b).await.unwrap().len(), 100);
     }
 }

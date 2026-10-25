@@ -419,8 +419,8 @@ pub fn build_view(config: &Config, req: &TestRequest) -> Result<(DryRunView, Vec
         let text: String = val.as_bytes().iter().map(|&b| char::from(b)).collect();
         v = v.with_header(n.as_str(), &text);
     }
-    // The body text is inspectable whether or not it is chunked; the dry
-    // run has no response body, so `response.body.text` is empty too.
+    // The dry run has the whole body, chunked or not; it has no response
+    // body, so `response.body.text` is empty.
     v = v
         .with_body(req.body.as_deref().unwrap_or(""))
         .with_response_body("");
@@ -526,7 +526,8 @@ pub fn apply_address_denial(out: &mut Outcome) {
 /// The in-flight values a dry run supplies, from the command line: which
 /// in-flight rules can run.
 pub fn known(req: &TestRequest) -> Reads {
-    let mut k = Reads::NONE;
+    // The dry run has the whole request body, so `body.text` is decided.
+    let mut k = Reads::BODY_TEXT;
     if req.body_bytes.is_some() {
         k |= Reads::BODY_BYTES;
     }
@@ -847,10 +848,7 @@ mod tests {
         let (view, _) = build_view(&config, &req).unwrap();
         assert_eq!(view.field(Field::BodySize), Value::Absent);
         assert_eq!(view.header("content-length"), None);
-        assert_eq!(
-            view.body_text(),
-            BodyText::Available(std::borrow::Cow::Borrowed("hello"))
-        );
+        assert_eq!(view.body_text(), BodyText::Whole(b"hello"));
     }
 
     #[test]

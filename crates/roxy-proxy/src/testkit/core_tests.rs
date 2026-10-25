@@ -337,11 +337,10 @@ async fn h1_a_stalled_response_is_cut_off() {
     assert_stalled_response_logged(&kit).await;
 }
 
-/// With a rule reading the response body, the stall happens while roxy is
-/// still collecting the body, before the head reached the client: the
-/// exchange ends with the same reason, answered with a `504`. The
-/// half-read upstream leg is given up: an HTTP/1.1 connection is dropped
-/// (an HTTP/2 upstream loses only the stream and stays pooled).
+/// A rule reading the response body scans it as it streams, so the head
+/// has reached the client before the stall: the body is cut with the same
+/// reason. The half-read upstream leg is given up: an HTTP/1.1 connection
+/// is dropped (an HTTP/2 upstream loses only the stream and stays pooled).
 async fn a_stalled_response_under_inspection_is_cut_off(h2: bool) {
     const RULES: &str = r#"
 - id: secret
@@ -363,18 +362,12 @@ async fn a_stalled_response_under_inspection_is_cut_off(h2: bool) {
     )
     .await
     .expect("the stall is cut off");
-    assert_eq!(a.status, 504, "{a:?}");
-    let err = kit.events("response_error", 1).await;
-    assert_eq!(err[0]["reason"], "response_body_timeout", "{err:#?}");
-    let ev = kit.request_event().await;
-    assert_eq!(ev["reason"], "response_body_timeout", "{ev:#}");
-    assert_eq!(ev["res"]["status"], 504, "{ev:#}");
+    assert_eq!(a.status, 200, "{a:?}");
+    assert!(a.body.is_err(), "the body is cut: {a:?}");
+    assert_stalled_response_logged(&kit).await;
     if !h2 {
         kit.upstream.wait_open(0).await;
     }
-    // The client connection is intact: the next exchange goes through.
-    let b = c.call("GET", "/one", &[], b"").await;
-    assert_eq!(b.status, 200, "{b:?}");
 }
 
 #[tokio::test]
@@ -1001,7 +994,12 @@ async fn a_body_rule_deny_answers_100_continue_first() {
     io.write_all(b"secret").await.unwrap();
     let res = read_response(&mut io).await;
     assert!(res.starts_with("HTTP/1.1 403"), "{res}");
-    assert!(kit.upstream.seen().is_empty());
+    let seen = kit.upstream.seen();
+    assert!(
+        seen.iter()
+            .all(|s| s.complete != Some(true) && s.body.is_empty()),
+        "the matching bytes never left: {seen:#?}"
+    );
     let ev = kit.request_event().await;
     assert_eq!(ev["terminal_rule"], "no-secrets", "{ev:#}");
 }

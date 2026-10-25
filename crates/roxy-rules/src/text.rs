@@ -220,13 +220,12 @@ impl TextTests {
 
     /// A scan of one body.
     pub fn scan(self: &Arc<Self>) -> TextScan {
+        let cursors: Vec<Cursor> = self.tests.iter().map(|(t, _)| Cursor::new(t)).collect();
+        let results: Vec<Option<bool>> = cursors.iter().map(|c| c.result).collect();
         TextScan {
-            cursors: self.tests.iter().map(|(t, _)| Cursor::new(t)).collect(),
-            results: self
-                .tests
-                .iter()
-                .map(|(t, _)| Cursor::new(t).result)
-                .collect(),
+            unreported: results.iter().any(Option::is_some),
+            cursors,
+            results,
             tests: self.clone(),
             seen: 0,
         }
@@ -241,10 +240,14 @@ pub struct TextScan {
     /// Each test's answer, `None` while undecided; what the rules read.
     results: Vec<Option<bool>>,
     seen: u64,
+    /// Tests decided before any byte (an empty needle), not yet reported
+    /// by [`TextScan::feed`] or [`TextScan::finish`].
+    unreported: bool,
 }
 
 impl TextScan {
-    /// Feeds the next bytes of the body. Whether any test was decided.
+    /// Feeds the next bytes of the body. Whether any test was decided (or,
+    /// on the first call, had been from the start).
     pub fn feed(&mut self, bytes: &[u8]) -> bool {
         self.seen += bytes.len() as u64;
         self.update(|c, t| c.feed(t, bytes))
@@ -257,7 +260,7 @@ impl TextScan {
     }
 
     fn update(&mut self, f: impl Fn(&mut Cursor, &TextTest)) -> bool {
-        let mut decided = false;
+        let mut decided = std::mem::take(&mut self.unreported);
         for ((c, r), (t, _)) in self
             .cursors
             .iter_mut()
