@@ -15,6 +15,7 @@ use roxy_http::Host;
 use crate::compile::{Const, OrdOp, Pred, ROperand, StrOp};
 use crate::config::{CaptureTarget, LogLevel, Scheme};
 use crate::diag::RuleId;
+use crate::text::{BodySide, TextTest};
 use crate::types::{Access, Type};
 use crate::view::{BodyText, FlowView, Value};
 
@@ -179,27 +180,9 @@ pub enum FailClosedReason {
     /// A resolved secret is not a valid header value (CR, LF, control or
     /// non-ASCII characters).
     SecretInvalid(String),
-    /// A body predicate was reached but the body exceeds
-    /// `limits.max_inspect_body_bytes`. Carries the field name.
-    BodyTooLargeToInspect(String),
-    /// A body predicate was reached but the body was not buffered or could
-    /// not be read. Carries the field name.
+    /// A body predicate was reached but the view has no scan of the body.
+    /// Carries the field name.
     BodyUnavailable(String),
-    /// A body predicate was reached but the body's `content-encoding` names
-    /// a coding that cannot be decoded.
-    UnsupportedContentEncoding {
-        /// The field name.
-        field: String,
-        /// The coding.
-        coding: String,
-    },
-    /// A body predicate was reached but the body could not be decoded.
-    BodyDecodeFailed {
-        /// The field name.
-        field: String,
-        /// What was wrong.
-        detail: String,
-    },
     /// An operator other than `==` / `!=` / `in` / `not in` was applied to a
     /// missing (`null`) value, which has no answer. Carries the field
     /// as written, e.g. `body.size`.
@@ -223,16 +206,7 @@ impl fmt::Display for FailClosedReason {
             Self::AddressListUnavailable(n) => write!(f, "address list @{n} unavailable"),
             Self::SecretMissing(n) => write!(f, "secret {n:?} missing"),
             Self::SecretInvalid(n) => write!(f, "secret {n:?} is not a valid header value"),
-            Self::BodyTooLargeToInspect(field) => {
-                write!(f, "`{field}`: body too large to inspect")
-            }
             Self::BodyUnavailable(field) => write!(f, "`{field}`: body unavailable"),
-            Self::UnsupportedContentEncoding { field, coding } => {
-                write!(f, "`{field}`: unsupported content coding `{coding}`")
-            }
-            Self::BodyDecodeFailed { field, detail } => {
-                write!(f, "`{field}`: body could not be decoded: {detail}")
-            }
             Self::MissingValue(field) => {
                 write!(
                     f,
@@ -807,11 +781,6 @@ pub(crate) enum Unavailable<'a> {
     Metric(&'a str),
     List(&'a str),
     /// Field name (`body.text` / `response.body.text`).
-    BodyTooLarge(&'static str),
-    /// Field name, coding.
-    BodyEncoding(&'static str, &'a str),
-    /// Field name, what was wrong.
-    BodyDecode(&'static str, &'a str),
     Body(&'static str),
     /// A missing value reached an operator that cannot answer for `null`.
     Missing(&'a Access),
@@ -824,15 +793,6 @@ impl Unavailable<'_> {
         match self {
             Unavailable::Metric(id) => FailClosedReason::MetricUnavailable(id.to_owned()),
             Unavailable::List(n) => FailClosedReason::AddressListUnavailable(n.to_owned()),
-            Unavailable::BodyTooLarge(f) => FailClosedReason::BodyTooLargeToInspect(f.to_owned()),
-            Unavailable::BodyEncoding(f, c) => FailClosedReason::UnsupportedContentEncoding {
-                field: f.to_owned(),
-                coding: c.to_owned(),
-            },
-            Unavailable::BodyDecode(f, d) => FailClosedReason::BodyDecodeFailed {
-                field: f.to_owned(),
-                detail: d.to_owned(),
-            },
             Unavailable::Body(f) => FailClosedReason::BodyUnavailable(f.to_owned()),
             Unavailable::Missing(a) => FailClosedReason::MissingValue(a.display_name()),
             Unavailable::WrongType(a, found) => FailClosedReason::WrongType {
@@ -874,8 +834,11 @@ fn get<'a>(op: &'a ROperand, s: &Scope<'a>) -> Value<'a> {
                 },
                 Value::Int,
             ),
-            Access::BodyText => body(s, s.view.body_text(), "body.text"),
-            Access::RespBodyText => body(s, s.view.response_body_text(), "response.body.text"),
+            // Compiled to `Pred::Text`, never read as a value.
+            Access::BodyText | Access::RespBodyText => {
+                s.fail(Unavailable::Body(access_field(access)));
+                Value::Absent
+            }
         },
     }
 }
@@ -896,25 +859,38 @@ fn typed<'a>(s: &Scope<'a>, access: &'a Access, v: Value<'a>) -> Value<'a> {
     }
 }
 
-/// A body that cannot be inspected fails closed rather than reading as absent.
-fn body<'a>(s: &Scope<'a>, b: BodyText<'a>, field: &'static str) -> Value<'a> {
+fn access_field(access: &Access) -> &'static str {
+    match access {
+        Access::RespBodyText => BodySide::Response.field(),
+        Access::Scalar(_)
+        | Access::Header(_)
+        | Access::HeaderAll(_)
+        | Access::RespHeader(_)
+        | Access::RespHeaderAll(_)
+        | Access::Query(_)
+        | Access::State(_)
+        | Access::Tag(_)
+        | Access::Metric(_)
+        | Access::BodyText => BodySide::Request.field(),
+    }
+}
+
+/// A body text test's answer; `None` while the scan has not decided it. A
+/// body the view does not have fails closed.
+fn text(s: &Scope<'_>, side: BodySide, index: usize, test: &TextTest) -> Option<bool> {
+    let b = match side {
+        BodySide::Request => s.view.body_text(),
+        BodySide::Response => s.view.response_body_text(),
+    };
     match b {
-        BodyText::Available(t) => Value::Str(t),
-        BodyText::TooLarge => {
-            s.fail(Unavailable::BodyTooLarge(field));
-            Value::Absent
-        }
-        BodyText::UnsupportedEncoding(c) => {
-            s.fail(Unavailable::BodyEncoding(field, c));
-            Value::Absent
-        }
-        BodyText::Undecodable(d) => {
-            s.fail(Unavailable::BodyDecode(field, d));
-            Value::Absent
-        }
+        BodyText::Scanned(results) => results.get(index).copied().unwrap_or_else(|| {
+            s.fail(Unavailable::Body(side.field()));
+            None
+        }),
+        BodyText::Whole(body) => Some(test.eval(body)),
         BodyText::Unavailable => {
-            s.fail(Unavailable::Body(field));
-            Value::Absent
+            s.fail(Unavailable::Body(side.field()));
+            None
         }
     }
 }
@@ -1083,6 +1059,13 @@ impl Pred {
                 )
             }),
             Pred::IsNull { op, negate } => matches!(get(op, s), Value::Absent) != *negate,
+            Pred::Text {
+                side,
+                index,
+                test,
+                negate,
+                pending,
+            } => text(s, *side, *index, test).map_or(*pending, |r| r != *negate),
         }
     }
 }

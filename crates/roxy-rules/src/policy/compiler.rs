@@ -27,6 +27,7 @@ use crate::lexer::is_ident;
 use crate::template::{
     Part, SECRET_PLACES, literal, mentions_secret, parse_template, secret_names,
 };
+use crate::text::TextTests;
 use crate::types::{Access, Field, InFlightValue, Reads, is_token};
 
 impl Condition {
@@ -41,21 +42,14 @@ impl Condition {
             return Err(c.finish().1);
         };
         // A byte metric's value is known at admission; only fields are late.
-        let mut late: Vec<String> = needs
-            .in_flight_names(Reads::IN_FLIGHT_FIELDS)
-            .iter()
-            .map(|n| format!("`{n}`"))
-            .collect();
-        if needs.request_body {
-            late.push("`body.text`".to_owned());
-        }
+        let late = needs.in_flight_names(Reads::IN_FLIGHT_FIELDS);
         if !late.is_empty() {
             return Err(vec![Diagnostic::new(
                 path,
                 format!(
-                    "a condition here may only read admission fields, and not `body.text`, because \
-                     it is decided before the request body is read; it reads {}",
-                    late.join(", ")
+                    "a condition here may only read admission fields, because it is decided \
+                     before the request is forwarded; it reads {}",
+                    quoted(&late)
                 ),
             )]);
         }
@@ -118,15 +112,16 @@ fn guards_not_null(pred: &Pred, f: Field) -> bool {
         | Pred::InStr { .. }
         | Pred::InInt { .. }
         | Pred::InNet { .. }
-        | Pred::InList { .. } => false,
+        | Pred::InList { .. }
+        | Pred::Text { .. } => false,
     }
 }
 
 pub(super) struct PolicyCompiler<'i, 'a> {
     input: &'i PolicyInput<'a>,
     d: Vec<Diagnostic>,
-    /// Body buffering needed by any expression compiled so far.
-    needs: Needs,
+    /// The rules' body text tests: request, response.
+    texts: [TextTests; 2],
 }
 
 impl<'i, 'a> PolicyCompiler<'i, 'a> {
@@ -134,14 +129,25 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         Self {
             input,
             d: Vec::new(),
-            needs: Needs::default(),
+            texts: Default::default(),
         }
     }
 
-    /// The body-buffering needs of everything compiled, and every
-    /// diagnostic found.
-    pub(super) fn finish(self) -> (Needs, Vec<Diagnostic>) {
-        (self.needs, self.d)
+    /// The rules' body text tests (request, response), and every diagnostic
+    /// found.
+    pub(super) fn finish(self) -> ([TextTests; 2], Vec<Diagnostic>) {
+        (self.texts, self.d)
+    }
+
+    /// Moves an expression's text tests into the policy's, renumbering
+    /// its plan to match.
+    fn adopt_texts(&mut self, pred: &mut Pred, needs: &Needs) {
+        let index: Vec<usize> = needs
+            .texts
+            .iter()
+            .map(|(side, test, want)| self.texts[*side as usize].add(test, *want))
+            .collect();
+        pred.renumber_texts(&mut |_, local| index[local]);
     }
 
     fn push(&mut self, rule: Option<&RuleId>, path: impl Into<String>, msg: impl Into<String>) {
@@ -160,11 +166,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             },
         );
         match result {
-            Ok((pred, needs)) => {
-                self.needs.request_body |= needs.request_body;
-                self.needs.response_body |= needs.response_body;
-                Some((pred, needs))
-            }
+            Ok((pred, needs)) => Some((pred, needs)),
             Err(e) => {
                 self.d
                     .push(Diagnostic::from_expr(path, src, e).with_rule(rule.cloned()));
@@ -430,7 +432,10 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             }
             let (when, needs) = match &rule.when {
                 Some(w) => match self.expr(Some(&rid), format!("{path}.when"), w.as_str()) {
-                    Some((p, n)) => (Some(p), n),
+                    Some((mut p, n)) => {
+                        self.adopt_texts(&mut p, &n);
+                        (Some(p), n)
+                    }
                     None => (None, Needs::default()),
                 },
                 None => (None, Needs::default()),
@@ -1103,7 +1108,7 @@ impl RuleShape {
     /// Why an in-flight rule's `set_header` / `remove_header` cannot apply to
     /// the response, if it cannot: everything that can re-check the rule
     /// must be known before the response head is sent (`response.status`,
-    /// `response.header[..]`, `response.body.size`, `response.body.text`).
+    /// `response.header[..]`, `response.body.size`).
     fn response_header_problem(&self, a: &Action) -> Option<String> {
         if !self.fields.intersects(Reads::BEFORE_RESPONSE_SENT) {
             Some(format!(

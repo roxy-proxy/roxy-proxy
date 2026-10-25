@@ -96,11 +96,13 @@ pub enum Field {
 pub enum InFlightValue {
     /// `body.bytes`.
     BodyBytes,
+    /// `body.text` (decided as the request body streams).
+    BodyText,
     /// `response.status`, `response.header[...]`, `response.body.size`.
     ResponseHead,
     /// `response.body.bytes`.
     ResponseBodyBytes,
-    /// `response.body.text` (buffered before the response head is sent).
+    /// `response.body.text` (decided as the response body streams).
     ResponseBodyText,
     /// `ws.*` (per WebSocket message).
     Ws,
@@ -112,8 +114,9 @@ pub enum InFlightValue {
 }
 
 impl InFlightValue {
-    pub const ALL: [InFlightValue; 7] = [
+    pub const ALL: [InFlightValue; 8] = [
         Self::BodyBytes,
+        Self::BodyText,
         Self::ResponseHead,
         Self::ResponseBodyBytes,
         Self::ResponseBodyText,
@@ -126,6 +129,7 @@ impl InFlightValue {
     pub const fn name(self) -> &'static str {
         match self {
             Self::BodyBytes => "body.bytes",
+            Self::BodyText => "body.text",
             Self::ResponseHead => "response head",
             Self::ResponseBodyBytes => "response.body.bytes",
             Self::ResponseBodyText => "response.body.text",
@@ -145,7 +149,7 @@ impl InFlightValue {
     /// Known before the response head is sent to the client, so a rule
     /// reading only such values can still change the response head.
     pub const fn before_response_sent(self) -> bool {
-        matches!(self, Self::ResponseHead | Self::ResponseBodyText)
+        matches!(self, Self::ResponseHead)
     }
 
     const fn bit(self) -> u16 {
@@ -184,6 +188,7 @@ macro_rules! derived {
 impl Reads {
     pub const NONE: Reads = Reads(0);
     pub const BODY_BYTES: Reads = Reads::of(InFlightValue::BodyBytes);
+    pub const BODY_TEXT: Reads = Reads::of(InFlightValue::BodyText);
     pub const RESPONSE_HEAD: Reads = Reads::of(InFlightValue::ResponseHead);
     pub const RESPONSE_BODY_BYTES: Reads = Reads::of(InFlightValue::ResponseBodyBytes);
     pub const RESPONSE_BODY_TEXT: Reads = Reads::of(InFlightValue::ResponseBodyText);
@@ -486,9 +491,7 @@ impl Access {
         match self {
             Self::Tag(_) => Some("false until set"),
             Self::Metric(_) => Some("an unavailable metric fails the flow closed"),
-            Self::BodyText | Self::RespBodyText => {
-                Some("an unavailable body fails the flow closed")
-            }
+            Self::BodyText | Self::RespBodyText => Some("an empty body is the empty string"),
             Self::Scalar(_)
             | Self::Header(_)
             | Self::HeaderAll(_)
@@ -508,10 +511,10 @@ impl Access {
         match self {
             Self::Scalar(f) => f.in_flight(),
             Self::RespHeader(_) | Self::RespHeaderAll(_) => Some(InFlightValue::ResponseHead),
+            Self::BodyText => Some(InFlightValue::BodyText),
             Self::RespBodyText => Some(InFlightValue::ResponseBodyText),
             Self::Header(_)
             | Self::HeaderAll(_)
-            | Self::BodyText
             | Self::Query(_)
             | Self::State(_)
             | Self::Tag(_)
@@ -731,7 +734,7 @@ mod tests {
             Access::RespBodyText.in_flight(),
             Some(InFlightValue::ResponseBodyText)
         );
-        assert_eq!(Access::BodyText.in_flight(), None);
+        assert_eq!(Access::BodyText.in_flight(), Some(InFlightValue::BodyText));
         let r = Reads::BODY_BYTES | Reads::METRIC_REQUEST_BYTES;
         assert!(r.intersects(Reads::METRICS));
         assert!(Reads::BODY_BYTES.is_subset(r));

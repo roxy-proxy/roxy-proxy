@@ -6,6 +6,7 @@ mod compiler;
 mod runtime;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::compile::Pred;
@@ -13,6 +14,7 @@ use crate::config::{MetricConfig, MetricCount, RuleConfig};
 use crate::diag::{Diagnostic, RuleId};
 use crate::eval::{Decision, Deny, Effect, InFlightEffect};
 use crate::template::Part;
+use crate::text::{BodySide, TextTests};
 use crate::types::{Field, InFlightValue, Reads};
 
 /// Everything [`Policy::compile`] needs from the config.
@@ -90,8 +92,8 @@ impl MetricDef {
 /// A standalone condition over admission fields, compiled against a policy's
 /// metrics and address lists: an addon's `when`.
 ///
-/// It may not read an in-flight field, nor `body.text`: whatever it guards
-/// owns the body stream, so nothing reads the body before it does.
+/// It may not read an in-flight field, `body.text` included: it is decided
+/// before the request is forwarded.
 #[derive(Debug, Clone)]
 pub struct Condition {
     pred: Pred,
@@ -248,8 +250,8 @@ pub struct Policy {
     /// Union of the byte-metric bits of the defined metrics.
     byte_metrics: Reads,
     metrics: Vec<MetricDef>,
-    needs_request_body: bool,
-    needs_response_body: bool,
+    /// The rules' body text tests: request, response.
+    texts: [Arc<TextTests>; 2],
     default_id: RuleId,
     fail_closed_id: RuleId,
 }
@@ -283,7 +285,7 @@ impl Policy {
         let mut c = compiler::PolicyCompiler::new(input);
         let metrics = c.metrics();
         let rules = c.rules();
-        let (needs, diagnostics) = c.finish();
+        let ([request, response], diagnostics) = c.finish();
         if !diagnostics.is_empty() {
             return Err(diagnostics);
         }
@@ -304,8 +306,7 @@ impl Policy {
             in_flight_triggers,
             byte_metrics,
             metrics,
-            needs_request_body: needs.request_body,
-            needs_response_body: needs.response_body,
+            texts: [Arc::new(request), Arc::new(response)],
             default_id: RuleId::new(RuleId::DEFAULT),
             fail_closed_id: RuleId::new(RuleId::FAIL_CLOSED),
         })
@@ -318,14 +319,10 @@ impl Policy {
         compiler::PolicyCompiler::metric_warnings(metrics)
     }
 
-    /// Whether any rule or metric filter reads `body.text`.
-    pub fn needs_request_body(&self) -> bool {
-        self.needs_request_body
-    }
-
-    /// Whether any rule reads `response.body.text`.
-    pub fn needs_response_body(&self) -> bool {
-        self.needs_response_body
+    /// The text tests the rules make of a body, for the proxy to scan it
+    /// with as it streams. Empty when no rule reads that body's text.
+    pub fn texts(&self, side: BodySide) -> &Arc<TextTests> {
+        &self.texts[side as usize]
     }
 
     /// The byte-metric bits ([`Reads::METRIC_REQUEST_BYTES`],

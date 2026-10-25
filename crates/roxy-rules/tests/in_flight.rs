@@ -406,12 +406,19 @@ fn in_flight_rules_cannot_allow_or_change_the_request() {
             .join("\n");
         assert!(err.contains(want), "{rule}: {err}");
     }
-    // A response header change in a rule reading only response-admission values
-    // (and the buffered body) is fine.
+    // A response header change in a rule reading only response-head values
+    // is fine; the body text streams after the head is sent.
     compile(
         "",
-        "- { id: a, when: 'response.status == 200 and response.body.text contains \"x\"', then: { remove_header: [x-a] } }",
+        "- { id: a, when: 'response.status == 200', then: { remove_header: [x-a] } }",
     );
+    let err = try_compile(
+        "",
+        "- { id: a, when: 'response.status == 200 and response.body.text contains \"x\"', then: { remove_header: [x-a] } }",
+    )
+    .unwrap_err()
+    .join("\n");
+    assert!(err.contains("response.body.text"), "{err}");
 }
 
 /// A deny on a byte metric can fire in flight, and a pass runs every

@@ -7,9 +7,9 @@ use std::time::Duration;
 
 use common::{METRICS, compile, try_compile};
 use roxy_rules::{
-    AllowOpts, CaptureTarget, Decision, Deny, DenyStatus, Effect, EvalContext, FailClosedReason,
-    Field, InFlightOutcome, LogLevel, MapView, Policy, Reads, RuleKind, Scheme, SetHeaderValue,
-    Type, Value,
+    AllowOpts, BodySide, BodyText, CaptureTarget, Decision, Deny, DenyStatus, Effect, EvalContext,
+    FailClosedReason, Field, FlowView, InFlightOutcome, LogLevel, MapView, Policy, Reads, RuleKind,
+    Scheme, SetHeaderValue, Type, Value,
 };
 
 fn ip(s: &str) -> Value<'static> {
@@ -160,7 +160,6 @@ fn like_and_matches() {
         ("path matches \"/REPOS/.*\"", false),
         ("path matches \"(?i)/REPOS/.*\"", true),
         ("host matches \"API\\\\.github\\\\.com\"", true),
-        ("body.text matches \".*hunter2.*\"", true),
     ]);
     // Only `*` and `?` are special in `like`.
     let v = MapView::new().with_str(Field::Path, "/a[1]{x}\\");
@@ -365,7 +364,6 @@ fn response_fields() {
             "response.header.all[\"content-type\"] contains \"utf-8\"",
             true,
         ),
-        ("response.body.text contains \"down\"", true),
         (
             "host under \"github.com\" and header[\"accept\"] == \"text/html\"",
             true,
@@ -584,52 +582,206 @@ fn fail_closed(reason: FailClosedReason) -> impl Fn(&roxy_rules::Outcome) {
 }
 
 #[test]
-fn bodies_fail_closed() {
-    let ctx = EvalContext::empty();
+fn body_text_tests() {
+    let v = flow().with_response_body("<h1>down</h1>");
+    for (expr, want) in [
+        ("body.text contains \"hunter2\"", true),
+        ("body.text contains \"hunter3\"", false),
+        ("not body.text contains \"hunter3\"", true),
+        ("body.text starts_with \"{\\\"token\"", true),
+        ("body.text ends_with \"}\"", true),
+        ("body.text == \"{\\\"token\\\": \\\"hunter2\\\"}\"", true),
+        ("\"x\" != body.text", true),
+        ("body.text in [\"a\", \"b\"]", false),
+        ("body.text not in [\"a\", \"b\"]", true),
+        ("response.body.text contains \"down\"", true),
+        ("response.body.text == \"\"", false),
+        (
+            "host == \"api.github.com\" and body.text contains \"hunter\"",
+            true,
+        ),
+    ] {
+        assert_eq!(eval_in(expr, &v), want, "{expr}");
+    }
+    // An empty body is text too.
+    let empty = MapView::new().with_body("");
+    assert!(eval_in("body.text == \"\"", &empty));
+    assert!(eval_in("body.text contains \"\"", &empty));
+    assert!(!eval_in("body.text contains \"x\"", &empty));
+}
+
+/// A rule reading the body's text is checked as the body streams, so it
+/// runs in flight: admission skips it, and it can only stop the exchange.
+#[test]
+fn body_text_rules_run_in_flight() {
     let p = compile(
         "",
         "- { id: b, when: 'body.text contains \"secret\"', then: deny }\n- { id: ok, then: allow }",
     );
-    let body = |s: &str| MapView::new().with_int(Field::BodySize, 10).with_body(s);
+    assert_eq!(p.rule_info()[0].kind, RuleKind::InFlight);
+    assert_eq!(p.rule_info()[0].triggers, Reads::BODY_TEXT);
+    let ctx = EvalContext::empty();
     assert_eq!(
-        p.evaluate_admission(&body("a secret"), &ctx).terminal_rule,
-        "b"
+        p.evaluate_admission(&MapView::new(), &ctx).terminal_rule,
+        "ok"
     );
-    assert_eq!(p.evaluate_admission(&body(""), &ctx).terminal_rule, "ok");
-    let too_large = body("x").with_body_too_large(false);
-    fail_closed(FailClosedReason::BodyTooLargeToInspect("body.text".into()))(
-        &p.evaluate_admission(&too_large, &ctx),
-    );
-    fail_closed(FailClosedReason::BodyUnavailable("body.text".into()))(
-        &p.evaluate_admission(&MapView::new(), &ctx),
-    );
+    for (action, want) in [
+        ("allow", "`allow` is only possible in admission rules"),
+        ("{ set_header: { x-a: b } }", "would change the request"),
+        ("{ capture: both }", "`capture` is decided at admission"),
+    ] {
+        let err = try_compile(
+            "",
+            &format!("- {{ id: b, when: 'body.text contains \"x\"', then: {action} }}"),
+        )
+        .unwrap_err()
+        .join("\n");
+        assert!(err.contains(want), "{action}: {err}");
+        assert!(err.contains("`body.text`"), "{action}: {err}");
+    }
+}
 
-    // Scoping by size first means a large upload is never inspected.
+#[test]
+fn body_text_takes_streamable_comparisons_only() {
+    for (expr, want) in [
+        ("body.text matches \".*x\"", "which `matches` cannot be"),
+        ("body.text like \"*x\"", "which `like` cannot be"),
+        (
+            "response.body.text under \"x\"",
+            "`response.body.text` is checked as the body streams past",
+        ),
+        ("body.text > 1", "which `>` cannot be"),
+        (
+            "body.text contains header[\"x\"]",
+            "can only be compared with a quoted string",
+        ),
+        (
+            "body.text == response.body.text",
+            "can only be compared with a quoted string",
+        ),
+        (
+            "body.text in [\"a\", 1]",
+            "compared with quoted strings, but this is the number 1",
+        ),
+        ("body.text in \"a\"", "a list of quoted strings"),
+        (
+            "\"x\" contains body.text",
+            "put `body.text` on the left of `contains`",
+        ),
+    ] {
+        let err = try_compile(
+            "",
+            &format!(
+                "- {{ id: b, when: '{}', then: deny }}",
+                expr.replace('\'', "''")
+            ),
+        )
+        .unwrap_err()
+        .join("\n");
+        assert!(err.contains(want), "{expr}: {err}");
+    }
+}
+
+/// A view whose bodies are being scanned: each test's answer so far.
+struct Scanned(&'static [Option<bool>]);
+
+impl FlowView for Scanned {
+    fn field(&self, _: Field) -> Value<'_> {
+        Value::Absent
+    }
+    fn header(&self, _: &str) -> Option<std::borrow::Cow<'_, str>> {
+        None
+    }
+    fn header_all(&self, _: &str) -> Vec<std::borrow::Cow<'_, str>> {
+        Vec::new()
+    }
+    fn response_header(&self, _: &str) -> Option<std::borrow::Cow<'_, str>> {
+        None
+    }
+    fn response_header_all(&self, _: &str) -> Vec<std::borrow::Cow<'_, str>> {
+        Vec::new()
+    }
+    fn query(&self, _: &str) -> Option<std::borrow::Cow<'_, str>> {
+        None
+    }
+    fn metric(&self, _: &str) -> Option<i64> {
+        None
+    }
+    fn state(&self, _: &str) -> Option<std::borrow::Cow<'_, str>> {
+        None
+    }
+    fn body_text(&self) -> BodyText<'_> {
+        BodyText::Scanned(self.0)
+    }
+    fn response_body_text(&self) -> BodyText<'_> {
+        BodyText::Unavailable
+    }
+    fn in_address_list(&self, _: &str, _: IpAddr) -> Option<bool> {
+        None
+    }
+}
+
+/// An undecided test reads as whichever answer cannot fire its rule,
+/// under `not` and `!=` too, so a rule fires only on settled bytes.
+#[test]
+fn an_undecided_test_never_fires_a_rule() {
     let p = compile(
         "",
-        "- { id: b, when: 'body.size < 1mb and body.text contains \"secret\"', then: deny }\n\
-         - { id: ok, then: allow }",
+        r#"
+- { id: has-a, when: 'body.text contains "a"', then: deny }
+- { id: no-b, when: 'not body.text contains "b"', then: deny }
+- { id: either, when: 'body.text contains "a" or body.text != "c"', then: deny }
+- { id: tautology, when: 'body.text contains "a" or not body.text contains "a"', then: deny }
+"#,
     );
-    let big = MapView::new()
-        .with_int(Field::BodySize, 5 << 20)
-        .with_body_too_large(false);
-    assert_eq!(p.evaluate_admission(&big, &ctx).terminal_rule, "ok");
-
-    // Response bodies too.
-    let p = compile(
-        "",
-        "- { id: r, when: 'response.body.text contains \"x\"', then: deny }",
-    );
-    let v = MapView::new().with_body_too_large(true);
-    let out = in_flight(&p, &v, &ctx).expect("stops");
-    assert_eq!(out.stop, Some(Deny::fail_closed()));
-    assert_eq!(out.terminal_rule.unwrap(), "_fail_closed");
+    // Tests: contains "a", contains "b", == "c" (shared where equal).
+    assert_eq!(p.texts(BodySide::Request).len(), 3);
+    assert!(p.texts(BodySide::Response).is_empty());
+    let fired = |results: &'static [Option<bool>]| -> Vec<String> {
+        let mut st = p.in_flight_state();
+        let mut tags = Vec::new();
+        p.evaluate_in_flight(
+            Reads::BODY_TEXT,
+            Reads::ALL,
+            &mut st,
+            &mut tags,
+            &Scanned(results),
+        )
+        .map(|o| o.matched.iter().map(ToString::to_string).collect())
+        .unwrap_or_default()
+    };
+    assert_eq!(fired(&[None, None, None]), Vec::<String>::new());
     assert_eq!(
-        out.fail_closed_reason,
-        Some(FailClosedReason::BodyTooLargeToInspect(
-            "response.body.text".into()
-        ))
+        fired(&[Some(true), None, None]),
+        ["has-a", "either", "tautology"]
     );
+    assert_eq!(
+        fired(&[Some(false), Some(false), Some(false)]),
+        ["no-b", "either", "tautology"]
+    );
+    assert_eq!(fired(&[None, None, Some(false)]), ["either"]);
+    assert_eq!(fired(&[Some(false), Some(true), Some(true)]), ["tautology"]);
+}
+
+#[test]
+fn a_body_the_view_does_not_have_fails_closed() {
+    let ctx = EvalContext::empty();
+    for (expr, field) in [
+        ("body.text contains \"x\"", "body.text"),
+        (
+            "not response.body.text contains \"x\"",
+            "response.body.text",
+        ),
+    ] {
+        let p = compile("", &format!("- {{ id: r, when: '{expr}', then: deny }}"));
+        let out = in_flight(&p, &MapView::new(), &ctx).expect("stops");
+        assert_eq!(out.stop, Some(Deny::fail_closed()));
+        assert_eq!(out.terminal_rule.unwrap(), "_fail_closed");
+        assert_eq!(
+            out.fail_closed_reason,
+            Some(FailClosedReason::BodyUnavailable(field.into()))
+        );
+    }
 }
 
 #[test]
@@ -1141,22 +1293,6 @@ fn every_effect_kind() {
         "redirect https://mirror.example.org:8443 (rewrite host)"
     );
     assert_eq!(rendered[9], "digest request");
-}
-
-#[test]
-fn body_buffering_flags() {
-    let p = compile("", "- { id: a, when: 'body.size > 1', then: allow }");
-    assert!(!p.needs_request_body() && !p.needs_response_body());
-    let p = compile(
-        "",
-        "- { id: a, when: 'body.text contains \"x\"', then: allow }",
-    );
-    assert!(p.needs_request_body() && !p.needs_response_body());
-    let p = compile(
-        "",
-        "- { id: a, when: 'response.body.text contains \"x\"', then: deny }",
-    );
-    assert!(!p.needs_request_body() && p.needs_response_body());
 }
 
 #[test]

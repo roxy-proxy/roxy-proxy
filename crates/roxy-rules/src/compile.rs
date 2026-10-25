@@ -19,6 +19,11 @@
 //! * A list-valued operand (`header.all["x"]`) satisfies `==`, `in`,
 //!   `starts_with`, `ends_with`, `contains`, `like` and `matches` if *any*
 //!   element does; `!=` and `not in` on a list are rejected as ambiguous.
+//! * `body.text` and `response.body.text` are compared only with quoted
+//!   strings, by the operators that can be decided as the body streams
+//!   (`contains`, `starts_with`, `ends_with`, `==`, `!=`, `in`, `not in`).
+//!   Each comparison becomes a [`TextTest`], answered by the proxy's scan
+//!   of the body ([`crate::text`]).
 
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -29,6 +34,7 @@ use regex::{Regex, RegexBuilder};
 use crate::ast::{Expr, Lit, LitNode, Node, Op, Operand};
 use crate::config::MetricCount;
 use crate::diag::{ExprError, Span};
+use crate::text::{BodySide, TextOp, TextTest, Want};
 use crate::types::{Access, Field, InFlightValue, Reads, Type, resolve};
 
 /// Compiled-program size limit for one regex (bytes). A hostile or careless
@@ -50,12 +56,10 @@ pub(crate) struct Env<'a> {
     pub list_exists: &'a dyn Fn(&str) -> bool,
 }
 
-/// What an expression needs beyond its plan: body buffering, and the
-/// values it reads that are not known at admission.
+/// What an expression needs beyond its plan: the values it reads that are
+/// not known at admission, and its body text tests.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Needs {
-    pub request_body: bool,
-    pub response_body: bool,
     /// In-flight fields and byte metrics read.
     pub reads: Reads,
     /// The in-flight values read, each with its name as written (`body.bytes`,
@@ -63,6 +67,9 @@ pub(crate) struct Needs {
     in_flight: Vec<(InFlightValue, String)>,
     /// The tags read (`tag["x"]`), in order of first appearance.
     pub tags: Vec<Box<str>>,
+    /// The body text tests, in the order of the plan's [`Pred::Text`]
+    /// indices, with the answer on which each can make the expression true.
+    pub texts: Vec<(BodySide, TextTest, Want)>,
 }
 
 impl Needs {
@@ -220,6 +227,46 @@ pub(crate) enum Pred {
         op: ROperand,
         negate: bool,
     },
+    /// A body text test, true when its answer differs from `negate`. The
+    /// index is the test's in the policy's [`crate::TextTests`] for `side`
+    /// (in [`Needs::texts`] until the policy is assembled). `pending` is
+    /// the value while the test is undecided: whichever cannot make the
+    /// whole expression true, so an undecided test never fires a rule.
+    Text {
+        side: BodySide,
+        index: usize,
+        test: Arc<TextTest>,
+        negate: bool,
+        pending: bool,
+    },
+}
+
+impl Pred {
+    /// Renumbers the body text tests through `index`.
+    pub(crate) fn renumber_texts(&mut self, index: &mut dyn FnMut(BodySide, usize) -> usize) {
+        match self {
+            Pred::All(ps) | Pred::Any(ps) => {
+                for p in ps {
+                    p.renumber_texts(index);
+                }
+            }
+            Pred::Not(p) => p.renumber_texts(index),
+            Pred::Text { side, index: i, .. } => *i = index(*side, *i),
+            Pred::Const(_)
+            | Pred::Truthy(_)
+            | Pred::Eq { .. }
+            | Pred::Ord { .. }
+            | Pred::Str { .. }
+            | Pred::Glob { .. }
+            | Pred::Regex { .. }
+            | Pred::Under { .. }
+            | Pred::InStr { .. }
+            | Pred::InInt { .. }
+            | Pred::InNet { .. }
+            | Pred::InList { .. }
+            | Pred::IsNull { .. } => {}
+        }
+    }
 }
 
 fn list_misuse(span: Span, name: &str) -> ExprError {
@@ -338,6 +385,7 @@ pub(crate) fn compile(src: &str, env: &Env<'_>) -> Result<(Pred, Needs), ExprErr
     let pred = Compiler {
         env,
         needs: &mut needs,
+        negated: false,
     }
     .node(&node)?;
     Ok((pred, needs))
@@ -484,6 +532,9 @@ fn describe_lit(l: &Lit) -> String {
 struct Compiler<'a, 'e> {
     env: &'a Env<'e>,
     needs: &'a mut Needs,
+    /// Inside an odd number of `not`s: a predicate here makes the
+    /// expression true by being false.
+    negated: bool,
 }
 
 impl Compiler<'_, '_> {
@@ -499,7 +550,12 @@ impl Compiler<'_, '_> {
                 self.flatten(node, false, &mut out)?;
                 Pred::All(out.into())
             }
-            Expr::Not(inner) => Pred::Not(Box::new(self.node(inner)?)),
+            Expr::Not(inner) => {
+                self.negated = !self.negated;
+                let inner = self.node(inner);
+                self.negated = !self.negated;
+                Pred::Not(Box::new(inner?))
+            }
             Expr::Pred(o) => self.predicate(o)?,
             Expr::Cmp { lhs, op, rhs } => self.comparison(lhs, *op, rhs, node.span)?,
         })
@@ -540,21 +596,10 @@ impl Compiler<'_, '_> {
             Operand::Field(f) => {
                 let metric = self.env.metric;
                 let access = resolve(f, &|id| metric(id).is_some())?;
-                match &access {
-                    Access::BodyText => self.needs.request_body = true,
-                    Access::RespBodyText => self.needs.response_body = true,
-                    Access::Tag(t) if !self.needs.tags.contains(t) => {
-                        self.needs.tags.push(t.clone());
-                    }
-                    Access::Scalar(_)
-                    | Access::Header(_)
-                    | Access::HeaderAll(_)
-                    | Access::RespHeader(_)
-                    | Access::RespHeaderAll(_)
-                    | Access::Query(_)
-                    | Access::State(_)
-                    | Access::Tag(_)
-                    | Access::Metric(_) => {}
+                if let Access::Tag(t) = &access
+                    && !self.needs.tags.contains(t)
+                {
+                    self.needs.tags.push(t.clone());
                 }
                 let in_flight = match &access {
                     Access::Metric(id) => metric(id).and_then(|count| {
@@ -630,6 +675,9 @@ impl Compiler<'_, '_> {
         }
         reject_null(&l)?;
         reject_null(&r)?;
+        if let Some(side) = body_side(&l).or_else(|| body_side(&r)) {
+            return self.text_comparison(side, l, op, r, ro, span);
+        }
         match op {
             Op::Eq | Op::Ne => equality(l, lo, op, r, ro, span),
             Op::Lt => ordering(l, lo, OrdOp::Lt, r, ro),
@@ -706,6 +754,137 @@ impl Compiler<'_, '_> {
             }
         };
         literal_set(l, lo, op, items, span)
+    }
+}
+
+impl Compiler<'_, '_> {
+    /// A comparison of a body's text: with quoted strings only, by an
+    /// operator that can be decided as the body streams.
+    fn text_comparison(
+        &mut self,
+        side: BodySide,
+        l: Typed<'_>,
+        op: Op,
+        r: Typed<'_>,
+        ro: &Operand,
+        span: Span,
+    ) -> Result<Pred, ExprError> {
+        let field = side.field();
+        let text_op = match op {
+            Op::Eq | Op::Ne | Op::In | Op::NotIn => TextOp::Equals,
+            Op::Contains => TextOp::Contains,
+            Op::StartsWith => TextOp::StartsWith,
+            Op::EndsWith => TextOp::EndsWith,
+            Op::Lt | Op::Le | Op::Gt | Op::Ge | Op::Like | Op::Matches | Op::Under => {
+                return Err(ExprError::new(
+                    span,
+                    format!(
+                        "`{field}` is checked as the body streams past, which `{}` cannot be; \
+                         use `contains`, `starts_with`, `ends_with`, `==`, `!=`, `in` or `not in`",
+                        op.as_str()
+                    ),
+                ));
+            }
+        };
+        // `==` and `!=` read the same either way round.
+        let other = match (body_side(&l), op) {
+            (Some(_), _) => r,
+            (None, Op::Eq | Op::Ne) => l,
+            (None, _) => {
+                return Err(ExprError::new(
+                    r.span(),
+                    format!("put `{field}` on the left of `{}`", op.as_str()),
+                ));
+            }
+        };
+        let needles: Vec<&str> = match (&other, op) {
+            (
+                Typed::Lit(LitNode {
+                    lit: Lit::List(items),
+                    ..
+                }),
+                Op::In | Op::NotIn,
+            ) => items
+                .iter()
+                .map(|item| match &item.lit {
+                    Lit::Str(s) => Ok(s.as_str()),
+                    lit @ (Lit::Int(..)
+                    | Lit::Bool(_)
+                    | Lit::List(_)
+                    | Lit::Ip(_)
+                    | Lit::Cidr(_)
+                    | Lit::AddressList(_)
+                    | Lit::Method(_)
+                    | Lit::Null) => Err(ExprError::new(
+                        item.span,
+                        format!(
+                            "`{field}` is compared with quoted strings, but this is {}",
+                            describe_lit(lit)
+                        ),
+                    )),
+                })
+                .collect::<Result<_, _>>()?,
+            (
+                Typed::Lit(LitNode {
+                    lit: Lit::Str(s), ..
+                }),
+                Op::Eq | Op::Ne | Op::Contains | Op::StartsWith | Op::EndsWith,
+            ) => vec![s.as_str()],
+            (other, _) => {
+                let want = if matches!(op, Op::In | Op::NotIn) {
+                    "a list of quoted strings"
+                } else {
+                    "a quoted string"
+                };
+                return Err(ExprError::new(
+                    other.span(),
+                    format!(
+                        "`{field}` can only be compared with {want}, found {}",
+                        other.describe(Some(ro))
+                    ),
+                ));
+            }
+        };
+        let negate = matches!(op, Op::Ne | Op::NotIn);
+        let mut atoms: Vec<Pred> = needles
+            .into_iter()
+            .map(|needle| self.text_test(side, TextTest::new(text_op, needle), negate))
+            .collect();
+        Ok(match (op, atoms.pop()) {
+            (Op::In, last) => Pred::Any(atoms.into_iter().chain(last).collect()),
+            (Op::NotIn, last) => Pred::All(atoms.into_iter().chain(last).collect()),
+            (_, Some(one)) => one,
+            (_, None) => unreachable!("one needle"),
+        })
+    }
+
+    /// One text test, true when its answer differs from `negate`.
+    fn text_test(&mut self, side: BodySide, test: TextTest, negate: bool) -> Pred {
+        // The answer that can make the expression true: `true` for a test
+        // that reads as itself, `false` under a negation or a `not`.
+        let wanted = negate == self.negated;
+        let want = Want {
+            on_true: wanted,
+            on_false: !wanted,
+        };
+        let index = self.needs.texts.len();
+        self.needs.texts.push((side, test.clone(), want));
+        Pred::Text {
+            side,
+            index,
+            test: Arc::new(test),
+            negate,
+            pending: self.negated,
+        }
+    }
+}
+
+/// The body whose text `t` is, if it is one.
+fn body_side(t: &Typed<'_>) -> Option<BodySide> {
+    match t {
+        Typed::Field(Access::BodyText, _) => Some(BodySide::Request),
+        Typed::Field(Access::RespBodyText, _) => Some(BodySide::Response),
+        Typed::Field(..) | Typed::Lit(_) => None,
     }
 }
 
