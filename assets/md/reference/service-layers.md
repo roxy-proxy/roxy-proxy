@@ -23,13 +23,9 @@ addons:
 ```
 
 The other keys are as for any addon
-([addon configuration](/reference/addon-configuration)).
-
-The [quickstart](/quickstart)'s sidecar includes
-[`roxy_layer.py`](https://github.com/roxy-proxy/roxy-proxy/blob/main/examples/quickstart/sentinel/roxy_layer.py),
-a Python asyncio implementation of the service side of this protocol. It
-handles the framing, flow control and errors, and hands a handler one
-exchange at a time.
+([addon configuration](/reference/addon-configuration)). For a minimal
+service and a Python implementation of this protocol, see
+[writing addons](/guides/writing-addons#a-service-layer).
 
 ## Transport
 
