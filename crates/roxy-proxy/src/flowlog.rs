@@ -119,7 +119,7 @@ pub enum FlowEvent<'a> {
         /// `_address_policy`, … for built-in decisions).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         terminal_rule: Option<Cow<'a, str>>,
-        /// Stable reason code for a deny or failure (`body_too_large_to_inspect`,
+        /// Stable reason code for a deny or failure (`body_decode_failed`,
         /// `effect_invalid`, `timeout`, …).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<Cow<'a, str>>,

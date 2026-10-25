@@ -58,13 +58,13 @@ is checked as the exchange streams
 | `query["k"]`, `query.raw` | string | admission |
 | `header["name"]`, `header.all["name"]` | string, list | admission |
 | `body.size` | int: declared length, `null` if not declared | admission |
-| `body.text` | string: the buffered body | admission |
 | `metric.<id>` | int | admission ([rate limits](/reference/rate-limits#metrics)) |
 | `state["key"]`, `tag["name"]` | string, bool | admission |
+| `body.text` | string: the request body, checked as it streams | in-flight ([body rules](/reference/rule-language#body-rules)) |
 | `body.bytes` | int: request body bytes so far | in-flight |
 | `response.status`, `response.header["name"]`, `response.header.all["name"]` | int, string, list | in-flight |
 | `response.body.size` | int: declared length, `null` if not declared | in-flight |
-| `response.body.text` | string: the buffered response body | in-flight |
+| `response.body.text` | string: the response body, checked as it streams | in-flight ([body rules](/reference/rule-language#body-rules)) |
 | `response.body.bytes` | int: response body bytes so far | in-flight |
 | `ws.direction`, `ws.opcode`, `ws.size`, `ws.text` | string, int, int, string | in-flight, per WebSocket message ([WebSockets](/reference/websockets#message-rules)) |
 
@@ -144,19 +144,50 @@ Anything more complex needs an addon.
 
 ## Body rules
 
-`body.text` and `response.body.text` are the only fields that make roxy
-buffer. If any rule reads `body.text`, roxy buffers every request body, up
-to `limits.max_inspect_body_bytes` (1 MiB), before deciding, then streams
-it on. `response.body.text` does the same for responses.
+`body.text` and `response.body.text` are checked as the body streams
+past, without buffering it. Each comparison is a test that roxy decides
+while the bytes go by:
 
-A body over the cap cannot be inspected, and a rule that reads it denies
-the exchange (`body_too_large_to_inspect`). To let large bodies through,
-raise the cap, or check the size before the text:
+| comparison | decided |
+|---|---|
+| `contains "s"` | once `s` is seen, or at the end of the body |
+| `starts_with "s"` | once the body's first bytes match `s` or not |
+| `ends_with "s"` | at the end of the body |
+| `== "s"`, `in [...]` | once the body differs from `s`, or at the end |
+| `not` any of these, `!=`, `not in` | as the comparison it negates |
+
+The value must be a quoted string, with the field on the left (either
+side for `==` and `!=`). `matches`, `like`, `under`, `<` and `>` cannot be
+decided as the body streams, and are compile errors.
+
+A rule that reads body text runs in flight: it can `deny`, `quarantine`,
+`log`, `tag` and `set_state`, but not `allow` or change the request.
+Write the allow as an admission rule and the body check as a `deny`:
 
 ```yaml
-when: body.size != null and body.size < 1mb and body.text contains "secret"
+- id: no-keys-out
+  when: host == "api.example.com" and body.text contains "BEGIN PRIVATE KEY"
+  then: deny
+- id: example
+  when: host == "api.example.com"
+  then: allow
 ```
+
+**Nothing that would make a rule fire leaves roxy.** Bytes go on as soon
+as no test can need them. The few bytes that could be the start of a
+match are held back until the next bytes settle it, so a `contains` that
+fires stops the exchange with none of the match sent. A test that a rule
+needs to be false (such as `not body.text contains "s"`) holds back the
+last byte of the body until the end, when the test is decided.
+
+When a rule fires mid-body, the exchange stops there. The upstream has
+the request head and the body up to the held bytes, and the request is
+cut. If the response head has not gone, the client gets the deny
+response; otherwise its response is cut. A response body rule cuts the
+response the same way, after its head has gone to the client.
 
 The text is the body decoded from its `content-encoding`
 ([content codings](/reference/http#content-codings)). A body that cannot
-be decoded also denies the exchange.
+be decoded, or is in a coding roxy does not decode, fails closed
+(`body_decode_failed`, `unsupported_content_encoding`). An empty body is
+the empty string.

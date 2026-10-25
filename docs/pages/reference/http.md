@@ -199,12 +199,9 @@ through unchanged. Size and time limits are in
 
 ## Content codings
 
-For the rules, roxy decodes `content-encoding` only to inspect a body.
-`body.text` and `response.body.text` see the decoded text, while the
-bytes forwarded are the bytes received
-([body rules](/reference/rule-language#body-rules)).
-
-Addons that read bodies
+Rules that read body text
+([body rules](/reference/rule-language#body-rules)), addons that read
+bodies
 ([content codings for addons](/reference/addon-configuration#content-codings))
 and the masking of secrets
 ([redacting responses](/reference/secrets#redacting-responses)) need plain
@@ -215,9 +212,15 @@ each chunk as soon as it is ready, so streams are not delayed. A body
 compressed again has no `content-length`. The capture, `response.body.bytes`
 and the `response_bytes` metric see a response as the upstream sent it.
 
+A request held whole to be signed (`sign: aws_sigv4`) is the exception:
+the rules read its decoded text before any of it is sent, and it goes on
+as it came, so its signature still holds.
+
 roxy decodes `gzip`, `x-gzip`, `deflate`, `br` and `zstd`, stacked up to
-four deep. Decoding is strict: a truncated or corrupt body cannot be
-inspected, and a rule that reads it fails closed.
+four deep. Decoding is strict: a truncated or corrupt body, or bytes
+after the end of the coded stream, fail the exchange closed
+(`body_decode_failed`), and so does a coding roxy does not decode
+(`unsupported_content_encoding`).
 
 `http.strip_accept_encoding` (default false) removes `accept-encoding`
 from every request, so origins answer uncompressed.

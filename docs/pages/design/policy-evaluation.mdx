@@ -48,7 +48,7 @@ these rules again each time the value changes. In the example,
 `upload-cap` is checked as the body streams, and stops the upload once it
 passes 10 MiB.
 
-<img src={requestTiming} alt="The request phase of one exchange through roxy, left to right. The client's request head (a solid line) travels first and its body bytes (a dashed line) stream behind it, through layer A (enforce), past layer B (observe, which gets a copy beside the path), through layer C (enforce) and the rules, then on to the upstream. Each layer's when is evaluated on the head as it reaches the layer. At the rules the admission decision is made once, on the head, after the stack and before anything is forwarded (when a rule reads body.text, the body is buffered first): allow, deny or change the request. As body bytes stream past the rules they are re-checked in flight (body.bytes, byte metrics), which can deny or quarantine but never allow or change the request." />
+<img src={requestTiming} alt="The request phase of one exchange through roxy, left to right. The client's request head (a solid line) travels first and its body bytes (a dashed line) stream behind it, through layer A (enforce), past layer B (observe, which gets a copy beside the path), through layer C (enforce) and the rules, then on to the upstream. Each layer's when is evaluated on the head as it reaches the layer. At the rules the admission decision is made once, on the head, after the stack and before anything is forwarded: allow, deny or change the request. As body bytes stream past the rules they are re-checked in flight (body.bytes, body.text, byte metrics), which can deny or quarantine but never allow or change the request." />
 
 The reference calls the first kind *admission* rules and the second
 *in-flight* rules. `roxy check` and `roxy rule test` say which each rule
@@ -60,8 +60,9 @@ headers that have not been sent yet. When it denies, roxy stops the
 exchange: the client gets an error if its response has not started, and
 otherwise the connection is closed.
 
-A rule that reads the whole body (`body.text`) is different: roxy holds
-the body back until it has read it, and then decides
+A rule that reads the body text (`body.text`) is checked as the body
+streams too. roxy holds back only the few bytes that could start a match,
+so a match is stopped before any of it is sent
 ([body rules](/reference/rule-language#body-rules)).
 
 ## Effects

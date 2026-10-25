@@ -1394,7 +1394,7 @@ mod tests {
         let res = r.response(&flow);
         assert_eq!(res.status, StatusCode::FORBIDDEN);
         assert_eq!(res.headers.get("x-roxy-rule"), Some("_default"));
-        let r = Refusal::fail_closed("body_too_large_to_inspect");
+        let r = Refusal::fail_closed("body_decode_failed");
         assert_eq!(r.status, 503);
         assert_eq!(
             r.rule,
