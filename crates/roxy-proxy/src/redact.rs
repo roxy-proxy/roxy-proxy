@@ -58,12 +58,13 @@ pub(crate) fn masks_body(cx: &FlowCx) -> bool {
 /// be masked, so the upstream sends the whole body: masking finds whole
 /// occurrences only, and a range's bounds are the client's to choose.
 /// Runs before the request is signed, so the signature covers the request
-/// as it leaves.
-pub(crate) fn request(cx: &FlowCx, req: &mut CanonicalRequest) {
-    if masks_body(cx) {
-        req.headers.remove("range");
-        req.headers.remove("if-range");
+/// as it leaves. Whether anything was dropped: the request facts are then
+/// settled again.
+pub(crate) fn request(cx: &FlowCx, req: &mut CanonicalRequest) -> bool {
+    if !masks_body(cx) {
+        return false;
     }
+    req.headers.remove("range") + req.headers.remove("if-range") > 0
 }
 
 /// Masks `needles` in `res` as `http.redact_response_secrets` asks. With
