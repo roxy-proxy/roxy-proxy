@@ -163,7 +163,8 @@ async fn a_body_rule_quarantines_mid_stream() {
 /// A response body rule reads the whole response: the client chooses a
 /// range's bounds, so two ranges that each cut the needle would carry it
 /// out in pieces past the rule. The request goes without `range` and
-/// `if-range`, and a `206` that comes back anyway is refused.
+/// `if-range`, the in-flight rules see it without them (`saw-range` does
+/// not fire), and a `206` that comes back anyway is refused.
 #[tokio::test]
 async fn a_response_body_rule_never_reads_a_range() {
     let kit = Kit::builder()
@@ -171,6 +172,9 @@ async fn a_response_body_rule_never_reads_a_range() {
             r#"
 - id: no-secret
   when: host == "up.test" and response.body.text contains "SECRET"
+  then: deny
+- id: saw-range
+  when: host == "up.test" and header["range"] != null and response.status == 200
   then: deny
 - id: up
   when: host == "up.test"

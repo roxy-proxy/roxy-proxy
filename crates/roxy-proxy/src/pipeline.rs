@@ -340,8 +340,11 @@ pub(crate) async fn request_steps(
     match request_rules(cx, req) {
         Verdict::Continue(mut req) => {
             // Settled with the effects, and before the signature, which
-            // covers the request as it leaves.
-            crate::recode::request_whole(cx, &mut req);
+            // covers the request as it leaves. The in-flight rules and the
+            // log see the request without the dropped fields.
+            if crate::recode::request_whole(cx, &mut req) {
+                settle_request_facts(cx, &req);
+            }
             sign_request(cx, req, io).await
         }
         Verdict::Deny(d) => Verdict::Deny(d),

@@ -70,12 +70,13 @@ pub(crate) fn reads_response_whole(cx: &FlowCx) -> bool {
 /// read whole, so the upstream sends the whole body: masking and the text
 /// tests find whole occurrences only, and a range's bounds are the
 /// client's to choose. Runs before the request is signed, so the
-/// signature covers the request as it leaves.
-pub(crate) fn request_whole(cx: &FlowCx, req: &mut CanonicalRequest) {
-    if reads_response_whole(cx) {
-        req.headers.remove("range");
-        req.headers.remove("if-range");
+/// signature covers the request as it leaves. Whether anything was
+/// dropped: the request facts are then settled again.
+pub(crate) fn request_whole(cx: &FlowCx, req: &mut CanonicalRequest) -> bool {
+    if !reads_response_whole(cx) {
+        return false;
     }
+    req.headers.remove("range") + req.headers.remove("if-range") > 0
 }
 
 /// The codings `res`'s body is to be decoded from for `need`: none when
