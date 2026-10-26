@@ -105,8 +105,9 @@ and the flow log records the rules' decision.
 ## Streams, not messages
 
 Rules read body text as it streams, holding back the last few bytes (as
-many as the longest string they compare with), so nothing they would
-refuse is sent first. A
+many as the longest string they compare with), so the text that decides
+a rule against a body is never sent before the rule stops the exchange
+([body rules](/reference/rule-language#body-rules)). A
 body is buffered only to sign it, to hand it whole to an addon, or to
 check a WebSocket message, up to a cap, and all buffers together stay
 within one process-wide budget

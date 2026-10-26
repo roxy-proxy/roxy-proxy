@@ -187,6 +187,16 @@ sees of it says nothing about the rules' text, and a `contains` that
 fires stops the exchange with none of the match sent. A streamed body
 reaches the other side that many bytes behind until it ends.
 
+The hold covers the comparison that decides the rule. A rule that makes
+two comparisons on the same body (`body.text contains "a" and
+body.text ends_with "z"`) fires when the last of them is decided, and
+by then the text that decided an earlier one may have left: where that
+matters, write one comparison per rule. `body.bytes` and
+`response.body.bytes` count the bytes forwarded so far, so while a body
+rule holds bytes back they run behind the text the rules have read; a
+rule should not combine a text comparison with a byte count on the same
+body.
+
 When a rule fires mid-body, the exchange stops there. The upstream has
 the request head and the body up to the held bytes, and the request is
 cut. If the response head has not gone, the client gets the deny
@@ -203,5 +213,6 @@ partial response (`206`) that comes back anyway fails closed
 The text is the body decoded from its `content-encoding`
 ([content codings](/reference/http#content-codings)). A body that cannot
 be decoded, or is in a coding roxy does not decode, fails closed
-(`body_decode_failed`, `unsupported_content_encoding`). An empty body is
-the empty string.
+(`body_decode_failed`, `unsupported_content_encoding`), as does one whose
+coder the [buffer budget](/reference/limits#buffer-budget) cannot cover
+(`buffer_budget_exhausted`). An empty body is the empty string.
