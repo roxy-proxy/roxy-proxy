@@ -70,7 +70,7 @@ A quarantine makes roxy refuse every request, whatever the policy says,
 until someone lifts it from outside the process. It is for a workload
 that has shown itself hostile. It survives reloads and restarts.
 
-Three things can trip it:
+Four things can trip it:
 
 - a rule's `quarantine` action
   ([actions](/reference/rule-language#actions));
@@ -80,7 +80,10 @@ Three things can trip it:
   malformed requests within the window
   ([listener modes](/reference/http#listener-modes)). Timeouts and
   clients that disconnect do not count. Use it on a sandbox's listener,
-  never a gateway's.
+  never a gateway's;
+- an injected secret found in a response, with
+  `http.redact_response_secrets.quarantine` on
+  ([secrets](/reference/secrets#redacting-responses)).
 
 While quarantined, every request is refused with `403` and
 `terminal_rule: _quarantined`. Open connections are closed after one

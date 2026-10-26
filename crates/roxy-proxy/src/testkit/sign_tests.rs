@@ -189,6 +189,52 @@ async fn s3_signs_the_payload_hash_or_streams_an_unsigned_payload() {
     assert_eq!(seen[0].body.len(), 4096);
 }
 
+/// `range` goes before the signature is made: with masking on, a request
+/// that injected a secret goes without `range`, and the signature covers
+/// the request as it leaves rather than naming a header that is no
+/// longer there.
+#[tokio::test]
+async fn a_range_dropped_for_masking_is_dropped_before_signing() {
+    let kit = signing("s3", "")
+        .secret("apikey", "s3cr3t-api-key-0123456789")
+        .rules(&format!(
+            r#"
+- id: key
+  when: host == "up.test"
+  then:
+    - set_header: {{ x-api-key: "${{secret:apikey}}" }}
+{}"#,
+            rules("s3", "")
+        ))
+        .http(|h| {
+            h.redact_response_secrets = crate::config::ResponseRedaction {
+                headers: true,
+                bodies: true,
+                quarantine: false,
+                min_length: 8,
+            };
+        })
+        .start()
+        .await;
+    let a = kit
+        .h1()
+        .await
+        .call("GET", "/bucket/key", &[("range", "bytes=0-9")], b"")
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert!(
+        !seen[0].headers.contains_key("range"),
+        "{:?}",
+        seen[0].headers
+    );
+    let auth = seen[0].headers["authorization"].to_str().unwrap();
+    assert!(
+        !signed_headers(auth).split(';').any(|h| h == "range"),
+        "{auth}"
+    );
+}
+
 /// A presigned request goes out under its query signature alone: roxy
 /// adds no signature, strips the client's signature headers, and records
 /// the passthrough so the log shows the request left without roxy's

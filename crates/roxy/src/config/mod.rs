@@ -243,6 +243,32 @@ pub struct Http {
     /// Decode bodies for the addons.
     /// Default true.
     pub decode_for_addons: bool,
+    /// Scrub injected secrets from responses.
+    pub redact_response_secrets: RedactResponseSecrets,
+}
+
+/// `http.redact_response_secrets`: which parts of a response are scrubbed.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RedactResponseSecrets {
+    pub headers: bool,
+    pub bodies: bool,
+    /// Quarantine the process when a scrubbed part held a secret.
+    pub quarantine: bool,
+    /// Values shorter than this many bytes are not masked.
+    pub min_length: usize,
+}
+
+impl Default for RedactResponseSecrets {
+    fn default() -> Self {
+        let d = roxy_proxy::ResponseRedaction::default();
+        Self {
+            headers: d.headers,
+            bodies: d.bodies,
+            quarantine: d.quarantine,
+            min_length: d.min_length,
+        }
+    }
 }
 
 impl Default for Http {
@@ -258,6 +284,7 @@ impl Default for Http {
             enable_h2: true,
             strip_accept_encoding: false,
             decode_for_addons: true,
+            redact_response_secrets: RedactResponseSecrets::default(),
         }
     }
 }
@@ -835,8 +862,8 @@ impl Config {
     }
 
     /// Whether anything can quarantine the process: a `quarantine` action,
-    /// a listener's `quarantine_on` or an addon holding the `quarantine`
-    /// capability. Such a config needs a state dir to keep the quarantine
+    /// a listener's `quarantine_on`, an addon holding the `quarantine`
+    /// capability or `http.redact_response_secrets.quarantine`. Such a config needs a state dir to keep the quarantine
     /// across restarts.
     pub fn uses_quarantine(&self) -> bool {
         self.listeners.iter().any(|l| l.quarantine_on.is_some())
@@ -849,6 +876,7 @@ impl Config {
                 .addons
                 .iter()
                 .any(|a| a.capabilities.contains(&Capability::Quarantine))
+            || self.http.redact_response_secrets.quarantine
     }
 }
 

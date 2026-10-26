@@ -199,11 +199,21 @@ through unchanged. Size and time limits are in
 
 ## Content codings
 
-roxy decodes `content-encoding` only to inspect a body. `body.text` and
-`response.body.text` see the decoded text, while the bytes forwarded are
-the bytes received ([body rules](/reference/rule-language#body-rules)).
-Addons are the exception: by default they get decoded bodies
-([content codings for addons](/reference/addon-configuration#content-codings)).
+For the rules, roxy decodes `content-encoding` only to inspect a body.
+`body.text` and `response.body.text` see the decoded text, while the
+bytes forwarded are the bytes received
+([body rules](/reference/rule-language#body-rules)).
+
+Addons that read bodies
+([content codings for addons](/reference/addon-configuration#content-codings))
+and the masking of secrets
+([redacting responses](/reference/secrets#redacting-responses)) need plain
+bytes. For them, roxy decompresses a body once and compresses it again in
+the same coding before it leaves, so the client and the upstream always
+get the coding they asked for. Compression uses fast settings and sends
+each chunk as soon as it is ready, so streams are not delayed. A body
+compressed again has no `content-length`. The capture, `response.body.bytes`
+and the `response_bytes` metric see a response as the upstream sent it.
 
 roxy decodes `gzip`, `x-gzip`, `deflate`, `br` and `zstd`, stacked up to
 four deep. Decoding is strict: a truncated or corrupt body cannot be

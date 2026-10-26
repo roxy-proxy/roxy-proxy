@@ -3396,16 +3396,13 @@ async fn a_head_only_observer_costs_no_copy() {
 }
 
 /// A body no layer is subscribed to is not decoded: the upstream gets the
-/// client's bytes with their `content-encoding`, where a layer that reads
-/// the body gets it decoded and the upstream the decoded bytes.
+/// client's bytes. A layer that reads the body gets it decoded, and the
+/// upstream gets it encoded again in the client's coding.
 #[tokio::test]
 async fn an_unsubscribed_body_is_not_decoded() {
     use crate::addons::Part;
     let gz = gzip(b"hello");
-    for (request, upstream_body, encoded) in [
-        (Part::Head, gz.clone(), true),
-        (Part::Full, b"hello".to_vec(), false),
-    ] {
+    for (request, same_bytes) in [(Part::Head, true), (Part::Full, false)] {
         let kit = one(AddonDef::test_layer("t").subscribe(request, Part::Head)).await;
         let mut c = kit.h1().await;
         let req = c
@@ -3415,13 +3412,16 @@ async fn an_unsubscribed_body_is_not_decoded() {
         let a = Answer::read(c.send(req).await.unwrap()).await;
         assert_eq!(a.status, 200, "{request:?}: {a:?}");
         let seen = kit.upstream.wait_seen(1).await;
-        assert_eq!(seen[0].body, upstream_body, "{request:?}");
-        assert_eq!(
-            seen[0].headers.contains_key("content-encoding"),
-            encoded,
-            "{request:?}: {:?}",
-            seen[0].headers
-        );
+        assert_eq!(seen[0].body == gz, same_bytes, "{request:?}");
+        assert_eq!(seen[0].headers["content-encoding"], "gzip", "{request:?}");
+        let plain = roxy_http::coding::decode(
+            &[roxy_http::coding::Coding::Gzip],
+            &seen[0].body,
+            1 << 20,
+            roxy_http::coding::unmetered(),
+        )
+        .unwrap();
+        assert_eq!(plain, b"hello", "{request:?}");
     }
 }
 

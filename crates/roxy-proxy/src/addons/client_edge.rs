@@ -162,6 +162,11 @@ pub(super) fn stack_outcome(
     let upgraded_body =
         (resp.status() == StatusCode::SWITCHING_PROTOCOLS).then(|| std::mem::take(resp.body_mut()));
     let mut res = from_upstream_response(resp, &st.snap.limits);
+    if answered.is_none() {
+        // The core's response, decoded there: encoded again for the client.
+        res.meta.decoded_from = std::mem::take(&mut *super::lock(&st.response_codings));
+        crate::recode::encode_response(&st.shared, &mut res);
+    }
     res.body = gated(std::mem::take(&mut res.body), st.shared.sink.clone());
     if st.close.load(Ordering::Relaxed) {
         res.meta.close = true;

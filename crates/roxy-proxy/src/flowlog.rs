@@ -21,11 +21,15 @@ use std::task::{Context, Poll};
 use roxy_log::{LogWriter, RotateOptions, RotatingFile, Stream, WriterOptions};
 use roxy_rules::RuleId;
 
+use crate::needles::Needles;
+
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::ser::SerializeSeq;
 use serde::{Serialize, Serializer};
 
-/// Replacement text for redacted values.
+/// Replacement text for redacted values: a secret, or the whole value of a
+/// redacted header. Unlike the masking of a response, which must keep
+/// lengths, it says nothing of the value's length.
 pub const REDACTED: &str = "[REDACTED]";
 
 /// Header names whose values are never logged. `log.redact_headers`
@@ -789,7 +793,7 @@ impl FlowSink for MemorySink {
 /// Scrubs secret values and sensitive headers from logged strings.
 #[derive(Debug, Clone)]
 pub struct Redactor {
-    secrets: Vec<String>,
+    needles: Needles,
     headers: HashSet<String>,
 }
 
@@ -803,7 +807,7 @@ impl Redactor {
     /// A redactor with no secrets and the default redacted headers.
     pub fn new() -> Self {
         Self {
-            secrets: Vec::new(),
+            needles: Needles::default(),
             headers: DEFAULT_REDACTED_HEADERS
                 .iter()
                 .map(|h| (*h).to_owned())
@@ -813,10 +817,7 @@ impl Redactor {
 
     /// Register a secret value. Empty strings are ignored.
     pub fn add_secret(&mut self, secret: impl Into<String>) {
-        let secret = secret.into();
-        if !secret.is_empty() && !self.secrets.contains(&secret) {
-            self.secrets.push(secret);
-        }
+        self.needles.add(secret);
     }
 
     /// Add a header name (case-insensitive) whose values are never logged.
@@ -832,38 +833,7 @@ impl Redactor {
     /// Replace every occurrence of a registered secret in `s` with
     /// [`REDACTED`]. Overlapping occurrences are merged into one marker.
     pub fn redact_str<'a>(&self, s: &'a str) -> Cow<'a, str> {
-        let mut ranges: Vec<(usize, usize)> = Vec::new();
-        for secret in &self.secrets {
-            // Find every start position, including overlapping ones.
-            let mut from = 0;
-            while let Some(i) = s[from..].find(secret.as_str()) {
-                let start = from + i;
-                ranges.push((start, start + secret.len()));
-                // Advance by one char so overlapping matches are found.
-                from = start + s[start..].chars().next().map_or(1, char::len_utf8);
-            }
-        }
-        if ranges.is_empty() {
-            return Cow::Borrowed(s);
-        }
-        ranges.sort_unstable();
-        let mut out = String::with_capacity(s.len());
-        let mut pos = 0;
-        let mut iter = ranges.into_iter().peekable();
-        while let Some((start, mut end)) = iter.next() {
-            while let Some(&(next_start, next_end)) = iter.peek() {
-                if next_start > end {
-                    break;
-                }
-                end = end.max(next_end);
-                iter.next();
-            }
-            out.push_str(&s[pos..start]);
-            out.push_str(REDACTED);
-            pos = end;
-        }
-        out.push_str(&s[pos..]);
-        Cow::Owned(out)
+        self.needles.replace_str(s, REDACTED)
     }
 
     /// The loggable form of a header value: [`REDACTED`] for redacted header

@@ -22,7 +22,9 @@ but roxy still bounds their size and time and re-frames them.
 - request smuggling and desync through ambiguous framing, on either side
   of roxy;
 - exfiltrating real credentials: with secret injection the client only
-  holds placeholders;
+  holds placeholders. An allowed upstream that echoes an injected value
+  back is outside this, but `http.redact_response_secrets` masks a
+  verbatim echo ([secrets](/reference/secrets#redacting-responses));
 - unbounded memory or connection use from slow clients, huge headers,
   huge bodies and key churn, within the configured limits;
 - learning anything from a deny beyond the rule id.

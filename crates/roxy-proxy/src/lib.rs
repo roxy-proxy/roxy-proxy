@@ -35,6 +35,10 @@
 //!   backpressure, rotation).
 //! - [`io`]: stream adapters.
 //! - `budget`: the process-wide byte budget for per-exchange buffers.
+//! - [`needles`]: the secret matcher and its byte-for-byte mask, shared
+//!   by the flow log's redaction and the response masking.
+//! - `redact`: masking injected secrets in a response, head and streaming
+//!   body.
 
 pub mod addons;
 pub mod addr;
@@ -52,8 +56,11 @@ mod h2conn;
 mod in_flight;
 pub mod io;
 pub mod listener;
+pub mod needles;
 mod pipeline;
 pub mod quarantine;
+mod recode;
+mod redact;
 pub mod secrets;
 pub mod server;
 mod sign;
@@ -66,7 +73,7 @@ mod view;
 pub use addrlist::{AddressList, AddressLists, ListError};
 pub use ca_server::{PEM_CONTENT_TYPE, POLICY_HEADER};
 pub use capture::{CAPTURE_FILE, CaptureLog, CaptureOptions};
-pub use config::{HttpBehaviour, ListenerSpec, PolicyUpdate, RuntimeConfig};
+pub use config::{HttpBehaviour, ListenerSpec, PolicyUpdate, ResponseRedaction, RuntimeConfig};
 pub use conn::INTERNAL_HOST;
 pub use flowlog::{
     BufferedSink, ClientInfo, DEFAULT_REDACTED_HEADERS, DecisionKind, DstInfo, FileSink, FlowEvent,

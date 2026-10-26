@@ -10,10 +10,9 @@ use std::sync::{Arc, Mutex};
 
 use roxy_wasm::{LayerError, LayerRequest, LayerResponse};
 
+use super::attribution::{Side, attributed};
 use super::chain::{Head, Headless, LaneRx, LaneTx, LayerIo, StageHandle};
-use super::{
-    AddonImpl, AddonMode, StackError, StackFlow, decode, lock, select, service, subscribe, tee,
-};
+use super::{AddonImpl, AddonMode, StackError, StackFlow, lock, select, service, subscribe, tee};
 
 /// A layer's ends of the hop upstream of it: where its forward goes, and
 /// where the response to it comes back.
@@ -136,7 +135,7 @@ async fn enter(
         && addon.subscribe.request == subscribe::Part::Full
         && !st.request_decoded.swap(true, Ordering::SeqCst)
     {
-        decode::request(st, &mut req, st.snap.limits.max_request_body_bytes);
+        decode_request(st, &mut req);
     }
     if addon.mode == AddonMode::Observe {
         return Entered::Through(tee::observe(st.clone(), index, req).await);
@@ -206,4 +205,21 @@ pub(super) async fn forward_lanes(
         unreachable!("a response lane carries responses")
     };
     Ok(http::Response::from_parts(parts, body))
+}
+
+/// Decodes a request on its way into the first layer that reads it, so a
+/// layer reads what the client meant rather than its compression; the core
+/// encodes it again ([`crate::recode`]). A decoded body is attributed to
+/// the client, so one the budget cannot cover fails as the budget's, not
+/// the reader's.
+fn decode_request(st: &Arc<StackFlow>, req: &mut LayerRequest) {
+    let mut body = std::mem::take(req.body_mut());
+    let limit = st.snap.limits.max_request_body_bytes;
+    let codings = crate::recode::request(&st.shared, req.headers_mut(), &mut body, limit);
+    *req.body_mut() = if codings.is_empty() {
+        body
+    } else {
+        attributed(st, Side::Client, body)
+    };
+    *lock(&st.request_codings) = codings;
 }

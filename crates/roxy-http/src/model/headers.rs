@@ -452,6 +452,17 @@ impl Headers {
         before.saturating_sub(self.entries.len())
     }
 
+    /// Replaces each value for which `f` returns a new one, in place. `f`
+    /// must keep the value invariants (it is handed values already valid,
+    /// obs-text included, and should only substitute visible ASCII).
+    pub fn replace_values(&mut self, mut f: impl FnMut(&HeaderValue) -> Option<HeaderValue>) {
+        for (_, v) in &mut self.entries {
+            if let Some(new) = f(v) {
+                *v = new;
+            }
+        }
+    }
+
     /// Fields in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = (&HeaderName, &HeaderValue)> {
         self.entries.iter().map(|(n, v)| (n, v))

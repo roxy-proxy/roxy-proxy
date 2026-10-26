@@ -39,8 +39,9 @@
 //!
 //! Every string in a captured *head* passes through the exchange's
 //! redactor, so an injected secret value (which the agent never saw) is
-//! scrubbed wherever it appears. Bodies are captured as they are,
-//! unredacted.
+//! scrubbed wherever it appears. Bodies are captured as they cross
+//! roxy's edge, unredacted: a response body as the upstream sent it,
+//! before any decoding or the masking of secrets.
 
 use std::fmt::Write as _;
 use std::io;
@@ -234,7 +235,8 @@ impl Tap {
         self.head(v);
     }
 
-    /// The canonical response head, as sent to the client.
+    /// The canonical response head, after the response rules' effects and
+    /// before anything decodes or masks the response.
     pub(crate) fn response_head(&mut self, res: &CanonicalResponse) {
         let v = serde_json::json!({
             "status": res.status.as_u16(),

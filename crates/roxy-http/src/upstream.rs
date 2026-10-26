@@ -96,7 +96,9 @@ pub fn to_upstream_upgrade_request(
     Ok(out)
 }
 
-fn single_content_length(map: &HeaderMap) -> Option<u64> {
+/// The length a field list declares, if it holds exactly one valid
+/// `content-length` (OWS-trimmed, as admission reads it).
+pub fn single_content_length(map: &HeaderMap) -> Option<u64> {
     let mut it = map.get_all(CONTENT_LENGTH).iter();
     let v = it.next()?;
     if it.next().is_some() {
@@ -133,6 +135,7 @@ where
         // The upstream's `connection: close` concerns roxy's upstream
         // connection only; it must not close the client's.
         close: false,
+        decoded_from: Vec::new(),
     };
     CanonicalResponse {
         status: parts.status,

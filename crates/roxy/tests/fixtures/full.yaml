@@ -29,6 +29,11 @@ http:
   enable_h2: true             # client-side HTTP/2 via ALPN h2 (default true; false = http/1.1 only)
   strip_accept_encoding: false  # remove accept-encoding so origins answer uncompressed
   decode_for_addons: true     # addons see decoded bodies, without content-encoding
+  redact_response_secrets:    # scrub injected secrets from the responses of the exchanges that injected them
+    headers: false
+    bodies: false
+    quarantine: false         # quarantine the process when a scrubbed part held a secret
+    min_length: 8             # injected values shorter than this are not masked
 
 limits:
   max_header_bytes: 64kb

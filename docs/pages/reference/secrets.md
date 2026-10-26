@@ -28,6 +28,67 @@ rules:
   target. Make sure a rule that injects a secret cannot match a request
   that another rule redirects elsewhere.
 
+## Redacting responses
+
+An upstream can echo an injected value back, for example in an error page
+that quotes `authorization`, or in a `location` header that carries a key.
+The client would then see the real value. `http.redact_response_secrets`
+masks it in the response:
+
+```yaml
+http:
+  redact_response_secrets:
+    headers: true      # response header and trailer values
+    bodies: true       # the response body, as it streams
+    quarantine: false  # quarantine roxy when a secret is found
+    min_length: 8      # shorter values are not masked
+```
+
+All three switches are off by default.
+
+- **What is masked:** only the values that this exchange's `set_header`
+  actions filled in from `${secret:..}`. A secret roxy did not put in the
+  request is left alone. Values that `sign` sends (the access key id and
+  session token) are not masked, because neither works without the secret
+  key, which never leaves roxy.
+- **How:** each byte becomes `*`, so a value keeps its length. An
+  uncompressed body keeps its `content-length`.
+- **`min_length`** (at least 1): shorter values are not masked, since a
+  short value would match unrelated text.
+- **Headers:** every header and trailer value, including a `101`'s.
+  Header names are not changed.
+- **Bodies:** masked as they stream. The last bytes of what has arrived,
+  one fewer than the longest injected value, wait for the next chunk or
+  the end of the body, whatever they are, so what the client sees of the
+  wait says nothing about the secret. A streamed chunk therefore reaches
+  the client complete only when the next one arrives: a server-sent event
+  stream runs one event behind.
+- **Compressed bodies:** roxy decompresses the body, masks it and
+  compresses it again in the same coding
+  ([content codings](/reference/http#content-codings)). A body roxy cannot
+  decompress is refused with `503` and reason
+  `unsupported_content_encoding` rather than sent unmasked.
+- **Ranges:** with `bodies` on, roxy drops `range` and `if-range` from a
+  request that injected a secret, so the upstream sends the whole body. A
+  range could cut a secret so that no whole copy of it is in the
+  response, and the client chooses where the range starts and ends. A
+  partial response (`206`) that comes back anyway is refused with `503`
+  and reason `partial_response`.
+- **Who sees it masked:** addons and the client. The response rules,
+  `response.body.text`, the in-flight byte counts and the capture see the
+  response as the upstream sent it, so a captured body holds an echoed
+  secret ([capture](/reference/flow-log#capture)).
+- **`quarantine: true`** quarantines roxy when a secret is found, with the
+  cause `{"kind": "secret_in_response", "flow", "part"}`, where `part` is
+  `headers`, `body` or `trailers` ([quarantine](/guides/operations#quarantine)).
+  A secret in the headers refuses that exchange; one in the body is masked.
+  It needs `headers` or `bodies` on, and `roxy run --state-dir`. Without
+  it, a found secret is logged as a warning.
+- **Limits:** the match is on the exact bytes, so a value the upstream
+  changes (base64, escaping, a change of case) is not caught. This stops
+  careless echoes, not a hostile upstream: choosing which hosts get a
+  secret is the real control. WebSocket messages are not masked.
+
 ## Signing AWS requests
 
 The `sign` action signs the forwarded request with AWS Signature Version

@@ -651,8 +651,8 @@ fn quarantine_on_floors() {
 }
 
 /// A config can quarantine through a listener threshold, a `quarantine`
-/// action or an addon granted `quarantine`; a `deny` or another capability
-/// is not enough.
+/// action, an addon granted `quarantine` or a secret found in a response;
+/// a `deny` or another capability is not enough.
 #[test]
 fn uses_quarantine_sees_every_trigger() {
     assert!(!parse(BASE).uses_quarantine());
@@ -679,6 +679,36 @@ fn uses_quarantine_sees_every_trigger() {
     };
     assert!(!with_cap("log"));
     assert!(with_cap("log, quarantine"));
+    let redact = |switches: &str| {
+        parse(&format!(
+            "{BASE}http: {{ redact_response_secrets: {{ {switches} }} }}\n"
+        ))
+        .uses_quarantine()
+    };
+    assert!(!redact("headers: true, bodies: true"));
+    assert!(redact("bodies: true, quarantine: true"));
+}
+
+/// `quarantine` finds secrets only in the parts it scrubs, so on its own
+/// it would never fire; a `min_length` of 0 would mask nothing useful.
+#[test]
+fn redaction_quarantine_needs_a_part_to_scrub() {
+    let d = diagnostics(&format!(
+        "{BASE}http: {{ redact_response_secrets: {{ quarantine: true }} }}\n"
+    ));
+    assert_eq!(d.len(), 1, "{d:?}");
+    assert_eq!(d[0].path, "http.redact_response_secrets.quarantine");
+    let d = diagnostics(&format!(
+        "{BASE}http: {{ redact_response_secrets: {{ bodies: true, min_length: 0 }} }}\n"
+    ));
+    assert_eq!(d[0].path, "http.redact_response_secrets.min_length");
+    for part in ["headers", "bodies"] {
+        parse(&format!(
+            "{BASE}http: {{ redact_response_secrets: {{ {part}: true, quarantine: true }} }}\n"
+        ))
+        .validate()
+        .unwrap();
+    }
 }
 
 #[test]

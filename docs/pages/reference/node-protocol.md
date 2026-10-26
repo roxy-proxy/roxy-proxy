@@ -127,7 +127,7 @@ state:
 |---|---|
 | `id` | the incident's id, which a release must name |
 | `since` | when it was tripped, by the node's clock |
-| `cause` | what tripped it: `kind: rule` with the `rule` and `flow`, `kind: threshold` with the `listener` and its threshold, or `kind: layer` with the `layer` and `flow` |
+| `cause` | what tripped it: `kind: rule` with the `rule` and `flow`, `kind: threshold` with the `listener` and its threshold, `kind: layer` with the `layer` and `flow`, or `kind: secret_in_response` with the `flow` and the `part` (`headers`, `body` or `trailers`) |
 
 The server answers `200` with the whole lease on every poll, or an
 [error](/reference/node-protocol#errors).

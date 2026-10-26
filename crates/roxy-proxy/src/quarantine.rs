@@ -1,7 +1,8 @@
 //! Quarantine: a process-wide state in which every exchange is refused
 //! with `403` and rule id `_quarantined`, before the addons and the rules
-//! run. It is tripped by a rule's `quarantine` action or by a listener's
-//! parse-error threshold, written to a marker file so it survives a
+//! run. It is tripped by a rule's `quarantine` action, an addon layer, a
+//! listener's parse-error threshold or an injected secret found in a
+//! response, written to a marker file so it survives a
 //! restart, and lifted only from outside the process: a control plane's
 //! release, or an operator removing the marker before a restart.
 
@@ -33,6 +34,9 @@ pub enum QuarantineCause {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         call: Option<u64>,
     },
+    /// A secret the exchange injected came back in its response, under
+    /// `http.redact_response_secrets.quarantine`.
+    SecretInResponse { flow: String, part: ResponsePart },
     /// A listener's parse-error threshold was reached.
     Threshold {
         listener: String,
@@ -40,6 +44,15 @@ pub enum QuarantineCause {
         count: u32,
         window_seconds: u64,
     },
+}
+
+/// The part of a response a secret was found in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResponsePart {
+    Headers,
+    Body,
+    Trailers,
 }
 
 /// One quarantine incident. `id` is minted here per trip; a release names

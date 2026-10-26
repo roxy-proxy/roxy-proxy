@@ -354,7 +354,15 @@ pub(crate) async fn request_steps(
         Verdict::Close(e) => return Verdict::Close(e),
     };
     match request_rules(cx, req) {
-        Verdict::Continue(req) => sign_request(cx, req, io).await,
+        Verdict::Continue(mut req) => {
+            // Settled with the effects, and before the signature, which
+            // covers the request as it leaves. The in-flight rules and the
+            // log see the request without the dropped fields.
+            if crate::redact::request(cx, &mut req) {
+                settle_request_facts(cx, &req);
+            }
+            sign_request(cx, req, io).await
+        }
         Verdict::Deny(d) => Verdict::Deny(d),
         Verdict::Close(e) => Verdict::Close(e),
     }
@@ -563,6 +571,9 @@ pub(crate) struct FlowCx {
     /// A `sign` effect of the admission decision, applied once every other
     /// request change has settled.
     pub sign: Option<AwsSigV4>,
+    /// The secret values `set_header` effects put into the forwarded
+    /// request: what an upstream could echo that the client never held.
+    pub injected: Vec<String>,
     /// Request body bytes forwarded so far (and their digest once the
     /// body completed), once the request is on its way.
     pub request_tally: Option<Arc<crate::body::Tally>>,
@@ -575,6 +586,8 @@ pub(crate) struct FlowCx {
     /// An addon layer that ran on this request reads a body: on an upgrade,
     /// it is in the WebSocket's byte path.
     pub layer_reads_bytes: bool,
+    /// Where the core hands its response, and what it decoded it from.
+    pub response_leg: crate::recode::Leg,
     /// The exchange's share of the buffer budget, held until it ends: the
     /// buffered body text stays with the facts for as long as the flow.
     pub buffers: Vec<BufferLease>,
@@ -710,6 +723,7 @@ impl FlowCx {
             taps: PerDir::default(),
             host_override: None,
             sign: None,
+            injected: Vec::new(),
             request_tally: None,
             request_delivery: None,
             tasks: {
@@ -719,6 +733,7 @@ impl FlowCx {
             },
             stack: None,
             layer_reads_bytes: false,
+            response_leg: crate::recode::Leg::Direct,
             buffers: Vec::new(),
             logged: false,
         })
@@ -1112,7 +1127,7 @@ async fn inspect_request_body(
 
 /// A body that carries no bytes needs no inspection buffer; the rules see
 /// it as empty text.
-fn known_empty(body: &Body) -> bool {
+pub(crate) fn known_empty(body: &Body) -> bool {
     body.known_length() == Some(0) || http_body::Body::is_end_stream(body)
 }
 
@@ -1365,6 +1380,15 @@ fn apply_request_effect(
             req.headers
                 .insert(&name, value.as_str())
                 .map_err(|e| invalid(kind, &e))?;
+            // The header value goes out OWS-trimmed, so a secret at either
+            // end loses its edge spaces; the trimmed form is what the
+            // upstream can echo.
+            cx.injected.extend(
+                value
+                    .secrets()
+                    .iter()
+                    .map(|s| s.trim_matches([' ', '\t']).to_owned()),
+            );
             cx.record.mutations.push(format!("set_header:{name}"));
         }
         Effect::RemoveHeader(name) => {
@@ -1524,15 +1548,20 @@ async fn inspect_response_body(
 }
 
 /// A response with no body by its status, its framing, or because the
-/// request was a `HEAD`.
-fn response_known_empty(cx: &FlowCx, res: &CanonicalResponse) -> bool {
+/// request was a `HEAD`. A body of length 0 can still end with trailers.
+pub(crate) fn response_known_empty(cx: &FlowCx, res: &CanonicalResponse) -> bool {
+    response_bodiless(cx, res) || known_empty(&res.body)
+}
+
+/// A response with no body by its status or because the request was a
+/// `HEAD`, so no trailers either.
+pub(crate) fn response_bodiless(cx: &FlowCx, res: &CanonicalResponse) -> bool {
     status_forbids_body(res.status)
         || cx
             .facts
             .request
             .as_ref()
             .is_some_and(|r| r.method == Method::Head)
-        || known_empty(&res.body)
 }
 
 /// The in-flight rules at the response head: they may stop the

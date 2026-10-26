@@ -20,7 +20,6 @@ pub(crate) mod attribution;
 mod chain;
 mod client_edge;
 mod core_edge;
-mod decode;
 mod endpoint;
 mod host;
 mod layer;
@@ -224,6 +223,12 @@ pub(crate) struct StackFlow {
     pub(crate) close: AtomicBool,
     /// The first layer to run has decoded the request for the layers.
     request_decoded: AtomicBool,
+    /// What the request was decoded from for the layers, to encode it in
+    /// again as it reaches the core.
+    request_codings: Mutex<Vec<roxy_http::coding::Coding>>,
+    /// What the core decoded its response from, to encode it in again at
+    /// the client edge.
+    response_codings: Mutex<Vec<roxy_http::coding::Coding>>,
     upgrade_tx: Mutex<Option<tokio::sync::oneshot::Sender<ws::Upgrade>>>,
     upgrade_rx: Mutex<Option<tokio::sync::oneshot::Receiver<ws::Upgrade>>>,
     /// Permits for the exchange's endpoint calls in flight.
@@ -259,6 +264,8 @@ impl StackFlow {
             attribution: Attribution::new(cx.meta.clone()),
             close: AtomicBool::new(false),
             request_decoded: AtomicBool::new(false),
+            request_codings: Mutex::new(Vec::new()),
+            response_codings: Mutex::new(Vec::new()),
             upgrade_tx: Mutex::new(Some(upgrade_tx)),
             upgrade_rx: Mutex::new(Some(upgrade_rx)),
             endpoint_calls: Arc::new(tokio::sync::Semaphore::new(

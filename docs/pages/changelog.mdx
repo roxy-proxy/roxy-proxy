@@ -6,7 +6,7 @@ come first. Each release's GitHub page lists every merged pull request.
 
 ## Unreleased
 
-The request trailers a service layer passes on are validated as a client's before they reach an origin, captures are written as JSON lines for line-oriented shippers, and upstream TLS no longer trusts the compromised eMudhra emSign hierarchy.
+The request trailers a service layer passes on are validated as a client's before they reach an origin, captures are written as JSON lines for line-oriented shippers, upstream TLS no longer trusts the compromised eMudhra emSign hierarchy, injected secrets can be masked in the responses of the exchanges that injected them, and bodies decoded for addons leave in the coding they came in.
 
 <details>
 <summary>Details</summary>
@@ -17,6 +17,11 @@ The request trailers a service layer passes on are validated as a client's befor
 - The flow log's `forward_aborted`, `answer_aborted` and `upstream_aborted` reasons are one, `layer_aborted`. A cut that follows a fault or the client's loss is no longer a layer's abort, so a body cut on its way through a layer is the client's or the upstream's. A layer's answer is its own when it gives it before taking the response from upstream, whether or not that response had arrived ([#593](https://github.com/roxy-proxy/roxy-proxy/issues/593)).
 - A raw backtick in an HTTP/1 request path is rejected with `invalid_path` instead of being percent-encoded; HTTP/2 already refused it. In a query it is still percent-encoded to `%60` ([#582](https://github.com/roxy-proxy/roxy-proxy/pull/582)).
 - Capture is written to `capture.jsonl` with one JSON object per line, in place of `capture.rxc` and its length-framed records: the head nested under `head`, body bytes base64 under `data`, and at most 48 KiB of body per line. A line-oriented shipper such as Vector or Fluent Bit can take the file as it is ([#527](https://github.com/roxy-proxy/roxy-proxy/issues/527)).
+- A body decoded for addon layers (`http.decode_for_addons`) is encoded again in its codings as it leaves the stack, so the client and the origin get the coding they negotiated, where they used to get it uncompressed ([#603](https://github.com/roxy-proxy/roxy-proxy/issues/603)).
+
+### Added
+
+- `http.redact_response_secrets` masks the secret values an exchange's `set_header` effects injected, byte for byte with `*`, in the response head and trailers (`headers`) and in the body as it streams (`bodies`), holding back the last bytes of what has arrived (one fewer than the longest injected value) until the next chunk or the end, whatever they are, so a streamed event arrives one chunk late. Values under `min_length` bytes (default 8) are left alone. With `bodies`, an encoded response is decoded, masked and encoded again in the same codings, so the client keeps the coding it negotiated, and a response roxy cannot decode is refused `unsupported_content_encoding`. An injecting request goes without `range` and `if-range`, since a range could split a secret past the mask, and a `206` is refused `partial_response`. `quarantine: true` quarantines the process when a masked part held a secret, with the new cause `secret_in_response` ([#576](https://github.com/roxy-proxy/roxy-proxy/issues/576)).
 
 ### Fixed
 

@@ -916,11 +916,14 @@ fn secrets_are_substituted() {
         [
             Effect::SetHeader {
                 name: "authorization".into(),
-                value: SetHeaderValue::from_secret("Bearer sk-123")
+                value: SetHeaderValue::from_secrets("Bearer sk-123", vec!["sk-123".into()])
             },
             Effect::SetHeader {
                 name: "x-both".into(),
-                value: SetHeaderValue::from_secret("sk-123/ghp_x")
+                value: SetHeaderValue::from_secrets(
+                    "sk-123/ghp_x",
+                    vec!["sk-123".into(), "ghp_x".into()]
+                )
             },
         ]
     );
