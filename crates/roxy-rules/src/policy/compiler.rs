@@ -58,11 +58,14 @@ impl Condition {
 }
 
 /// Headers rules may not set or remove: framing and hop-by-hop headers are
-/// owned by roxy's canonicaliser, and `host` changes go
+/// owned by roxy's canonicaliser, `content-encoding` names the codings
+/// roxy decodes a body from for the rules and masking (a rule changing it
+/// would have them read the coded bytes), and `host` changes go
 /// through `redirect: { rewrite_host: true }`.
 const RESERVED_HEADERS: &[&str] = &[
     "host",
     "content-length",
+    "content-encoding",
     "transfer-encoding",
     "connection",
     "keep-alive",

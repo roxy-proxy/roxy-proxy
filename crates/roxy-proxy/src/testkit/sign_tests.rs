@@ -549,6 +549,44 @@ async fn a_signed_request_keeps_its_trailers() {
     assert_eq!(trailers["x-checksum"], "abc");
 }
 
+/// A signed request of trailers alone, labelled with a coding, has no
+/// text to decode: its tests are settled as an empty body's, and it goes
+/// with no bytes, as the payload hash says.
+#[tokio::test]
+async fn a_signed_encoded_request_of_trailers_alone_goes_without_bytes() {
+    let rules = format!(
+        r#"
+- id: no-secret
+  when: host == "up.test" and body.text contains "SECRET"
+  then: deny
+{}"#,
+        rules("s3", "")
+    );
+    let kit = Kit::builder()
+        .secret("akid", AKID)
+        .secret("sk", SK)
+        .secret("token", TOKEN)
+        .rules(&rules)
+        .flags(|f| f.allow_request_trailers = true)
+        .start()
+        .await;
+    let mut io = super::http_tests::h1_in_tunnel(&kit).await;
+    io.write_all(
+        b"POST /bucket/key HTTP/1.1\r\nhost: up.test\r\ncontent-encoding: gzip\r\ntransfer-encoding: chunked\r\n\r\n0\r\nx-checksum: none\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let (head, _) = super::read_response(&mut io).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].body, b"", "{:?}", seen[0]);
+    assert_eq!(
+        seen[0].headers["x-amz-content-sha256"],
+        super::sha256_hex(b"")
+    );
+    assert_eq!(seen[0].trailers.as_ref().unwrap()["x-checksum"], "none");
+}
+
 #[tokio::test]
 async fn an_h2_signature_covers_the_authority() {
     let kit = signing("bedrock", "").start().await;

@@ -247,6 +247,12 @@ impl Body {
         }
     }
 
+    /// Whether the body is held in memory and not yet polled: [`Self::as_bytes`]
+    /// is its data, or it has none (trailers alone).
+    pub fn is_held(&self) -> bool {
+        matches!(self.inner, Inner::Full { .. })
+    }
+
     /// Buffers the whole body (for inspection paths): its bytes and the
     /// trailers that followed them. Fails with [`BodyError::TooLarge`] as
     /// soon as more than `max` bytes arrive.

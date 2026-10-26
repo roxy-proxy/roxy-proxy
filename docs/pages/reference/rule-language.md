@@ -128,7 +128,7 @@ These add effects:
 
 | action | where | effect |
 |---|---|---|
-| `set_header: { name: value }` | request: admission rules; response: in-flight rules | Set or replace a header. Request values may use `${secret:name}` ([secrets](/reference/secrets)). |
+| `set_header: { name: value }` | request: admission rules; response: in-flight rules | Set or replace a header. Request values may use `${secret:name}` ([secrets](/reference/secrets)). Framing and hop-by-hop headers, `host` and `content-encoding` belong to roxy and cannot be changed. |
 | `remove_header: [names]` | as `set_header` | Remove headers. |
 | `rewrite_path: { match, to }` | admission rules | Rewrite the path with a regex; `$1` and `${name}` refer to groups. |
 | `set_query: { k: v }`, `remove_query: [k]` | admission rules | Change the query. |

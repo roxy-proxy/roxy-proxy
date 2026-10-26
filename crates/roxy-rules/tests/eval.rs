@@ -690,6 +690,29 @@ fn body_text_takes_streamable_comparisons_only() {
     }
 }
 
+/// A rule cannot relabel a body's coding: the body text rules and masking
+/// read the body decoded from it.
+#[test]
+fn rules_cannot_change_content_encoding() {
+    for then in [
+        "{ remove_header: [content-encoding] }",
+        "[{ set_header: { Content-Encoding: identity } }, allow]",
+    ] {
+        let when = if then.contains("allow") {
+            "host == \"a\""
+        } else {
+            "response.status == 200"
+        };
+        let err = try_compile("", &format!("- {{ id: c, when: '{when}', then: {then} }}"))
+            .unwrap_err()
+            .join("\n");
+        assert!(
+            err.contains("header `content-encoding` is managed by roxy"),
+            "{then}: {err}"
+        );
+    }
+}
+
 /// A view whose bodies are being scanned: each test's answer so far.
 struct Scanned(&'static [Option<bool>]);
 

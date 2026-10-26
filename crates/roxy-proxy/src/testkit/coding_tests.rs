@@ -254,6 +254,20 @@ async fn a_decoder_window_the_budget_cannot_cover_fails_closed() {
     assert_cut(&kit, a, "_fail_closed", Some("buffer_budget_exhausted")).await;
 }
 
+/// The same through a layer: the response is encoded again at the
+/// client's edge of the stack, and that encoder's refusal is named too.
+#[tokio::test]
+async fn a_coder_window_the_budget_cannot_cover_under_a_layer_fails_closed() {
+    let kit = Kit::builder()
+        .rules(RULES)
+        .addon(AddonDef::test_layer("a"))
+        .limits(|l| l.max_buffered_bytes = 1024)
+        .start()
+        .await;
+    let a = try_echo(&kit, false, "gzip", gzip(b"hello")).await;
+    assert_cut(&kit, a, "_fail_closed", Some("buffer_budget_exhausted")).await;
+}
+
 #[tokio::test]
 async fn an_unknown_coding_fails_closed() {
     let kit = kit().await;

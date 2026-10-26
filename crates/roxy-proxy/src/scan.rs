@@ -48,7 +48,11 @@ pub(crate) fn request(
     if cx.snap.policy.texts(BodySide::Request).is_empty() {
         return Ok(());
     }
-    if known_empty(&req.body) {
+    // Trailers alone, held to be signed, carry no data either; they must
+    // go as they are, since an encoder would give them bytes the signature
+    // does not cover.
+    let held_empty = req.body.is_held() && req.body.as_bytes().is_none();
+    if known_empty(&req.body) || held_empty {
         return in_flight.on_text_end(Dir::Request).map_err(refusal);
     }
     let Ok(codings) = coding::content_codings(&req.headers) else {
