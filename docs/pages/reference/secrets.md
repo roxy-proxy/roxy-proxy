@@ -57,9 +57,12 @@ All three switches are off by default.
   short value would match unrelated text.
 - **Headers:** every header and trailer value, including a `101`'s.
   Header names are not changed.
-- **Bodies:** masked as they stream. Only bytes that could be the start of
-  a secret wait for the next chunk, so streams such as server-sent events
-  are not delayed.
+- **Bodies:** masked as they stream. The last bytes of what has arrived,
+  one fewer than the longest injected value, wait for the next chunk or
+  the end of the body, whatever they are, so what the client sees of the
+  wait says nothing about the secret. A streamed chunk therefore reaches
+  the client complete only when the next one arrives: a server-sent event
+  stream runs one event behind.
 - **Compressed bodies:** roxy decompresses the body, masks it and
   compresses it again in the same coding
   ([content codings](/reference/http#content-codings)). A body roxy cannot

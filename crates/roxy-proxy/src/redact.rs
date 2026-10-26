@@ -138,23 +138,26 @@ impl Alarm {
 }
 
 /// A response body with secrets masked in its data, its trailers, or
-/// both, as it streams. A secret can straddle two frames, so bytes that
-/// end a frame and begin a secret (at most `longest secret - 1`) are held
-/// back until the next frame or the end shows whether the rest follows.
-/// Nothing else is buffered, so a stream of events is not delayed unless
-/// an event ends in what could start a secret.
+/// both, as it streams. A secret can straddle two frames, so the last
+/// `longest secret - 1` bytes of what has arrived are held back until the
+/// next frame or the end, whatever they are: a hold that depended on the
+/// bytes would tell the client, byte by byte, what the secret begins
+/// with. Nothing else is buffered. The cost is that a frame reaches the
+/// client complete only when the next one, or the end, arrives.
 struct MaskedBody {
     inner: Body,
     needles: Arc<Needles>,
     /// `bodies` masks the data, `headers` the trailers.
     switches: ResponseRedaction,
-    /// `longest secret - 1`: the most a secret can reach back into bytes
-    /// already released.
+    /// `longest secret - 1`: the most of a secret that can have arrived
+    /// without the rest.
     keep: usize,
-    /// Bytes not yet released: a secret could begin in them.
+    /// Bytes not yet released, as the upstream sent them.
     held: Vec<u8>,
-    /// The last `keep` bytes released, unmasked.
-    behind: Vec<u8>,
+    /// How many of the first bytes of `held` are the rest of a secret
+    /// whose start was released masked: they are masked when released,
+    /// whatever else is found around them.
+    pre_masked: usize,
     /// Trailers to send once `held` is flushed.
     pending_trailers: Option<HeaderMap>,
     alarm: Alarm,
@@ -176,7 +179,7 @@ impl MaskedBody {
                 switches,
                 keep,
                 held: Vec::new(),
-                behind: Vec::new(),
+                pre_masked: 0,
                 pending_trailers: None,
                 alarm,
                 found: false,
@@ -188,40 +191,39 @@ impl MaskedBody {
         )
     }
 
-    /// The masked bytes of `held` that no later byte can change, or all of
-    /// it at the end. A match that runs past the hold-back point is
-    /// complete, so it is released whole rather than split. A secret that
-    /// began in bytes already released is found against `behind`, so its
-    /// rest is masked too, and the output is the same however the body is
+    /// All of `held` but its last `keep` bytes, masked, or all of it at the
+    /// end. How much goes depends only on how much has arrived. A secret
+    /// that overlaps the released bytes has arrived whole (it is at most
+    /// `keep + 1` long), so it is found now; the part of it still held is
+    /// remembered as `pre_masked` and masked when it goes, whatever is
+    /// found around it then. The output is the same however the body is
     /// split.
     fn release(&mut self, end: bool) -> Option<Bytes> {
-        let from = self.behind.len();
-        let mut buf = std::mem::take(&mut self.behind);
-        buf.extend_from_slice(&self.held);
-        let ranges = self.needles.ranges(&buf);
-        let mut cut = if end {
-            buf.len()
+        let cut = if end {
+            self.held.len()
         } else {
-            // A secret begun in `behind` may still be arriving: its rest
-            // waits too.
-            (buf.len() - self.needles.partial_suffix(&buf)).max(from)
+            self.held.len().saturating_sub(self.keep)
         };
-        if let Some(&(_, e)) = ranges.iter().find(|&&(s, e)| s < cut && e > cut) {
-            cut = e;
+        if cut == 0 {
+            return None;
         }
-        let mut out = buf[from..cut].to_vec();
-        let mut hit = false;
-        for &(s, e) in ranges.iter().filter(|&&(s, e)| s < cut && e > from) {
-            out[s.max(from) - from..e - from].fill(MASK);
+        let ranges = self.needles.ranges(&self.held);
+        let mut out = self.held[..cut].to_vec();
+        let mut hit = self.pre_masked > 0;
+        out[..self.pre_masked.min(cut)].fill(MASK);
+        let mut pre_masked = self.pre_masked.saturating_sub(cut);
+        for &(s, e) in ranges.iter().filter(|&&(s, _)| s < cut) {
+            out[s..e.min(cut)].fill(MASK);
+            pre_masked = pre_masked.max(e - cut.min(e));
             hit = true;
         }
         if hit && !self.found {
             self.found = true;
             self.alarm.raise(Part::Body);
         }
-        self.held = buf.split_off(cut);
-        self.behind = buf.split_off(cut.saturating_sub(self.keep));
-        (!out.is_empty()).then(|| Bytes::from(out))
+        self.held.drain(..cut);
+        self.pre_masked = pre_masked;
+        Some(Bytes::from(out))
     }
 }
 
@@ -389,28 +391,67 @@ mod tests {
         }
     }
 
-    /// A frame is held back only as far as its end could begin a secret,
-    /// so a stream of events is not delayed waiting for the next.
+    /// The last `longest - 1` bytes of what has arrived wait for the next
+    /// frame or the end, whatever they are.
     #[tokio::test]
-    async fn only_a_possible_secret_start_is_held_back() {
+    async fn the_last_bytes_are_held_back_whatever_they_are() {
         let (mut tx, body) = Body::channel(u64::MAX, None);
         let mut body = MaskedBody::wrap(body, needles(&["sk-live-123"]), ALL, quiet());
         tx.send_data(Bytes::from_static(b"data: one\n\n"))
             .await
             .unwrap();
         let f = body.frame().await.unwrap().unwrap();
-        assert_eq!(f.into_data().unwrap(), &b"data: one\n\n"[..]);
+        assert_eq!(f.into_data().unwrap(), &b"d"[..]);
         tx.send_data(Bytes::from_static(b"data: sk-li"))
             .await
             .unwrap();
         let f = body.frame().await.unwrap().unwrap();
-        assert_eq!(f.into_data().unwrap(), &b"data: "[..]);
+        assert_eq!(f.into_data().unwrap(), &b"ata: one\n\nd"[..]);
         tx.send_data(Bytes::from_static(b"ve-123\n\n"))
             .await
             .unwrap();
+        let f = body.frame().await.unwrap().unwrap();
+        assert_eq!(f.into_data().unwrap(), &b"ata: ***"[..]);
         tx.finish().await.unwrap();
         let rest = body.collect().await.unwrap().to_bytes();
-        assert_eq!(rest, &b"***********\n\n"[..]);
+        assert_eq!(rest, &b"********\n\n"[..]);
+    }
+
+    /// What the client can see of the hold says nothing about the secret.
+    /// The client (the attacker) can get an allowed upstream that streams
+    /// its own bytes back to end a frame with bytes of its choosing, and
+    /// it sees how much of that frame roxy passes on at once. The amount
+    /// must be the same whether the frame ends in the start of the secret
+    /// or not; with a hold that depended on the bytes, this probe read the
+    /// secret off one byte per guess (found in review).
+    #[tokio::test]
+    async fn the_hold_back_is_not_an_oracle_for_the_secret() {
+        const SECRET: &str = "sk-live-0123456789";
+        for (good, bad) in [
+            ("s", "x"),
+            ("sk-live-01", "sk-live-0x"),
+            ("sk-live-012345678", "zzzzzzzzzzzzzzzzz"),
+        ] {
+            let mut released = Vec::new();
+            for probe in [good, bad] {
+                let (mut tx, body) = Body::channel(u64::MAX, None);
+                let mut body = MaskedBody::wrap(body, needles(&[SECRET]), ALL, quiet());
+                let mut cx = Context::from_waker(std::task::Waker::noop());
+                let text = format!("a frame of some text that ends in: {probe}");
+                tx.send_data(Bytes::from(text.clone())).await.unwrap();
+                let mut out = Vec::new();
+                while let Poll::Ready(Some(Ok(f))) =
+                    http_body::Body::poll_frame(Pin::new(&mut body), &mut cx)
+                {
+                    if let Ok(d) = f.into_data() {
+                        out.extend_from_slice(&d);
+                    }
+                }
+                assert_eq!(out, &text.as_bytes()[..out.len()], "{probe:?}");
+                released.push(out.len());
+            }
+            assert_eq!(released[0], released[1], "{good:?} vs {bad:?}");
+        }
     }
 
     #[tokio::test]

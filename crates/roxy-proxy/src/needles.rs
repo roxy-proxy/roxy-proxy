@@ -66,22 +66,6 @@ impl Needles {
         merged
     }
 
-    /// The length of the longest suffix of `b` that is a proper prefix of
-    /// a value: bytes that may begin a value whose rest has not arrived
-    /// yet.
-    pub fn partial_suffix(&self, b: &[u8]) -> usize {
-        self.values
-            .iter()
-            .filter_map(|value| {
-                let value = value.as_bytes();
-                (1..value.len().min(b.len() + 1))
-                    .rev()
-                    .find(|&k| b.ends_with(&value[..k]))
-            })
-            .max()
-            .unwrap_or(0)
-    }
-
     /// `b` with every occurrence masked.
     pub fn mask_bytes<'a>(&self, b: &'a [u8]) -> Cow<'a, [u8]> {
         let ranges = self.ranges(b);
@@ -149,15 +133,5 @@ mod tests {
         assert_eq!(&*n.mask_bytes(b"aaa"), b"***");
         assert_eq!(n.replace_str("xabcdefx", "#"), "x#x");
         assert_eq!(n.replace_str("é-abcd-é", "#"), "é-#-é");
-    }
-
-    #[test]
-    fn a_partial_suffix_is_a_prefix_of_a_value() {
-        let n = needles(&["sk-live-123", "ghp_"]);
-        assert_eq!(n.partial_suffix(b"data: sk-li"), 5);
-        assert_eq!(n.partial_suffix(b"x gh"), 2);
-        assert_eq!(n.partial_suffix(b"data\n\n"), 0);
-        // A whole value is not partial.
-        assert_eq!(n.partial_suffix(b"ghp_"), 0);
     }
 }

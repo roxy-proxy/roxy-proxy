@@ -100,8 +100,8 @@ A body of unknown length that a rule reads reserves the whole
 `max_inspect_body_bytes`, so the defaults allow 1024 such bodies at once.
 The budget is not a cap on the process's memory: socket buffers, streaming
 buffers and addon memory are separate. So are the bytes that the masking
-of secrets holds back from a streaming response, which come to less than
-twice the longest injected secret.
+of secrets holds back from a streaming response, one fewer than the
+longest injected secret.
 
 ## Connections
 
