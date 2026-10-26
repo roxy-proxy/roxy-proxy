@@ -640,6 +640,65 @@ async fn a_close_from_the_upstream_ends_a_websocket_through_layers() {
     no_layer_error(&kit);
 }
 
+/// The same through the message relay (a rule reads `ws.*`): the upstream
+/// closes while the client is still open, and the client gets the
+/// upstream's close frame and EOF before the drain deadline, with no layer
+/// error.
+#[tokio::test(start_paused = true)]
+async fn a_close_from_the_upstream_ends_a_message_relay_through_layers() {
+    use futures_util::{SinkExt as _, StreamExt as _};
+    use tokio_tungstenite::tungstenite::Message;
+    let rules = format!(
+        "{RULES}
+- id: no-binary
+  when: ws.opcode == 2
+  then: deny
+"
+    );
+    let mut b = Kit::builder().rules(&rules);
+    for l in named(&["a", "b"]) {
+        b = b.addon(l);
+    }
+    let kit = b.start().await;
+    let mut ws = kit.ws("/ws", &[("x-echo", "frames-once")]).await;
+    ws.send(Message::text("hello")).await.unwrap();
+    let got = tokio::time::timeout(std::time::Duration::from_secs(10), ws.next())
+        .await
+        .expect("echo in time")
+        .unwrap()
+        .unwrap();
+    assert_eq!(got, Message::text("hello"));
+    // The upstream has closed without a close from the client: the close
+    // frame and then EOF reach the client through both layers.
+    let (end, took) = super::timed(tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        async {
+            let mut closed = false;
+            loop {
+                match ws.next().await {
+                    Some(Ok(Message::Close(_))) => closed = true,
+                    None | Some(Err(_)) => break closed,
+                    Some(Ok(_)) => {}
+                }
+            }
+        },
+    ))
+    .await;
+    assert!(
+        end.expect("EOF in time"),
+        "the upstream's close frame reached the client"
+    );
+    assert!(
+        took < crate::exchange::CLOSE_TIMEOUT,
+        "the layers ended on their own, not at the drain deadline: {took:?}"
+    );
+    drop(ws);
+    let ev = kit.request_event().await;
+    assert_eq!(strs(&ev["addons"]), ["a", "b"], "{ev:#}");
+    assert_eq!(ev["decision"], "allow", "{ev:#}");
+    no_layer_error(&kit);
+}
+
 /// The relay's end closes the client even when a layer keeps its bodies
 /// open (`x-hold`): the socket is roxy's, not the layer's, and the
 /// upstream's close ends the relay without waiting for what the layers
