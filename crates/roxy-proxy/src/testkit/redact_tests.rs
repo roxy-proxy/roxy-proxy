@@ -295,11 +295,23 @@ async fn a_body_that_cannot_be_decoded_fails_closed() {
 
 /// The client chooses a range's bounds, so two ranges that each cut the
 /// secret would carry it out in pieces past a mask of whole occurrences.
-/// The request goes without `range` and `if-range`, and a `206` that
+/// The request goes without `range` and `if-range`, the in-flight rules
+/// see it without them (`saw-range` does not fire), and a `206` that
 /// comes back anyway, plain or encoded, is refused.
 #[tokio::test]
 async fn a_range_is_never_masked() {
-    let kit = kit(BOTH).await;
+    let kit = Kit::builder()
+        .secret("token", SECRET)
+        .rules(&format!(
+            r#"{RULES}
+- id: saw-range
+  when: host == "up.test" and header["range"] != null and response.status == 200
+  then: deny
+"#
+        ))
+        .http(|h| h.redact_response_secrets = BOTH)
+        .start()
+        .await;
     let mut c = kit.h1().await;
     let a = c
         .call(

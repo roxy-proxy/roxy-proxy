@@ -97,7 +97,7 @@ cannot cover a reservation, the exchange fails at once
 
 The budget is not a cap on the process's memory: socket buffers, streaming
 buffers and addon memory are separate. So are the bytes held back from a
-streaming body: by the masking of secrets, less than twice the longest
+streaming body: by the masking of secrets, one fewer than the longest
 injected secret, and by [body rules](/reference/rule-language#body-rules),
 the length of the longest string they compare with, plus one.
 
