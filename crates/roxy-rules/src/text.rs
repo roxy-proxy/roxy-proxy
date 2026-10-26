@@ -206,17 +206,14 @@ impl TextTests {
 
     /// The index of `test`, added if new.
     pub(crate) fn add(&mut self, test: &TextTest, want: Want) -> usize {
-        let i = match self.tests.iter().position(|(t, _)| t == test) {
-            Some(i) => {
-                let w = &mut self.tests[i].1;
-                w.on_true |= want.on_true;
-                w.on_false |= want.on_false;
-                i
-            }
-            None => {
-                self.tests.push((test.clone(), want));
-                self.tests.len() - 1
-            }
+        let i = if let Some(i) = self.tests.iter().position(|(t, _)| t == test) {
+            let w = &mut self.tests[i].1;
+            w.on_true |= want.on_true;
+            w.on_false |= want.on_false;
+            i
+        } else {
+            self.tests.push((test.clone(), want));
+            self.tests.len() - 1
         };
         let (t, w) = &self.tests[i];
         self.hold = self.hold.max(t.needle.len() + usize::from(w.on_false));
@@ -369,7 +366,11 @@ mod tests {
         );
         let mut scan = Arc::new(tests).scan();
         assert!(!scan.feed(b"a SEC"));
-        assert_eq!(scan.hold(), 5, "everything so far, under the needle's length");
+        assert_eq!(
+            scan.hold(),
+            5,
+            "everything so far, under the needle's length"
+        );
         assert!(!scan.feed(b"x"));
         assert_eq!(scan.hold(), 6);
         assert!(!scan.feed(b"nothing partial here"));
