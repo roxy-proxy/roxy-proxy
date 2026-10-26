@@ -14,7 +14,7 @@ connection rather than letting traffic through
 | a metric, address list or secret is unavailable | `503`, `_fail_closed` |
 | a metric table is full | `503`, `_fail_closed`, `metric_table_full` |
 | a body that rules read cannot be decoded | `503`, `_fail_closed`, `body_decode_failed`, or the body is cut if its head has gone |
-| a response that [masking](/reference/secrets#redacting-responses) cannot read whole: a coding roxy does not decode, or a `206` | `503`, `_fail_closed`, `unsupported_content_encoding` or `partial_response` |
+| a response that [masking](/reference/secrets#redacting-responses) or a [body rule](/reference/rule-language#body-rules) cannot read whole: a coding roxy does not decode, or a `206` | `503`, `_fail_closed`, `unsupported_content_encoding` or `partial_response` |
 | a body to sign is over `max_sign_body_bytes` | `413`, `_sign` |
 | the buffer budget is used up | `503`, `_fail_closed`, `buffer_budget_exhausted` |
 | a body or header limit is exceeded mid-stream | both sides are closed |

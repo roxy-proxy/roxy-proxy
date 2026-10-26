@@ -240,6 +240,46 @@ async fn a_body_rule_on_a_signed_encoded_request_keeps_the_signature() {
     );
 }
 
+/// `range` goes before the signature is made: a response body rule reads
+/// the whole response, so the request goes without `range`, and the
+/// signature covers the request as it leaves rather than naming a header
+/// that is no longer there.
+#[tokio::test]
+async fn a_range_dropped_for_a_body_rule_is_dropped_before_signing() {
+    let rules = format!(
+        r#"
+- id: no-secret
+  when: host == "up.test" and response.body.text contains "SECRET"
+  then: deny
+{}"#,
+        rules("s3", "")
+    );
+    let kit = Kit::builder()
+        .secret("akid", AKID)
+        .secret("sk", SK)
+        .secret("token", TOKEN)
+        .rules(&rules)
+        .start()
+        .await;
+    let a = kit
+        .h1()
+        .await
+        .call("GET", "/bucket/key", &[("range", "bytes=0-9")], b"")
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert!(
+        !seen[0].headers.contains_key("range"),
+        "{:?}",
+        seen[0].headers
+    );
+    let auth = seen[0].headers["authorization"].to_str().unwrap();
+    assert!(
+        !signed_headers(auth).split(';').any(|h| h == "range"),
+        "{auth}"
+    );
+}
+
 /// A presigned request goes out under its query signature alone: roxy
 /// adds no signature, strips the client's signature headers, and records
 /// the passthrough so the log shows the request left without roxy's

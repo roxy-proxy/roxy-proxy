@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use http::{HeaderMap, HeaderValue, StatusCode};
 use roxy_http::coding::{self, Coding};
-use roxy_http::{Body, CanonicalResponse, Headers};
+use roxy_http::{Body, CanonicalRequest, CanonicalResponse, Headers};
+use roxy_rules::BodySide;
 
 use crate::pipeline::{FlowCx, Refusal, known_empty, response_known_empty};
 use crate::server::Shared;
@@ -25,8 +26,8 @@ use crate::server::Shared;
 /// is in a coding roxy does not decode.
 const UNDECODABLE: &str = "unsupported_content_encoding";
 
-/// Flow-log `reason` of a range (`206`) of a response that masking must
-/// read whole.
+/// Flow-log `reason` of a range (`206`) of a response that masking or the
+/// rules must read whole.
 const PARTIAL: &str = "partial_response";
 
 /// Where the core hands its response: to the client, or to the addon
@@ -51,16 +52,35 @@ pub(crate) enum Need {
     /// as it is, for a layer to judge.
     Layers,
     /// The rules on `response.body.text`, which must not pass a body they
-    /// cannot read. A range of a plain body is read as it is.
+    /// cannot read whole.
     Rules,
     /// The masking of secrets, which must not pass a body it cannot read
     /// whole.
     Masking,
 }
 
+/// Whether this exchange's response body is read whole: masked, or
+/// scanned for the rules on `response.body.text`. Neither can read a
+/// range of it.
+pub(crate) fn reads_response_whole(cx: &FlowCx) -> bool {
+    crate::redact::masks_body(cx) || !cx.snap.policy.texts(BodySide::Response).is_empty()
+}
+
+/// Drops `range` and `if-range` from a request whose response body is
+/// read whole, so the upstream sends the whole body: masking and the text
+/// tests find whole occurrences only, and a range's bounds are the
+/// client's to choose. Runs before the request is signed, so the
+/// signature covers the request as it leaves.
+pub(crate) fn request_whole(cx: &FlowCx, req: &mut CanonicalRequest) {
+    if reads_response_whole(cx) {
+        req.headers.remove("range");
+        req.headers.remove("if-range");
+    }
+}
+
 /// The codings `res`'s body is to be decoded from for `need`: none when
 /// nothing needs it plain or it cannot be decoded for the layers, and a
-/// refusal when masking cannot read it whole.
+/// refusal when masking or the rules cannot read it whole.
 pub(crate) fn response_codings(
     cx: &FlowCx,
     res: &CanonicalResponse,
@@ -69,20 +89,20 @@ pub(crate) fn response_codings(
     if need == Need::None || response_known_empty(cx, res) {
         return Ok(Vec::new());
     }
+    let reads = matches!(need, Need::Rules | Need::Masking);
     let partial =
         res.status == StatusCode::PARTIAL_CONTENT || res.headers.contains("content-range");
-    // Masking finds whole occurrences only, and a range's bounds are the
-    // client's to choose: ranges that each cut a secret would carry it out
-    // in pieces. The request went without `range` for this, so a range
-    // that still comes back is refused.
-    if need == Need::Masking && partial {
+    // Masking and the text tests find whole occurrences only, and a
+    // range's bounds are the client's to choose: ranges that each cut a
+    // secret or a needle would carry it out in pieces. The request went
+    // without `range` for this, so a range that still comes back is
+    // refused.
+    if reads && partial {
         return Err(Refusal::fail_closed(PARTIAL));
     }
-    let reads = matches!(need, Need::Rules | Need::Masking);
     match coding::content_codings(&res.headers) {
-        Ok(codings) if !partial => Ok(codings),
         // A range of an encoded body cannot be decoded on its own.
-        Ok(codings) if reads && !codings.is_empty() => Err(Refusal::fail_closed(PARTIAL)),
+        Ok(codings) if !partial => Ok(codings),
         // The rules and masking cannot pass a body they cannot read; a
         // layer judges it.
         Err(_) if reads => Err(Refusal::fail_closed(UNDECODABLE)),

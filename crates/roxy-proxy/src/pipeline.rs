@@ -338,7 +338,12 @@ pub(crate) async fn request_steps(
     io: &mut dyn BodyIo,
 ) -> Verdict {
     match request_rules(cx, req) {
-        Verdict::Continue(req) => sign_request(cx, req, io).await,
+        Verdict::Continue(mut req) => {
+            // Settled with the effects, and before the signature, which
+            // covers the request as it leaves.
+            crate::recode::request_whole(cx, &mut req);
+            sign_request(cx, req, io).await
+        }
         Verdict::Deny(d) => Verdict::Deny(d),
         Verdict::Close(e) => Verdict::Close(e),
     }

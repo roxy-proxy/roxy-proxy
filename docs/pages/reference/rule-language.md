@@ -186,6 +186,13 @@ cut. If the response head has not gone, the client gets the deny
 response; otherwise its response is cut. A response body rule cuts the
 response the same way, after its head has gone to the client.
 
+A response body rule reads the whole response. With one in the policy,
+roxy drops `range` and `if-range` from every request, so the upstream
+sends the whole body: the client chooses where a range starts and ends,
+and two ranges that each cut a match would carry it out in pieces. A
+partial response (`206`) that comes back anyway fails closed
+(`partial_response`).
+
 The text is the body decoded from its `content-encoding`
 ([content codings](/reference/http#content-codings)). A body that cannot
 be decoded, or is in a coding roxy does not decode, fails closed

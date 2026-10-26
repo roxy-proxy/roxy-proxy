@@ -754,7 +754,6 @@ async fn forward<F: ClientTransport>(
         });
         req.meta.upgrade = None;
     }
-    crate::redact::request(cx, &mut req);
     if let Err(r) = crate::scan::request(cx, &mut req, &in_flight) {
         return Outcome::Refuse(r);
     }

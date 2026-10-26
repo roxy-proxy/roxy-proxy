@@ -5,8 +5,9 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use roxy_http::Body;
 
-use super::{Client, Kit, streaming_body};
+use super::{Answer, Client, Kit, streaming_body};
 
 const RULES: &str = r#"
 - id: no-secret
@@ -157,4 +158,55 @@ async fn a_body_rule_quarantines_mid_stream() {
     let a = kit.h1().await.call("GET", "/x", &[], b"").await;
     assert_eq!(a.status, 403, "{a:?}");
     assert_eq!(a.headers["x-roxy-rule"], "_quarantined");
+}
+
+/// A response body rule reads the whole response: the client chooses a
+/// range's bounds, so two ranges that each cut the needle would carry it
+/// out in pieces past the rule. The request goes without `range` and
+/// `if-range`, and a `206` that comes back anyway is refused.
+#[tokio::test]
+async fn a_response_body_rule_never_reads_a_range() {
+    let kit = Kit::builder()
+        .rules(
+            r#"
+- id: no-secret
+  when: host == "up.test" and response.body.text contains "SECRET"
+  then: deny
+- id: up
+  when: host == "up.test"
+  then: allow
+"#,
+        )
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+    let a = c
+        .call(
+            "GET",
+            "/x",
+            &[("range", "bytes=0-2"), ("if-range", "\"v1\"")],
+            b"",
+        )
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert!(
+        !seen[0].headers.contains_key("range"),
+        "{:?}",
+        seen[0].headers
+    );
+    assert!(
+        !seen[0].headers.contains_key("if-range"),
+        "{:?}",
+        seen[0].headers
+    );
+    let req = c
+        .request("POST", "/echo", &[("x-echo-status", "206")])
+        .body(Body::from_bytes(Bytes::from_static(b"[SEC")))
+        .unwrap();
+    let a = Answer::read(c.send(req).await.expect("response")).await;
+    assert_eq!(a.status, 503, "{a:?}");
+    let ev = kit.events("request", 2).await.remove(1);
+    assert_eq!(ev["terminal_rule"], "_fail_closed", "{ev:#}");
+    assert_eq!(ev["reason"], "partial_response", "{ev:#}");
 }

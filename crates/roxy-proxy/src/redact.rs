@@ -21,7 +21,7 @@ use std::task::{Context, Poll, ready};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
 use http_body::Frame;
-use roxy_http::{Body, BodyError, CanonicalRequest, CanonicalResponse, Headers};
+use roxy_http::{Body, BodyError, CanonicalResponse, Headers};
 
 use crate::config::ResponseRedaction;
 use crate::needles::{MASK, Needles};
@@ -49,19 +49,11 @@ pub(crate) fn needles(cx: &FlowCx) -> Option<Arc<Needles>> {
     (!needles.is_empty()).then(|| Arc::new(needles))
 }
 
-/// Whether this exchange's response body is masked.
+/// Whether this exchange's response body is masked. Such a response is
+/// read whole: [`crate::recode::request_whole`] keeps a range from being
+/// asked for.
 pub(crate) fn masks_body(cx: &FlowCx) -> bool {
     cx.snap.http.redact_response_secrets.bodies && needles(cx).is_some()
-}
-
-/// Drops `range` and `if-range` from a request whose response body will
-/// be masked, so the upstream sends the whole body: masking finds whole
-/// occurrences only, and a range's bounds are the client's to choose.
-pub(crate) fn request(cx: &FlowCx, req: &mut CanonicalRequest) {
-    if masks_body(cx) {
-        req.headers.remove("range");
-        req.headers.remove("if-range");
-    }
 }
 
 /// Masks `needles` in `res` as `http.redact_response_secrets` asks. With
