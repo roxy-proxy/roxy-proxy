@@ -63,6 +63,7 @@ pub(crate) fn request(
         recode::decode(&cx.shared, &mut req.body, &codings, limit);
         req.body = TextBody::wrap(std::mem::take(&mut req.body), in_flight, Dir::Request);
         recode::encode(&cx.shared, &mut req.body, &codings);
+        req.body = CoderFaults::wrap(std::mem::take(&mut req.body), in_flight, Dir::Request);
     }
     Ok(())
 }
@@ -82,6 +83,18 @@ pub(crate) fn response(
     }
     res.body = TextBody::wrap(std::mem::take(&mut res.body), in_flight, Dir::Response);
     Ok(())
+}
+
+/// Once the response is encoded again, names its coders' failures, if a
+/// rule reads `response.body.text` ([`CoderFaults`]).
+pub(crate) fn watch_response_coders(
+    cx: &FlowCx,
+    res: &mut CanonicalResponse,
+    in_flight: &Arc<InFlight>,
+) {
+    if !cx.snap.policy.texts(BodySide::Response).is_empty() {
+        res.body = CoderFaults::wrap(std::mem::take(&mut res.body), in_flight, Dir::Response);
+    }
 }
 
 fn refusal(s: Stopped) -> Refusal {
@@ -114,6 +127,56 @@ fn scan_whole(
         in_flight
             .on_text(Dir::Request, &buf[..n])
             .map_err(refusal)?;
+    }
+}
+
+/// Names the failures of the coders around a scanned body: a coding that
+/// fails, or a window the budget refuses, is roxy's refusal, not a peer
+/// cutting the body short. It sits outside the coders, so it sees both the
+/// decoder's failures and the encoder's.
+struct CoderFaults {
+    inner: Body,
+    in_flight: Arc<InFlight>,
+    dir: Dir,
+}
+
+impl CoderFaults {
+    fn wrap(body: Body, in_flight: &Arc<InFlight>, dir: Dir) -> Body {
+        let known = body.known_length();
+        Body::wrap_native(
+            Self {
+                inner: body,
+                in_flight: in_flight.clone(),
+                dir,
+            },
+            u64::MAX,
+            known,
+        )
+    }
+}
+
+impl http_body::Body for CoderFaults {
+    type Data = Bytes;
+    type Error = BodyError;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, BodyError>>> {
+        let this = &mut *self;
+        let polled = Pin::new(&mut this.inner).poll_frame(cx);
+        if let Poll::Ready(Some(Err(e))) = &polled {
+            this.in_flight.body_failed(this.dir, e);
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -193,9 +256,6 @@ impl http_body::Body for TextBody {
                 },
                 Poll::Ready(None) => None,
                 Poll::Ready(Some(Err(e))) => {
-                    if matches!(e, BodyError::Undecodable(_)) {
-                        this.in_flight.text_failed(this.dir, UNDECODABLE);
-                    }
                     this.done = true;
                     return Poll::Ready(Some(Err(e)));
                 }

@@ -228,6 +228,32 @@ async fn a_corrupt_body_fails_closed() {
     assert_fails_closed(&kit, &a, "body_decode_failed").await;
 }
 
+/// A decoder window the buffer budget cannot cover is the budget's
+/// refusal, not a body the client cut short.
+#[tokio::test]
+async fn a_decoder_window_the_budget_cannot_cover_fails_closed() {
+    // Under the 32 KiB window gzip charges on its first byte.
+    let kit = || {
+        Kit::builder()
+            .rules(RULES)
+            .limits(|l| l.max_buffered_bytes = 1024)
+            .start()
+    };
+    let k = kit().await;
+    let mut c = k.h1().await;
+    let a = post(
+        &mut c,
+        "/x",
+        &[("content-encoding", "gzip")],
+        gzip(b"hello"),
+    )
+    .await;
+    assert_fails_closed(&k, &a, "buffer_budget_exhausted").await;
+    let kit = kit().await;
+    let a = try_echo(&kit, false, "gzip", gzip(b"hello")).await;
+    assert_cut(&kit, a, "_fail_closed", Some("buffer_budget_exhausted")).await;
+}
+
 #[tokio::test]
 async fn an_unknown_coding_fails_closed() {
     let kit = kit().await;

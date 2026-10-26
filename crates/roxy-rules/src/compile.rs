@@ -845,6 +845,18 @@ impl Compiler<'_, '_> {
                 ));
             }
         };
+        // The body is compared byte for byte, not decoded, so a U+FFFD
+        // would match only its own bytes, never the invalid UTF-8 a
+        // decoder would have replaced with it.
+        if needles.iter().any(|n| n.contains('\u{FFFD}')) {
+            return Err(ExprError::new(
+                other.span(),
+                format!(
+                    "`{field}` is compared byte for byte, so U+FFFD matches only its own bytes, \
+                     not invalid UTF-8"
+                ),
+            ));
+        }
         let negate = matches!(op, Op::Ne | Op::NotIn);
         let mut atoms: Vec<Pred> = needles
             .into_iter()

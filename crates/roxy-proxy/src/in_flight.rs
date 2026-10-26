@@ -313,12 +313,27 @@ impl InFlight {
         self.text(dir, TextScan::finish).map(drop)
     }
 
-    /// The body's text cannot be read on (its coding failed mid-stream):
-    /// the exchange stops, failing closed with `code`.
-    pub(crate) fn text_failed(&self, dir: Dir, code: &'static str) -> Stopped {
+    /// The body failed on roxy's side, not either peer's: its coding
+    /// failed, or the budget refused a coder's window. The exchange stops,
+    /// failing closed with that code; other failures are left to the
+    /// caller.
+    pub(crate) fn body_failed(&self, dir: Dir, e: &BodyError) {
+        let code = match e {
+            BodyError::Undecodable(_) => "body_decode_failed",
+            BodyError::BudgetExhausted => crate::budget::EXHAUSTED,
+            BodyError::TooLarge { .. }
+            | BodyError::LengthMismatch
+            | BodyError::Incomplete
+            | BodyError::Closed
+            | BodyError::Abandoned
+            | BodyError::Timeout
+            | BodyError::Invalid(_)
+            | BodyError::Upstream(_)
+            | BodyError::Stopped => return,
+        };
         let mut g = self.lock();
-        g.stop_with(Refusal::fail_closed(code), text_stage(dir));
-        self.publish(&g).expect_err("just stopped")
+        g.stop_with(Refusal::fail_closed(code), body_stage(dir));
+        let _ = self.publish(&g);
     }
 
     fn text(&self, dir: Dir, step: impl FnOnce(&mut TextScan) -> bool) -> Result<usize, Stopped> {
@@ -333,15 +348,15 @@ impl InFlight {
         // A body is scanned only when its tests exist, and they are set
         // before its first byte; never forward an unscanned one.
         let Some(scan) = scan else {
-            g.stop_with(Refusal::fail_closed("body_unavailable"), text_stage(dir));
+            g.stop_with(Refusal::fail_closed("body_unavailable"), body_stage(dir));
             return self.publish(&g).map(|()| 0);
         };
         let decided = step(scan);
         let hold = scan.hold();
         if decided {
-            let effects = g.evaluate(changed, text_stage(dir));
+            let effects = g.evaluate(changed, body_stage(dir));
             if !effects.is_empty() && g.stopped.is_none() {
-                g.stop_with(Refusal::fail_closed("unsupported_effect"), text_stage(dir));
+                g.stop_with(Refusal::fail_closed("unsupported_effect"), body_stage(dir));
             }
         }
         self.publish(&g).map(|()| hold)
@@ -437,7 +452,7 @@ fn scan(policy: &roxy_rules::Policy, side: BodySide) -> Option<TextScan> {
     (!tests.is_empty()).then(|| tests.scan())
 }
 
-fn text_stage(dir: Dir) -> Stage {
+fn body_stage(dir: Dir) -> Stage {
     match dir {
         Dir::Request => Stage::RequestBody,
         Dir::Response => Stage::ResponseBody,

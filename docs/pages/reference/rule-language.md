@@ -160,6 +160,10 @@ The value must be a quoted string, with the field on the left (either
 side for `==` and `!=`). `matches`, `like`, `under`, `<` and `>` cannot be
 decided as the body streams, and are compile errors.
 
+The body is compared byte for byte with the string's UTF-8 bytes. Invalid
+UTF-8 in the body is not replaced, so a string containing U+FFFD (`�`)
+could never match it, and is a compile error.
+
 A rule that reads body text runs in flight: it can `deny`, `quarantine`,
 `log`, `tag` and `set_state`, but not `allow` or change the request.
 Write the allow as an admission rule and the body check as a `deny`:

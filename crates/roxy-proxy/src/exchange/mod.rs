@@ -835,6 +835,7 @@ async fn forward<F: ClientTransport>(
             if matches!(cx.response_leg, Leg::Direct) {
                 crate::recode::encode_response(&cx.shared, &mut res);
             }
+            crate::scan::watch_response_coders(cx, &mut res, &in_flight);
             Outcome::Respond(res)
         }
         ResponseVerdict::Deny(r) => Outcome::Refuse(r),

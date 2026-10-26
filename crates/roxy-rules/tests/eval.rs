@@ -668,6 +668,14 @@ fn body_text_takes_streamable_comparisons_only() {
             "\"x\" contains body.text",
             "put `body.text` on the left of `contains`",
         ),
+        (
+            "body.text contains \"\u{FFFD}\"",
+            "U+FFFD matches only its own bytes",
+        ),
+        (
+            "body.text in [\"a\", \"b\u{FFFD}\"]",
+            "U+FFFD matches only its own bytes",
+        ),
     ] {
         let err = try_compile(
             "",
