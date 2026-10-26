@@ -25,7 +25,7 @@ use roxy_http::{Body, BodyError, CanonicalRequest, CanonicalResponse, Headers};
 
 use crate::config::ResponseRedaction;
 use crate::needles::{MASK, Needles};
-use crate::pipeline::{FlowCx, response_known_empty};
+use crate::pipeline::{FlowCx, response_bodiless};
 use crate::quarantine::{QuarantineCause, ResponsePart as Part};
 use crate::server::Shared;
 
@@ -79,7 +79,9 @@ pub(crate) fn response(cx: &FlowCx, res: &mut CanonicalResponse, needles: Arc<Ne
     if switches.headers && mask_headers(&needles, &mut res.headers) {
         alarm.raise(Part::Headers);
     }
-    if response_known_empty(cx, res) {
+    // A body of length 0 can still end with trailers: only one with no
+    // frames left goes unwrapped.
+    if response_bodiless(cx, res) || http_body::Body::is_end_stream(&res.body) {
         return;
     }
     let body = std::mem::take(&mut res.body);

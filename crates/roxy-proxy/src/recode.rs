@@ -136,7 +136,9 @@ pub(crate) fn encode_response(shared: &Arc<Shared>, res: &mut CanonicalResponse)
 }
 
 /// Encodes a request's body in `codings` again, unless a layer gave it a
-/// coding of its own or left it no body.
+/// coding of its own or left it no body. A `content-length` the layer
+/// declared is for the plain body: it is checked against that body here
+/// and dropped, since the encoded one has a length of its own.
 pub(crate) fn encode_request(
     shared: &Arc<Shared>,
     headers: &mut HeaderMap,
@@ -149,6 +151,14 @@ pub(crate) fn encode_request(
     {
         return;
     }
+    let mut declared = headers.get_all(http::header::CONTENT_LENGTH).iter();
+    if let (Some(v), None) = (declared.next(), declared.next())
+        && let Ok(n) = roxy_http::parse_content_length(v.as_bytes())
+    {
+        headers.remove(http::header::CONTENT_LENGTH);
+        *body = std::mem::take(body).checked(u64::MAX, Some(n));
+    }
+    // Any other `content-length` stays, for admission to refuse.
     headers.insert(
         http::header::CONTENT_ENCODING,
         HeaderValue::from_str(&coding::header_value(codings))
@@ -215,6 +225,36 @@ mod tests {
         let mut body = Body::empty();
         encode_request(shared, &mut headers, &mut body, &[Coding::Gzip]);
         assert!(headers.is_empty());
+    }
+
+    /// A length the layer declared is the plain body's: checked against it,
+    /// then dropped for the encoded body.
+    #[tokio::test]
+    async fn a_layers_declared_length_is_checked_before_encoding() {
+        let kit = Kit::builder().start().await;
+        let shared = kit.server.shared();
+        for (declared, holds) in [("5", true), ("4", false)] {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                http::header::CONTENT_LENGTH,
+                HeaderValue::from_static(declared),
+            );
+            let mut body = Body::from_bytes(Bytes::from_static(b"hello"));
+            encode_request(shared, &mut headers, &mut body, &[Coding::Gzip]);
+            assert!(!headers.contains_key(http::header::CONTENT_LENGTH));
+            let out = body.collect().await;
+            if holds {
+                let plain = coding::decode(
+                    &[Coding::Gzip],
+                    &out.unwrap().to_bytes(),
+                    1 << 20,
+                    coding::unmetered(),
+                );
+                assert_eq!(plain.unwrap(), b"hello");
+            } else {
+                assert!(out.is_err(), "content-length {declared}");
+            }
+        }
     }
 
     /// Stacked codings come back in the order they were applied.

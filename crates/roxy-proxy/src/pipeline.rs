@@ -1540,15 +1540,20 @@ async fn inspect_response_body(
 }
 
 /// A response with no body by its status, its framing, or because the
-/// request was a `HEAD`.
+/// request was a `HEAD`. A body of length 0 can still end with trailers.
 pub(crate) fn response_known_empty(cx: &FlowCx, res: &CanonicalResponse) -> bool {
+    response_bodiless(cx, res) || known_empty(&res.body)
+}
+
+/// A response with no body by its status or because the request was a
+/// `HEAD`, so no trailers either.
+pub(crate) fn response_bodiless(cx: &FlowCx, res: &CanonicalResponse) -> bool {
     status_forbids_body(res.status)
         || cx
             .facts
             .request
             .as_ref()
             .is_some_and(|r| r.method == Method::Head)
-        || known_empty(&res.body)
 }
 
 /// The in-flight rules at the response head: they may stop the

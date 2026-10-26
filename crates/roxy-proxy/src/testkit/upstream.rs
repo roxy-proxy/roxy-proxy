@@ -336,6 +336,8 @@ impl Upstream {
     ///   followed by the trailer `x-checksum: none`;
     /// * `/reflect`: reads the body, answers `200` with the request's
     ///   `authorization` as the header `x-reflect` and as the body;
+    /// * `/reflect-trailers`: reads the body, answers `200` with an empty
+    ///   body and the request's `authorization` as the trailer `x-reflect`;
     /// * `/grpc`: reads the body, answers `200 application/grpc` with the
     ///   body `hello` of undeclared length and the trailers
     ///   `grpc-status: 0`, `grpc-message: OK`; with `x-forbidden-trailer`
@@ -437,6 +439,9 @@ impl Upstream {
         }
         if path == "/reflect" {
             return reflect(authorization);
+        }
+        if path == "/reflect-trailers" {
+            return reflect_trailers(authorization);
         }
         if let Some(code) = path.strip_prefix("/status/") {
             return http::Response::builder()
@@ -577,7 +582,6 @@ impl Upstream {
     }
 }
 
-/// `/trailers`: an empty body with an `x-checksum` trailer.
 fn header_text(req: &http::Request<Incoming>, name: &str) -> Option<String> {
     req.headers()
         .get(name)
@@ -593,9 +597,23 @@ fn reflect(authorization: Option<http::HeaderValue>) -> http::Response<Body> {
         .unwrap()
 }
 
+/// `/trailers`: an empty body with an `x-checksum` trailer.
 fn trailers() -> http::Response<Body> {
     let mut trailers = http::HeaderMap::new();
     trailers.insert("x-checksum", http::HeaderValue::from_static("none"));
+    empty_with(trailers)
+}
+
+/// `/reflect-trailers`: an empty body with the request's `authorization`
+/// as the trailer `x-reflect`.
+fn reflect_trailers(authorization: Option<http::HeaderValue>) -> http::Response<Body> {
+    let mut trailers = http::HeaderMap::new();
+    let auth = authorization.unwrap_or(http::HeaderValue::from_static(""));
+    trailers.insert("x-reflect", auth);
+    empty_with(trailers)
+}
+
+fn empty_with(trailers: http::HeaderMap) -> http::Response<Body> {
     let body =
         Full::new(Bytes::new()).with_trailers(async move { Some(Ok::<_, Infallible>(trailers)) });
     http::Response::new(body.boxed())

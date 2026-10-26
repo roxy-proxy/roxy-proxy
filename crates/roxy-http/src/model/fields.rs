@@ -15,7 +15,7 @@ use crate::chars::trim_ows;
 use crate::url;
 
 /// Parses a `Content-Length` value: 1 to 19 ASCII digits, nothing else.
-pub(crate) fn parse_content_length(v: &[u8]) -> Result<u64, ParseError> {
+pub fn parse_content_length(v: &[u8]) -> Result<u64, ParseError> {
     if v.is_empty() || v.len() > 19 || !v.iter().all(u8::is_ascii_digit) {
         return reject(
             Reason::BadContentLength,

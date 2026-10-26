@@ -104,6 +104,28 @@ async fn headers_and_bodies_switch_separately() {
     }
 }
 
+/// A body of length 0 can still end with trailers on h2: they are masked
+/// with the head.
+#[tokio::test]
+async fn trailers_after_an_empty_body_are_masked() {
+    let kit = kit(BOTH).await;
+    let (send, _conn) = super::h2_client(&kit).await;
+    let req = http::Request::get("https://up.test/reflect-trailers")
+        .body(())
+        .unwrap();
+    let mut ready = send.clone().ready().await.unwrap();
+    let (resp, _) = ready.send_request(req, true).unwrap();
+    let resp = resp.await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(resp.headers()["content-length"], "0");
+    let mut body = resp.into_body();
+    while let Some(chunk) = body.data().await {
+        assert!(chunk.unwrap().is_empty());
+    }
+    let trailers = body.trailers().await.unwrap().expect("the trailers");
+    assert_eq!(trailers["x-reflect"], format!("Bearer {MASKED}").as_str());
+}
+
 /// An exchange that injected nothing is not scrubbed: the value is the
 /// client's own.
 #[tokio::test]
