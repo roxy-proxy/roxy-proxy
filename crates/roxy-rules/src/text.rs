@@ -11,9 +11,12 @@
 //! Each test is undecided until the bytes settle it: `contains` once the
 //! needle has been seen, `starts_with` once as many bytes as the needle has
 //! arrived or one differs, `==` once a byte differs or there are too many,
-//! and anything else when the body ends. While a test is undecided,
-//! [`TextScan::hold`] says how many of the latest bytes must not be
-//! forwarded yet, so that a rule matching on them can still stop them.
+//! and anything else when the body ends. [`TextScan::hold`] says how many
+//! of the latest bytes must not be forwarded yet, so that a rule matching
+//! on them can still stop them: as many as the longest needle (one more
+//! for a test some rule needs false), whatever the bytes are, until the
+//! body ends. A hold that followed the partial match would tell the
+//! client, byte by byte, what the rules compare with.
 
 use std::sync::Arc;
 
@@ -168,21 +171,11 @@ impl Cursor {
             });
         }
     }
-
-    /// The latest bytes this test still needs held back: the partial
-    /// match a rule matching on `true` waits on, and the last byte for a
-    /// rule matching on `false`, which can be decided by the end alone.
-    fn hold(&self, want: Want) -> usize {
-        if self.result.is_some() {
-            return 0;
-        }
-        let partial = if want.on_true { self.k } else { 0 };
-        partial.max(usize::from(want.on_false))
-    }
 }
 
-/// Which answers of a test some rule matches on, so which bytes are worth
-/// holding back.
+/// Which answers of a test some rule matches on. A test wanted `false`
+/// can be decided by the end of the body alone, so one more byte is held
+/// for it: the body is never complete at the other side before then.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Want {
     pub on_true: bool,
@@ -193,6 +186,11 @@ pub(crate) struct Want {
 #[derive(Debug, Default)]
 pub struct TextTests {
     tests: Vec<(TextTest, Want)>,
+    /// How many of the latest bytes a scan holds back: the longest
+    /// needle, plus one for a test wanted `false`. A match that reaches
+    /// the released bytes has arrived whole, so a test is always decided
+    /// before any of its match goes.
+    hold: usize,
 }
 
 impl TextTests {
@@ -208,14 +206,21 @@ impl TextTests {
 
     /// The index of `test`, added if new.
     pub(crate) fn add(&mut self, test: &TextTest, want: Want) -> usize {
-        if let Some(i) = self.tests.iter().position(|(t, _)| t == test) {
-            let w = &mut self.tests[i].1;
-            w.on_true |= want.on_true;
-            w.on_false |= want.on_false;
-            return i;
-        }
-        self.tests.push((test.clone(), want));
-        self.tests.len() - 1
+        let i = match self.tests.iter().position(|(t, _)| t == test) {
+            Some(i) => {
+                let w = &mut self.tests[i].1;
+                w.on_true |= want.on_true;
+                w.on_false |= want.on_false;
+                i
+            }
+            None => {
+                self.tests.push((test.clone(), want));
+                self.tests.len() - 1
+            }
+        };
+        let (t, w) = &self.tests[i];
+        self.hold = self.hold.max(t.needle.len() + usize::from(w.on_false));
+        i
     }
 
     /// A scan of one body.
@@ -228,6 +233,7 @@ impl TextTests {
             results,
             tests: self.clone(),
             seen: 0,
+            finished: false,
         }
     }
 }
@@ -243,6 +249,8 @@ pub struct TextScan {
     /// Tests decided before any byte (an empty needle), not yet reported
     /// by [`TextScan::feed`] or [`TextScan::finish`].
     unreported: bool,
+    /// The body has ended: nothing is held any more.
+    finished: bool,
 }
 
 impl TextScan {
@@ -256,6 +264,7 @@ impl TextScan {
     /// The body ended: every test is decided. Whether any test was decided
     /// now.
     pub fn finish(&mut self) -> bool {
+        self.finished = true;
         self.update(Cursor::finish)
     }
 
@@ -281,18 +290,19 @@ impl TextScan {
         &self.results
     }
 
-    /// How many of the latest bytes fed must not be forwarded yet. It
-    /// never grows by more than the bytes fed since it was last read, so
-    /// the bytes it covers are always ones still held.
+    /// How many of the latest bytes fed must not be forwarded yet: the
+    /// policy's hold, or everything fed so far if that is less, and
+    /// nothing once the body has ended. It depends only on how much has
+    /// arrived, so what the client sees of it says nothing about the
+    /// tests, and it never grows by more than the bytes fed since it was
+    /// last read, so the bytes it covers are always ones still held.
     pub fn hold(&self) -> usize {
-        let hold = self
-            .cursors
-            .iter()
-            .zip(&self.tests.tests)
-            .map(|(c, (_, want))| c.hold(*want))
-            .max()
-            .unwrap_or(0);
-        hold.min(usize::try_from(self.seen).unwrap_or(usize::MAX))
+        if self.finished {
+            return 0;
+        }
+        self.tests
+            .hold
+            .min(usize::try_from(self.seen).unwrap_or(usize::MAX))
     }
 }
 
@@ -344,10 +354,11 @@ mod tests {
         }
     }
 
-    /// The hold covers a partial match, so a needle is never released
-    /// whole before its test is decided.
+    /// The hold is the longest needle, whatever the bytes are: a needle
+    /// is never released whole before its test is decided, and the client
+    /// cannot tell a partial match from any other tail.
     #[test]
-    fn a_partial_match_is_held() {
+    fn the_last_bytes_are_held_whatever_they_are() {
         let mut tests = TextTests::default();
         tests.add(
             &TextTest::new(TextOp::Contains, "SECRET"),
@@ -358,19 +369,22 @@ mod tests {
         );
         let mut scan = Arc::new(tests).scan();
         assert!(!scan.feed(b"a SEC"));
-        assert_eq!(scan.hold(), 3);
+        assert_eq!(scan.hold(), 5, "everything so far, under the needle's length");
         assert!(!scan.feed(b"x"));
-        assert_eq!(scan.hold(), 0);
+        assert_eq!(scan.hold(), 6);
+        assert!(!scan.feed(b"nothing partial here"));
+        assert_eq!(scan.hold(), 6, "the same whatever the tail");
         assert!(scan.feed(b"SECRET"));
         assert_eq!(scan.results(), [Some(true)]);
-        assert_eq!(scan.hold(), 0);
+        assert_eq!(scan.hold(), 6, "the same once decided");
+        assert!(!scan.finish());
+        assert_eq!(scan.hold(), 0, "nothing after the end");
     }
 
-    /// A rule on `not contains` is decided by the end, so the last byte is
-    /// held until then; one on `contains` holds nothing outside a partial
-    /// match.
+    /// A rule on `not contains` is decided by the end, so one more byte is
+    /// held until then; one on `contains` holds the needle's length.
     #[test]
-    fn a_test_wanted_false_holds_the_last_byte() {
+    fn a_test_wanted_false_holds_one_more_byte() {
         let test = TextTest::new(TextOp::Contains, "z");
         for (want, hold) in [
             (
@@ -378,14 +392,14 @@ mod tests {
                     on_true: false,
                     on_false: true,
                 },
-                1,
+                2,
             ),
             (
                 Want {
                     on_true: true,
                     on_false: false,
                 },
-                0,
+                1,
             ),
         ] {
             let mut tests = TextTests::default();

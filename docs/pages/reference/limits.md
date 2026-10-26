@@ -99,8 +99,7 @@ The budget is not a cap on the process's memory: socket buffers, streaming
 buffers and addon memory are separate. So are the bytes held back from a
 streaming body: by the masking of secrets, less than twice the longest
 injected secret, and by [body rules](/reference/rule-language#body-rules),
-at most the length of the longest string they compare with, or one
-byte.
+the length of the longest string they compare with, plus one.
 
 ## Connections
 

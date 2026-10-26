@@ -51,9 +51,10 @@ async fn upstream_body(kit: &Kit, n: usize) -> Vec<u8> {
         })
 }
 
-/// The bytes before a partial match go on as they arrive; the partial
-/// match waits, and when the next chunk completes it the request is
-/// denied with none of it sent.
+/// All but the last few bytes (as many as the longest needle, `SECRET`)
+/// go on as they arrive, whatever they are; the partial match is among
+/// those held, and when the next chunk completes it the request is denied
+/// with none of it sent.
 async fn a_match_split_across_chunks_never_reaches_the_upstream(h2: bool) {
     let kit = Kit::builder().rules(RULES).start().await;
     let mut c = client(&kit, h2).await;
@@ -63,7 +64,7 @@ async fn a_match_split_across_chunks_never_reaches_the_upstream(h2: bool) {
     tx.send_data(Bytes::from_static(b"safe and SEC"))
         .await
         .unwrap();
-    assert_eq!(upstream_body(&kit, 9).await, b"safe and ");
+    assert_eq!(upstream_body(&kit, 6).await, b"safe a");
     tx.send_data(Bytes::from_static(b"RET and more"))
         .await
         .unwrap();
@@ -73,7 +74,7 @@ async fn a_match_split_across_chunks_never_reaches_the_upstream(h2: bool) {
     let ev = kit.request_event().await;
     assert_eq!(ev["stage"], "request_body", "{ev:#}");
     let seen = kit.upstream.wait_seen(1).await;
-    assert_eq!(seen[0].body, b"safe and ", "{seen:#?}");
+    assert_eq!(seen[0].body, b"safe a", "{seen:#?}");
     assert_eq!(seen[0].complete, Some(false), "{seen:#?}");
 }
 
@@ -88,7 +89,7 @@ async fn h2_a_match_split_across_chunks_never_reaches_the_upstream() {
 }
 
 /// `not ... contains` is decided only at the end, so the end is held: the
-/// last byte goes only once the body is known not to need the deny.
+/// last bytes go only once the body is known not to need the deny.
 #[tokio::test]
 async fn a_negated_test_holds_the_end_of_the_body() {
     for h2 in [false, true] {
@@ -97,14 +98,16 @@ async fn a_negated_test_holds_the_end_of_the_body() {
         let (mut tx, body) = streaming_body();
         let req = c.request("POST", "/marked", &[]).body(body).unwrap();
         let answer = c.start(req);
-        tx.send_data(Bytes::from_static(b"hello")).await.unwrap();
-        assert_eq!(upstream_body(&kit, 4).await, b"hell");
+        tx.send_data(Bytes::from_static(b"hello, world"))
+            .await
+            .unwrap();
+        assert_eq!(upstream_body(&kit, 6).await, b"hello,");
         tx.finish().await.unwrap();
         let a = answer.await.unwrap().unwrap();
         assert_eq!(a.status, 403, "h2 {h2}: {a:?}");
         assert_eq!(a.headers["x-roxy-rule"], "needs-marker");
         let seen = kit.upstream.wait_seen(1).await;
-        assert_eq!(seen[0].body, b"hell", "h2 {h2}: {seen:#?}");
+        assert_eq!(seen[0].body, b"hello,", "h2 {h2}: {seen:#?}");
         assert_eq!(seen[0].complete, Some(false), "h2 {h2}: {seen:#?}");
     }
     let kit = Kit::builder().rules(RULES).start().await;
@@ -143,7 +146,7 @@ async fn a_body_rule_quarantines_mid_stream() {
     tx.send_data(Bytes::from_static(b"first part, "))
         .await
         .unwrap();
-    assert_eq!(upstream_body(&kit, 12).await, b"first part, ");
+    assert_eq!(upstream_body(&kit, 7).await, b"first p");
     tx.send_data(Bytes::from_static(b"then exfil"))
         .await
         .unwrap();
@@ -153,7 +156,7 @@ async fn a_body_rule_quarantines_mid_stream() {
     let tripped = kit.events("quarantined", 1).await.remove(0);
     assert_eq!(tripped["cause"]["rule"], "trip", "{tripped:#}");
     let seen = kit.upstream.wait_seen(1).await;
-    assert_eq!(seen[0].body, b"first part, ", "{seen:#?}");
+    assert_eq!(seen[0].body, b"first p", "{seen:#?}");
 
     let a = kit.h1().await.call("GET", "/x", &[], b"").await;
     assert_eq!(a.status, 403, "{a:?}");

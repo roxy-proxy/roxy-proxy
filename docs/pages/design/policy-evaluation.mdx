@@ -61,8 +61,8 @@ exchange: the client gets an error if its response has not started, and
 otherwise the connection is closed.
 
 A rule that reads the body text (`body.text`) is checked as the body
-streams too. roxy holds back only the few bytes that could start a match,
-so a match is stopped before any of it is sent
+streams too. roxy holds back the last few bytes, as many as the longest
+string compared with, so a match is stopped before any of it is sent
 ([body rules](/reference/rule-language#body-rules)).
 
 ## Effects

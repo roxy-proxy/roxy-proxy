@@ -173,12 +173,15 @@ Write the allow as an admission rule and the body check as a `deny`:
   then: allow
 ```
 
-**Nothing that would make a rule fire leaves roxy.** Bytes go on as soon
-as no test can need them. The few bytes that could be the start of a
-match are held back until the next bytes settle it, so a `contains` that
-fires stops the exchange with none of the match sent. A test that a rule
-needs to be false (such as `not body.text contains "s"`) holds back the
-last byte of the body until the end, when the test is decided.
+**Nothing that would make a rule fire leaves roxy.** The last bytes of
+the body so far are held back until the next bytes arrive or the body
+ends: as many as the longest string the rules compare with, and one more
+when a rule needs a test to be false (such as
+`not body.text contains "s"`), since only the end of the body can decide
+that. The hold is the same whatever the bytes are, so what the client
+sees of it says nothing about the rules' text, and a `contains` that
+fires stops the exchange with none of the match sent. A streamed body
+reaches the other side that many bytes behind until it ends.
 
 When a rule fires mid-body, the exchange stops there. The upstream has
 the request head and the body up to the held bytes, and the request is

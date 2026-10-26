@@ -2,11 +2,12 @@
 //!
 //! When a rule reads `body.text` or `response.body.text`, that body passes
 //! through [`TextBody`] on its way. Each chunk is fed to the body's text
-//! tests ([`InFlight::on_text`]) before any of it is forwarded, and the few
-//! bytes a test still waits on are held back until it is decided, so a rule
-//! matching on them stops the exchange before they leave. The end of the
-//! body is held the same way: the last bytes and the trailers go only once
-//! every test is decided.
+//! tests ([`InFlight::on_text`]) before any of it is forwarded, and the
+//! last bytes, as many as the longest string the rules compare with, are
+//! held back until more arrive, whatever they are, so a rule matching on
+//! them stops the exchange before they leave. The end of the body is held
+//! the same way: the last bytes and the trailers go only once every test
+//! is decided.
 //!
 //! The tests read the body decoded from its `content-encoding`. A body that
 //! streams is decoded, scanned and encoded again in the same codings
