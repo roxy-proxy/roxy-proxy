@@ -754,7 +754,6 @@ async fn forward<F: ClientTransport>(
         });
         req.meta.upgrade = None;
     }
-    crate::redact::request(cx, &mut req);
     if let Err(e) = cx
         .snap
         .upstream

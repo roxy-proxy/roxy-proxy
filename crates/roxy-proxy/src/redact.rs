@@ -57,6 +57,8 @@ pub(crate) fn masks_body(cx: &FlowCx) -> bool {
 /// Drops `range` and `if-range` from a request whose response body will
 /// be masked, so the upstream sends the whole body: masking finds whole
 /// occurrences only, and a range's bounds are the client's to choose.
+/// Runs before the request is signed, so the signature covers the request
+/// as it leaves.
 pub(crate) fn request(cx: &FlowCx, req: &mut CanonicalRequest) {
     if masks_body(cx) {
         req.headers.remove("range");
