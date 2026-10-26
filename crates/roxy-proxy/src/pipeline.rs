@@ -1380,7 +1380,15 @@ fn apply_request_effect(
             req.headers
                 .insert(&name, value.as_str())
                 .map_err(|e| invalid(kind, &e))?;
-            cx.injected.extend_from_slice(value.secrets());
+            // The header value goes out OWS-trimmed, so a secret at either
+            // end loses its edge spaces; the trimmed form is what the
+            // upstream can echo.
+            cx.injected.extend(
+                value
+                    .secrets()
+                    .iter()
+                    .map(|s| s.trim_matches([' ', '\t']).to_owned()),
+            );
             cx.record.mutations.push(format!("set_header:{name}"));
         }
         Effect::RemoveHeader(name) => {

@@ -126,6 +126,27 @@ async fn trailers_after_an_empty_body_are_masked() {
     assert_eq!(trailers["x-reflect"], format!("Bearer {MASKED}").as_str());
 }
 
+/// A secret with edge whitespace is forwarded trimmed where it ends the
+/// header value; that trimmed form is still masked when echoed.
+#[tokio::test]
+async fn a_secret_padded_with_whitespace_is_masked_as_forwarded() {
+    let kit = Kit::builder()
+        .secret("token", " padded-secret-value\t")
+        .rules(RULES)
+        .http(|h| h.redact_response_secrets = BOTH)
+        .start()
+        .await;
+    let a = kit.h1().await.call("GET", "/reflect", &[], b"").await;
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(
+        seen[0].headers["authorization"],
+        "Bearer  padded-secret-value"
+    );
+    let masked = format!("Bearer  {}", "*".repeat("padded-secret-value".len()));
+    assert_eq!(a.headers["x-reflect"], masked.as_str());
+    assert_eq!(body(&a), masked);
+}
+
 /// An exchange that injected nothing is not scrubbed: the value is the
 /// client's own.
 #[tokio::test]

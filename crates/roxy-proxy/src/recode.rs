@@ -151,10 +151,7 @@ pub(crate) fn encode_request(
     {
         return;
     }
-    let mut declared = headers.get_all(http::header::CONTENT_LENGTH).iter();
-    if let (Some(v), None) = (declared.next(), declared.next())
-        && let Ok(n) = roxy_http::parse_content_length(v.as_bytes())
-    {
+    if let Some(n) = roxy_http::upstream::single_content_length(headers) {
         headers.remove(http::header::CONTENT_LENGTH);
         *body = std::mem::take(body).checked(u64::MAX, Some(n));
     }
@@ -233,11 +230,11 @@ mod tests {
     async fn a_layers_declared_length_is_checked_before_encoding() {
         let kit = Kit::builder().start().await;
         let shared = kit.server.shared();
-        for (declared, holds) in [("5", true), ("4", false)] {
+        for (declared, holds) in [("5", true), (" 5\t", true), ("4", false)] {
             let mut headers = HeaderMap::new();
             headers.insert(
                 http::header::CONTENT_LENGTH,
-                HeaderValue::from_static(declared),
+                HeaderValue::from_str(declared).unwrap(),
             );
             let mut body = Body::from_bytes(Bytes::from_static(b"hello"));
             encode_request(shared, &mut headers, &mut body, &[Coding::Gzip]);
