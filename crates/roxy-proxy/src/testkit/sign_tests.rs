@@ -189,6 +189,97 @@ async fn s3_signs_the_payload_hash_or_streams_an_unsigned_payload() {
     assert_eq!(seen[0].body.len(), 4096);
 }
 
+/// A body rule on a signed, encoded request reads the decoded text, and
+/// the request goes as it came: the signed hash is of the bytes sent.
+#[tokio::test]
+async fn a_body_rule_on_a_signed_encoded_request_keeps_the_signature() {
+    let rules = format!(
+        r#"
+- id: no-secret
+  when: host == "up.test" and body.text contains "SECRET"
+  then: deny
+{}"#,
+        rules("s3", "")
+    );
+    let kit = Kit::builder()
+        .secret("akid", AKID)
+        .secret("sk", SK)
+        .secret("token", TOKEN)
+        .rules(&rules)
+        .start()
+        .await;
+    let gzip = |b: &[u8]| {
+        use std::io::Write as _;
+        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(b).unwrap();
+        e.finish().unwrap()
+    };
+    let put = |body: Vec<u8>| {
+        let kit = &kit;
+        async move {
+            let mut c = kit.h1().await;
+            let req = c
+                .request("PUT", "/bucket/key", &[("content-encoding", "gzip")])
+                .body(Body::from_bytes(Bytes::from(body)))
+                .unwrap();
+            Answer::read(c.send(req).await.unwrap()).await
+        }
+    };
+    let a = put(gzip(b"the SECRET")).await;
+    assert_eq!(a.status, 403, "{a:?}");
+    assert!(kit.upstream.seen().is_empty());
+
+    let sent = gzip(b"nothing to see");
+    let a = put(sent.clone()).await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].body, sent);
+    assert_eq!(
+        seen[0].headers["x-amz-content-sha256"],
+        super::sha256_hex(&sent)
+    );
+}
+
+/// `range` goes before the signature is made: a response body rule reads
+/// the whole response, so the request goes without `range`, and the
+/// signature covers the request as it leaves rather than naming a header
+/// that is no longer there.
+#[tokio::test]
+async fn a_range_dropped_for_a_body_rule_is_dropped_before_signing() {
+    let rules = format!(
+        r#"
+- id: no-secret
+  when: host == "up.test" and response.body.text contains "SECRET"
+  then: deny
+{}"#,
+        rules("s3", "")
+    );
+    let kit = Kit::builder()
+        .secret("akid", AKID)
+        .secret("sk", SK)
+        .secret("token", TOKEN)
+        .rules(&rules)
+        .start()
+        .await;
+    let a = kit
+        .h1()
+        .await
+        .call("GET", "/bucket/key", &[("range", "bytes=0-9")], b"")
+        .await;
+    assert_eq!(a.status, 200, "{a:?}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert!(
+        !seen[0].headers.contains_key("range"),
+        "{:?}",
+        seen[0].headers
+    );
+    let auth = seen[0].headers["authorization"].to_str().unwrap();
+    assert!(
+        !signed_headers(auth).split(';').any(|h| h == "range"),
+        "{auth}"
+    );
+}
+
 /// `range` goes before the signature is made: with masking on, a request
 /// that injected a secret goes without `range`, and the signature covers
 /// the request as it leaves rather than naming a header that is no
@@ -456,6 +547,44 @@ async fn a_signed_request_keeps_its_trailers() {
         .as_ref()
         .unwrap_or_else(|| panic!("{:?}", seen[0]));
     assert_eq!(trailers["x-checksum"], "abc");
+}
+
+/// A signed request of trailers alone, labelled with a coding, has no
+/// text to decode: its tests are settled as an empty body's, and it goes
+/// with no bytes, as the payload hash says.
+#[tokio::test]
+async fn a_signed_encoded_request_of_trailers_alone_goes_without_bytes() {
+    let rules = format!(
+        r#"
+- id: no-secret
+  when: host == "up.test" and body.text contains "SECRET"
+  then: deny
+{}"#,
+        rules("s3", "")
+    );
+    let kit = Kit::builder()
+        .secret("akid", AKID)
+        .secret("sk", SK)
+        .secret("token", TOKEN)
+        .rules(&rules)
+        .flags(|f| f.allow_request_trailers = true)
+        .start()
+        .await;
+    let mut io = super::http_tests::h1_in_tunnel(&kit).await;
+    io.write_all(
+        b"POST /bucket/key HTTP/1.1\r\nhost: up.test\r\ncontent-encoding: gzip\r\ntransfer-encoding: chunked\r\n\r\n0\r\nx-checksum: none\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let (head, _) = super::read_response(&mut io).await;
+    assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+    let seen = kit.upstream.wait_seen(1).await;
+    assert_eq!(seen[0].body, b"", "{:?}", seen[0]);
+    assert_eq!(
+        seen[0].headers["x-amz-content-sha256"],
+        super::sha256_hex(b"")
+    );
+    assert_eq!(seen[0].trailers.as_ref().unwrap()["x-checksum"], "none");
 }
 
 #[tokio::test]

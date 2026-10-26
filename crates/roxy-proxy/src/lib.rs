@@ -61,6 +61,7 @@ mod pipeline;
 pub mod quarantine;
 mod recode;
 mod redact;
+mod scan;
 pub mod secrets;
 pub mod server;
 mod sign;

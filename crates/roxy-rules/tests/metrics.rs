@@ -444,16 +444,16 @@ fn null_key_guarded_by_where_skips_the_flow() {
 fn filter_failure_propagates() {
     let c = TestClock::new();
     let p = compile(
-        "- { id: f, count: requests, where: 'body.text contains \"x\"' }
+        "- { id: f, count: requests, where: 'client.ip in @internal' }
 - { id: plain, count: requests }",
         "[]",
     );
     let s = MetricStore::with_clock(p.metric_defs(), 10, c.clock());
-    let v = MapView::new(); // body not buffered
+    let v = MapView::new().with(Field::ClientIp, Value::Ip(Ipv4Addr::LOCALHOST.into())); // list not loaded
     let reason = p.metric_defs()[0].matches(&v).unwrap_err();
     assert_eq!(
         reason,
-        FailClosedReason::BodyUnavailable("body.text".into())
+        FailClosedReason::AddressListUnavailable("internal".into())
     );
     assert_eq!(
         s.record(&v, &REQ),
@@ -465,9 +465,13 @@ fn filter_failure_propagates() {
     // Other metrics still counted the flow.
     assert_eq!(s.get("plain", &v), Ok(1));
     // Filter true / false.
-    rec(&s, &v.clone().with_body("xyz"));
-    rec(&s, &v.clone().with_body("abc"));
-    assert_eq!(s.get("f", &v), Ok(1));
+    let listed = |nets: &str| {
+        v.clone()
+            .with_address_list("internal", vec![nets.parse().unwrap()])
+    };
+    rec(&s, &listed("127.0.0.0/8"));
+    rec(&s, &listed("10.0.0.0/8"));
+    assert_eq!(s.get("f", &listed("127.0.0.0/8")), Ok(1));
 }
 
 #[test]

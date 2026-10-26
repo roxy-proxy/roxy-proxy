@@ -239,12 +239,18 @@ impl Body {
     }
 
     /// The whole body, when it is held in memory and not yet polled (one
-    /// built with [`Body::from_bytes`], or buffered by an inspection).
+    /// built with [`Body::from_bytes`], or buffered whole).
     pub fn as_bytes(&self) -> Option<&Bytes> {
         match &self.inner {
             Inner::Full { data, .. } => data.as_ref(),
             Inner::Empty | Inner::Channel { .. } | Inner::Boxed { .. } | Inner::Prefixed(_) => None,
         }
+    }
+
+    /// Whether the body is held in memory and not yet polled: [`Self::as_bytes`]
+    /// is its data, or it has none (trailers alone).
+    pub fn is_held(&self) -> bool {
+        matches!(self.inner, Inner::Full { .. })
     }
 
     /// Buffers the whole body (for inspection paths): its bytes and the

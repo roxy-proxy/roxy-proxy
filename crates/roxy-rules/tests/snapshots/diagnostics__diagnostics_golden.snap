@@ -82,7 +82,7 @@ rules[0].when:1:1: `tag["x"]` is never null (false until set), so comparing it w
 rules[1].when:1:1: `metric.writes` is never null (an unavailable metric fails the flow closed), so comparing it with `null` is always the same answer; remove it  [rule b]
     | metric.writes != null
     | ^^^^^^^^^^^^^
-rules[2].when:1:9: `body.text` is never null (an unavailable body fails the flow closed), so comparing it with `null` is always the same answer; remove it  [rule c]
+rules[2].when:1:9: `body.text` is never null (an empty body is the empty string), so comparing it with `null` is always the same answer; remove it  [rule c]
     | null != body.text
     |         ^^^^^^^^^
 

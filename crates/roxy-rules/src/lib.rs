@@ -53,8 +53,8 @@
 //! * **One list, two kinds of rule**. Compiling records what each
 //!   rule's `when` reads. A rule that reads only *admission* values (known
 //!   at the forwarding decision) is an **admission rule**. A rule that
-//!   reads an *in-flight* field (`body.bytes`, `response.*`, `ws.*`) is an
-//!   **in-flight rule**. A `deny` or `quarantine` rule that reads a byte
+//!   reads an *in-flight* field (`body.bytes`, `body.text`, `response.*`,
+//!   `ws.*`) is an **in-flight rule**. A `deny` or `quarantine` rule that reads a byte
 //!   metric (`count: request_bytes` or `response_bytes`) and no in-flight
 //!   field is both ([`RuleKind::AdmissionAndInFlight`]): it takes part in
 //!   the admission decision and is re-checked as this exchange adds bytes
@@ -80,6 +80,11 @@
 //!   rule apply once, the first time it matches. Each rule's reads are a
 //!   bit mask, so an event no rule triggers on costs one `and`, and an
 //!   evaluation in which nothing matches allocates nothing.
+//! * **Body text** is never buffered. `body.text` and `response.body.text`
+//!   take only comparisons with quoted strings that can be decided as the
+//!   body streams ([`TextScan`]). A comparison not yet decided reads as
+//!   whichever answer cannot make its rule match, so a rule fires only
+//!   once the bytes settle it.
 //! * **Legal actions**. Admission rules may use every action; their
 //!   `set_header`/`remove_header` change the request. An in-flight rule
 //!   cannot `allow`, `rewrite_path`, `set_query`, `remove_query`,
@@ -88,18 +93,18 @@
 //!   `remove_header` change the response**: they are legal only when the
 //!   rule reads response values and everything that can re-check it is
 //!   known before the response head is sent (`response.status`,
-//!   `response.header[..]`, `response.body.size`, `response.body.text`); an
-//!   in-flight rule that does not read the response would change the
-//!   request, and one that also reads `body.bytes`, `response.body.bytes`
-//!   or a byte metric could match after the head was sent. Both are
+//!   `response.header[..]`, `response.body.size`); an in-flight rule that
+//!   does not read the response would change the request, and one that
+//!   also reads `body.bytes`, `body.text`, the response body or a byte
+//!   metric could match after the head was sent. Both are
 //!   compile errors. There is no explicit target key: the rule's reads
 //!   decide it.
 //! * **Denies close.** A deny closes the client connection after the
 //!   response unless the rule says `deny: { close: false }`.
 //! * **Unavailable inputs fail closed.** If evaluation reaches a metric the
 //!   view reports unavailable ([`FlowView::metric`] → `None`), an address
-//!   list it cannot answer for, a body predicate whose body is too large to
-//!   inspect or not available ([`BodyText`]), a missing value under an
+//!   list it cannot answer for, a body predicate whose body the view does
+//!   not have ([`BodyText::Unavailable`]), a missing value under an
 //!   operator that cannot answer for `null`, or a `set_header` secret that
 //!   is missing or not a valid header value: at admission, the result is
 //!   [`Decision::fail_closed`] (503, close), `terminal_rule =
@@ -167,6 +172,7 @@ mod parser;
 mod policy;
 mod state;
 pub mod template;
+mod text;
 mod types;
 mod view;
 pub mod yaml;
@@ -194,5 +200,6 @@ pub use policy::{
 };
 pub use state::{StateFull, StateSource, StateStore};
 pub use template::{Part, TemplateError, expand, parse_template};
+pub use text::{BodySide, TextScan, TextTests};
 pub use types::{Field, InFlightValue, Reads, Type};
 pub use view::{BodyText, FlowView, MapView, Value};

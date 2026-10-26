@@ -14,89 +14,17 @@
 
 use std::borrow::Cow;
 use std::net::IpAddr;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Mutex, PoisonError};
 
-use roxy_http::coding::{self, DecodeError};
 use roxy_http::ws::frame::Message;
 use roxy_http::{Headers, Host, Method, Query, Scheme};
-use roxy_rules::{BodyText, Field, FlowView, Value};
+use roxy_rules::{BodyText, Field, FlowView, TextScan, Value};
 
 use crate::addrlist::AddressLists;
-use crate::budget::Exhausted;
 use crate::flowlog::TlsInfo;
 use crate::in_flight::Dir;
 use crate::listener::ClientConn;
-use crate::server::Shared;
 use crate::sources::{MetricSource, MetricSourceError, StateSource};
-
-/// An inspected (buffered) body.
-#[derive(Debug, Clone, Default)]
-pub(crate) enum Inspected {
-    /// No rule needs the body; it streams untouched.
-    #[default]
-    NotBuffered,
-    /// Buffered and decoded (lossy UTF-8). Shared: the facts are cloned
-    /// into the in-flight checker and the addon stack, and the text can be
-    /// as large as `limits.max_inspect_body_bytes`.
-    Text(Arc<str>),
-    /// Larger than `limits.max_inspect_body_bytes`, as sent or decoded.
-    TooLarge,
-    /// `content-encoding` names a coding roxy cannot decode.
-    UnsupportedEncoding(String),
-    /// The body could not be decoded.
-    Undecodable(String),
-}
-
-impl Inspected {
-    /// A body known to carry no bytes: its text is empty whatever its
-    /// headers say.
-    pub(crate) fn empty() -> Self {
-        Self::Text(Arc::from(""))
-    }
-
-    /// A buffered body, decoded by its `content-encoding` for the rules.
-    /// The decoded text may be at most `cap` bytes, like the body as sent.
-    /// The decoder's windows are charged to `shared`'s budget while it
-    /// runs; a window the budget cannot cover is [`Exhausted`], which the
-    /// caller fails closed on rather than a fact about the body.
-    pub(crate) fn decode(
-        headers: &Headers,
-        body: &[u8],
-        cap: u64,
-        shared: &Arc<Shared>,
-    ) -> Result<Self, Exhausted> {
-        let codings = match coding::content_codings(headers) {
-            Ok(c) => c,
-            Err(e) => return Self::from_error(e),
-        };
-        if codings.is_empty() {
-            return Ok(Self::Text(String::from_utf8_lossy(body).into()));
-        }
-        match coding::decode(&codings, body, cap, shared.window_meter()) {
-            Ok(d) => Ok(Self::Text(String::from_utf8_lossy(&d).into())),
-            Err(e) => Self::from_error(e),
-        }
-    }
-
-    fn from_error(e: DecodeError) -> Result<Self, Exhausted> {
-        Ok(match e {
-            DecodeError::Unsupported(c) => Self::UnsupportedEncoding(c),
-            DecodeError::TooLarge { .. } => Self::TooLarge,
-            DecodeError::BudgetExhausted => return Err(Exhausted),
-            e @ DecodeError::Invalid { .. } => Self::Undecodable(e.to_string()),
-        })
-    }
-
-    fn as_body_text(&self) -> BodyText<'_> {
-        match self {
-            Self::NotBuffered => BodyText::Unavailable,
-            Self::Text(t) => BodyText::Available(Cow::Borrowed(t)),
-            Self::TooLarge => BodyText::TooLarge,
-            Self::UnsupportedEncoding(c) => BodyText::UnsupportedEncoding(c),
-            Self::Undecodable(d) => BodyText::Undecodable(d),
-        }
-    }
-}
 
 /// The request head.
 #[derive(Debug, Clone)]
@@ -110,7 +38,6 @@ pub(crate) struct RequestFacts {
     pub headers: Headers,
     pub upgrade: Option<String>,
     pub body_size: Option<u64>,
-    pub body: Inspected,
     pub head_bytes: usize,
 }
 
@@ -120,7 +47,6 @@ pub(crate) struct ResponseFacts {
     pub status: http::StatusCode,
     pub headers: Headers,
     pub body_size: Option<u64>,
-    pub body: Inspected,
 }
 
 /// The WebSocket message being checked.
@@ -153,6 +79,12 @@ pub(crate) struct FlowFacts {
     pub response_body_bytes: Option<u64>,
     /// `ws.*`: set only while a WebSocket message is being checked.
     pub ws: Option<WsFacts>,
+    /// `body.text`: the scan of the request body, from forwarding on, when
+    /// a rule reads it.
+    pub request_text: Option<TextScan>,
+    /// `response.body.text`: the scan of the response body, from its head
+    /// on.
+    pub response_text: Option<TextScan>,
 }
 
 /// Lower-case host text without brackets.
@@ -183,6 +115,10 @@ fn s(v: Option<&String>) -> Value<'_> {
 /// hide a value from a predicate.
 fn all_values<'h>(h: &'h Headers, name: &str) -> Vec<Cow<'h, str>> {
     h.get_all_text(name).collect()
+}
+
+fn scanned(scan: Option<&TextScan>) -> BodyText<'_> {
+    scan.map_or(BodyText::Unavailable, |s| BodyText::Scanned(s.results()))
 }
 
 fn int(n: u64) -> Value<'static> {
@@ -377,17 +313,11 @@ impl FlowView for ProxyView<'_> {
     }
 
     fn body_text(&self) -> BodyText<'_> {
-        self.facts
-            .request
-            .as_ref()
-            .map_or(BodyText::Unavailable, |r| r.body.as_body_text())
+        scanned(self.facts.request_text.as_ref())
     }
 
     fn response_body_text(&self) -> BodyText<'_> {
-        self.facts
-            .response
-            .as_ref()
-            .map_or(BodyText::Unavailable, |r| r.body.as_body_text())
+        scanned(self.facts.response_text.as_ref())
     }
 
     fn in_address_list(&self, list: &str, ip: IpAddr) -> Option<bool> {
@@ -397,46 +327,5 @@ impl FlowView for ProxyView<'_> {
         // Exact membership: see `AddressList::contains_exact` for why the
         // broad deny-floor matching is wrong for rules that allow.
         self.lists.get(list).map(|l| l.contains_exact(ip))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::io::Write as _;
-
-    use super::*;
-    use crate::testkit::Kit;
-
-    /// Decoding for the rules charges the decoder's window to the budget
-    /// for as long as it runs: a window the budget cannot cover is refused
-    /// before anything is allocated, and one it can is given back with the
-    /// decoder.
-    #[tokio::test]
-    async fn decoding_charges_the_window_and_gives_it_back() {
-        let mut e = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        e.write_all(b"hello").unwrap();
-        let gz = e.finish().unwrap();
-        let mut headers = Headers::new();
-        headers.append("content-encoding", "gzip").unwrap();
-
-        let kit = Kit::builder()
-            .limits(|l| l.max_buffered_bytes = 16 * 1024)
-            .start()
-            .await;
-        let shared = kit.server.shared().clone();
-        assert!(matches!(
-            Inspected::decode(&headers, &gz, 1 << 20, &shared),
-            Err(Exhausted)
-        ));
-        assert_eq!(shared.buffered(), 0);
-
-        let kit = Kit::builder().start().await;
-        let shared = kit.server.shared().clone();
-        let text = Inspected::decode(&headers, &gz, 1 << 20, &shared).unwrap();
-        assert!(
-            matches!(&text, Inspected::Text(t) if &**t == "hello"),
-            "{text:?}"
-        );
-        assert_eq!(shared.buffered(), 0);
     }
 }

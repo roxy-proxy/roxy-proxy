@@ -104,8 +104,13 @@ and the flow log records the rules' decision.
 
 ## Streams, not messages
 
-A body is buffered only when a rule or addon needs to read it, up to a
-cap, and all buffers together stay within one process-wide budget
+Rules read body text as it streams, holding back the last few bytes (as
+many as the longest string they compare with), so the text that decides
+a rule against a body is never sent before the rule stops the exchange
+([body rules](/reference/rule-language#body-rules)). A
+body is buffered only to sign it, to hand it whole to an addon, or to
+check a WebSocket message, up to a cap, and all buffers together stay
+within one process-wide budget
 ([limits](/reference/limits#buffer-budget)). Memory use does not grow with
 body size.
 

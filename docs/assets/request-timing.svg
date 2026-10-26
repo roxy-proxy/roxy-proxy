@@ -98,7 +98,7 @@
     <text x="550" y="162">admission, once, on the head:</text>
     <text x="550" y="180">allow · deny · change it</text>
     <text x="550" y="248">in flight, as bytes pass:</text>
-    <text x="550" y="266">body.bytes · byte metrics</text>
+    <text x="550" y="266">body.bytes · body.text · metrics</text>
     <text x="550" y="284">deny or quarantine only</text>
   </g>
 </svg>

@@ -26,10 +26,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// cover.
 pub(crate) const EXHAUSTED: &str = "buffer_budget_exhausted";
 
-/// The budget could not cover a reservation.
-#[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Exhausted;
-
 /// Bytes reserved across the process.
 #[derive(Debug, Default)]
 pub(crate) struct BufferBudget {

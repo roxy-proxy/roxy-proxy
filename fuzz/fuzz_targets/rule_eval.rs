@@ -9,8 +9,8 @@
 //!   allow, and the reason is set exactly when the terminal rule is
 //!   `_fail_closed`;
 //! - **unavailable inputs only ever fail closed.** Take a flow where every
-//!   input is available, then make one unavailable (a metric, the request
-//!   body text, the address list). The outcome is either exactly the same
+//!   input is available, then make one unavailable (a metric, the address
+//!   list). The outcome is either exactly the same
 //!   (the input was not reached) or a fail-closed deny. It is never a
 //!   different decision, in particular never an allow that the available
 //!   flow did not get.
@@ -35,7 +35,6 @@ const STR_FIELDS: &[&str] = &[
     "header[\"x-a\"]",
     "query[\"q\"]",
     "state[\"k\"]",
-    "body.text",
 ];
 const INT_FIELDS: &[&str] = &["port", "body.size", "metric.m0", "metric.m1"];
 const STR_OPS: &[&str] = &[
@@ -121,7 +120,6 @@ struct Flow<'a> {
     state: Option<&'a str>,
     m0: i64,
     m1: i64,
-    body: &'a str,
     in_list: bool,
 }
 
@@ -138,8 +136,7 @@ fn view(f: &Flow<'_>) -> MapView {
         .with_int(Field::Port, i64::from(f.port))
         .with(Field::ClientIp, roxy_rules::Value::Ip(ip.into()))
         .with_metric("m0", f.m0)
-        .with_metric("m1", f.m1)
-        .with_body(f.body);
+        .with_metric("m1", f.m1);
     if let Some(h) = f.header {
         v = v.with_header("x-a", h);
     }
@@ -205,13 +202,6 @@ fuzz_target!(|data: &[u8]| {
         v.metrics.remove(metric);
         degraded.push((format!("metric {metric} unavailable"), v));
     }
-    let mut v = full.clone();
-    v.body = None;
-    degraded.push(("body text unavailable".to_owned(), v));
-    degraded.push((
-        "body too large".to_owned(),
-        full.clone().with_body_too_large(false),
-    ));
     let mut v = full.clone();
     v.address_lists.clear();
     degraded.push(("address list unavailable".to_owned(), v));

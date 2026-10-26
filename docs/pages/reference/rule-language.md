@@ -58,13 +58,13 @@ is checked as the exchange streams
 | `query["k"]`, `query.raw` | string | admission |
 | `header["name"]`, `header.all["name"]` | string, list | admission |
 | `body.size` | int: declared length, `null` if not declared | admission |
-| `body.text` | string: the buffered body | admission |
 | `metric.<id>` | int | admission ([rate limits](/reference/rate-limits#metrics)) |
 | `state["key"]`, `tag["name"]` | string, bool | admission |
+| `body.text` | string: the request body, checked as it streams | in-flight ([body rules](/reference/rule-language#body-rules)) |
 | `body.bytes` | int: request body bytes so far | in-flight |
 | `response.status`, `response.header["name"]`, `response.header.all["name"]` | int, string, list | in-flight |
 | `response.body.size` | int: declared length, `null` if not declared | in-flight |
-| `response.body.text` | string: the buffered response body | in-flight |
+| `response.body.text` | string: the response body, checked as it streams | in-flight ([body rules](/reference/rule-language#body-rules)) |
 | `response.body.bytes` | int: response body bytes so far | in-flight |
 | `ws.direction`, `ws.opcode`, `ws.size`, `ws.text` | string, int, int, string | in-flight, per WebSocket message ([WebSockets](/reference/websockets#message-rules)) |
 
@@ -128,7 +128,7 @@ These add effects:
 
 | action | where | effect |
 |---|---|---|
-| `set_header: { name: value }` | request: admission rules; response: in-flight rules | Set or replace a header. Request values may use `${secret:name}` ([secrets](/reference/secrets)). |
+| `set_header: { name: value }` | request: admission rules; response: in-flight rules | Set or replace a header. Request values may use `${secret:name}` ([secrets](/reference/secrets)). Framing and hop-by-hop headers, `host` and `content-encoding` belong to roxy and cannot be changed. |
 | `remove_header: [names]` | as `set_header` | Remove headers. |
 | `rewrite_path: { match, to }` | admission rules | Rewrite the path with a regex; `$1` and `${name}` refer to groups. |
 | `set_query: { k: v }`, `remove_query: [k]` | admission rules | Change the query. |
@@ -144,19 +144,75 @@ Anything more complex needs an addon.
 
 ## Body rules
 
-`body.text` and `response.body.text` are the only fields that make roxy
-buffer. If any rule reads `body.text`, roxy buffers every request body, up
-to `limits.max_inspect_body_bytes` (1 MiB), before deciding, then streams
-it on. `response.body.text` does the same for responses.
+`body.text` and `response.body.text` are checked as the body streams
+past, without buffering it. Each comparison is a test that roxy decides
+while the bytes go by:
 
-A body over the cap cannot be inspected, and a rule that reads it denies
-the exchange (`body_too_large_to_inspect`). To let large bodies through,
-raise the cap, or check the size before the text:
+| comparison | decided |
+|---|---|
+| `contains "s"` | once `s` is seen, or at the end of the body |
+| `starts_with "s"` | once the body's first bytes match `s` or not |
+| `ends_with "s"` | at the end of the body |
+| `== "s"`, `in [...]` | once the body differs from `s`, or at the end |
+| `not` any of these, `!=`, `not in` | as the comparison it negates |
+
+The value must be a quoted string, with the field on the left (either
+side for `==` and `!=`). `matches`, `like`, `under`, `<` and `>` cannot be
+decided as the body streams, and are compile errors.
+
+The body is compared byte for byte with the string's UTF-8 bytes. Invalid
+UTF-8 in the body is not replaced, so a string containing U+FFFD (`�`)
+could never match it, and is a compile error.
+
+A rule that reads body text runs in flight: it can `deny`, `quarantine`,
+`log`, `tag` and `set_state`, but not `allow` or change the request.
+Write the allow as an admission rule and the body check as a `deny`:
 
 ```yaml
-when: body.size != null and body.size < 1mb and body.text contains "secret"
+- id: no-keys-out
+  when: host == "api.example.com" and body.text contains "BEGIN PRIVATE KEY"
+  then: deny
+- id: example
+  when: host == "api.example.com"
+  then: allow
 ```
+
+**Nothing that would make a rule fire leaves roxy.** The last bytes of
+the body so far are held back until the next bytes arrive or the body
+ends: as many as the longest string the rules compare with, and one more
+when a rule needs a test to be false (such as
+`not body.text contains "s"`), since only the end of the body can decide
+that. The hold is the same whatever the bytes are, so what the client
+sees of it says nothing about the rules' text, and a `contains` that
+fires stops the exchange with none of the match sent. A streamed body
+reaches the other side that many bytes behind until it ends.
+
+The hold covers the comparison that decides the rule. A rule that makes
+two comparisons on the same body (`body.text contains "a" and
+body.text ends_with "z"`) fires when the last of them is decided, and
+by then the text that decided an earlier one may have left: where that
+matters, write one comparison per rule. `body.bytes` and
+`response.body.bytes` count the bytes forwarded so far, so while a body
+rule holds bytes back they run behind the text the rules have read; a
+rule should not combine a text comparison with a byte count on the same
+body.
+
+When a rule fires mid-body, the exchange stops there. The upstream has
+the request head and the body up to the held bytes, and the request is
+cut. If the response head has not gone, the client gets the deny
+response; otherwise its response is cut. A response body rule cuts the
+response the same way, after its head has gone to the client.
+
+A response body rule reads the whole response. With one in the policy,
+roxy drops `range` and `if-range` from every request, so the upstream
+sends the whole body: the client chooses where a range starts and ends,
+and two ranges that each cut a match would carry it out in pieces. A
+partial response (`206`) that comes back anyway fails closed
+(`partial_response`).
 
 The text is the body decoded from its `content-encoding`
 ([content codings](/reference/http#content-codings)). A body that cannot
-be decoded also denies the exchange.
+be decoded, or is in a coding roxy does not decode, fails closed
+(`body_decode_failed`, `unsupported_content_encoding`), as does one whose
+coder the [buffer budget](/reference/limits#buffer-budget) cannot cover
+(`buffer_budget_exhausted`). An empty body is the empty string.

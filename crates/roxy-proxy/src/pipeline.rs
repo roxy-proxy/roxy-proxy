@@ -1,10 +1,9 @@
 //! The exchange core's fixed steps.
 //!
-//! On the way out, [`request_steps`] buffers the request body (only when a
-//! rule reads `body.text`) and then makes the admission decision with its
-//! effects. On the way back, [`response_steps`] buffers the response body
-//! (only for `response.body.text`) and then checks the in-flight rules at the
-//! response head ([`crate::in_flight`]). The upstream exchange between the two
+//! On the way out, [`request_steps`] makes the admission decision with its
+//! effects. On the way back, [`response_steps`] checks the in-flight rules
+//! at the response head ([`crate::in_flight`]). Neither reads a body: rules
+//! on body text are checked as it streams ([`crate::scan`]). The upstream exchange between the two
 //! is in [`crate::exchange`]. Extension happens above all of this, in the
 //! addon stack ([`crate::addons`]), not here.
 //!
@@ -25,7 +24,7 @@ use std::future::Future;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Instant, SystemTime};
 
 use aws_sigv4::http_request::SignableBody;
 use bytes::Bytes;
@@ -33,7 +32,7 @@ use http::StatusCode;
 use roxy_http::h1::ServerConn;
 use roxy_http::url::{normalize_path, normalize_query};
 use roxy_http::{
-    Authority, Body, BodyError, CanonicalRequest, CanonicalResponse, DriveError, Headers, Method,
+    Authority, Body, BodyError, CanonicalRequest, CanonicalResponse, DriveError, Method,
     ParseError, Query, Reason, Scheme, status_forbids_body,
 };
 use roxy_rules::{
@@ -43,9 +42,8 @@ use roxy_rules::{
 use ulid::Ulid;
 
 use crate::body::{Collected, collect_prefix};
-use crate::budget::{self, BufferLease, Exhausted};
+use crate::budget::{self, BufferLease};
 use crate::capture::Tap;
-use crate::exchange::{WriteFailure, emit_response_error};
 use crate::flowlog::{
     ClientInfo, DecisionKind, DstInfo, FlowEvent, PeerInfo, RequestInfo, ResponseInfo, Stage,
     Timing, TlsInfo,
@@ -58,9 +56,7 @@ use crate::secrets::Secrets;
 use crate::server::{Shared, Snapshot};
 use crate::sign;
 use crate::sources::{MetricSourceError, Sample};
-use crate::view::{
-    FlowFacts, Inspected, ProxyView, RequestFacts, ResponseFacts, host_str, host_text,
-};
+use crate::view::{FlowFacts, ProxyView, RequestFacts, ResponseFacts, host_str, host_text};
 
 /// The boxed future of [`BodyIo::collect`].
 pub(crate) type CollectFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -308,23 +304,18 @@ pub(crate) enum ResponseVerdict {
     Continue(CanonicalResponse),
     /// Replace it with a local answer.
     Deny(Refusal),
-    /// The client side ended the exchange while the response was being
-    /// inspected.
-    Close(DriveError),
 }
 
 /// Body access a step needs from the client connection: buffering while
 /// the codec keeps pumping the client's request body.
 pub(crate) trait BodyIo: Send {
     /// [`collect_prefix`], with `meter` asked after each frame whether the
-    /// bytes held so far may be kept and `idle` bounding the wait for each
-    /// frame.
+    /// bytes held so far may be kept.
     fn collect<'a>(
         &'a mut self,
         body: &'a mut Body,
         cap: u64,
         meter: &'a mut (dyn FnMut(u64) -> bool + Send),
-        idle: Option<Duration>,
     ) -> CollectFuture<'a, Result<Collected, DriveError>>;
 }
 
@@ -334,31 +325,24 @@ impl BodyIo for ServerConn<ClientIo> {
         body: &'a mut Body,
         cap: u64,
         meter: &'a mut (dyn FnMut(u64) -> bool + Send),
-        idle: Option<Duration>,
     ) -> CollectFuture<'a, Result<Collected, DriveError>> {
-        Box::pin(self.drive(collect_prefix(body, cap, meter, idle)))
+        Box::pin(self.drive(collect_prefix(body, cap, meter)))
     }
 }
 
-/// The request side: inspect the body if a rule needs it, then the admission
-/// decision and its effects, then the signature over the result if a
-/// `sign` effect asked for one.
+/// The request side: the admission decision and its effects, then the
+/// signature over the result if a `sign` effect asked for one.
 pub(crate) async fn request_steps(
     cx: &mut FlowCx,
     req: CanonicalRequest,
     io: &mut dyn BodyIo,
 ) -> Verdict {
-    let req = match inspect_request_body(cx, req, io).await {
-        Verdict::Continue(req) => req,
-        Verdict::Deny(d) => return Verdict::Deny(d),
-        Verdict::Close(e) => return Verdict::Close(e),
-    };
     match request_rules(cx, req) {
         Verdict::Continue(mut req) => {
             // Settled with the effects, and before the signature, which
             // covers the request as it leaves. The in-flight rules and the
             // log see the request without the dropped fields.
-            if crate::redact::request(cx, &mut req) {
+            if crate::recode::request_whole(cx, &mut req) {
                 settle_request_facts(cx, &req);
             }
             sign_request(cx, req, io).await
@@ -368,18 +352,14 @@ pub(crate) async fn request_steps(
     }
 }
 
-/// The response side: inspect the body if a rule needs it, then the
-/// in-flight rules at the response head.
-pub(crate) async fn response_steps(
-    cx: &mut FlowCx,
-    res: CanonicalResponse,
-    io: &mut dyn BodyIo,
-) -> ResponseVerdict {
-    match inspect_response_body(cx, res, io).await {
-        ResponseVerdict::Continue(res) => response_rules(cx, res),
-        ResponseVerdict::Deny(d) => ResponseVerdict::Deny(d),
-        ResponseVerdict::Close(e) => ResponseVerdict::Close(e),
-    }
+/// The response side: the in-flight rules at the response head.
+pub(crate) fn response_steps(cx: &mut FlowCx, res: CanonicalResponse) -> ResponseVerdict {
+    cx.facts.response = Some(ResponseFacts {
+        status: res.status,
+        headers: res.headers.clone(),
+        body_size: res.body.known_length(),
+    });
+    response_rules(cx, res)
 }
 
 // ---------------------------------------------------------------------------
@@ -628,7 +608,6 @@ pub(crate) fn request_facts(req: &CanonicalRequest) -> RequestFacts {
         headers: req.headers.clone(),
         upgrade: req.meta.upgrade.clone(),
         body_size: req.body.known_length(),
-        body: Inspected::NotBuffered,
         head_bytes: req.meta.head_bytes,
     }
 }
@@ -700,6 +679,8 @@ impl FlowCx {
             request_body_bytes: None,
             response_body_bytes: None,
             ws: None,
+            request_text: None,
+            response_text: None,
         };
         Ok(Self {
             meta: Arc::new(FlowMeta {
@@ -1044,10 +1025,7 @@ pub(crate) fn fail_closed_code(
         FailClosedReason::AddressListUnavailable(_) => "address_list_unavailable",
         FailClosedReason::SecretMissing(_) => "secret_missing",
         FailClosedReason::SecretInvalid(_) => "secret_invalid",
-        FailClosedReason::BodyTooLargeToInspect(_) => "body_too_large_to_inspect",
         FailClosedReason::BodyUnavailable(_) => "body_unavailable",
-        FailClosedReason::UnsupportedContentEncoding { .. } => "unsupported_content_encoding",
-        FailClosedReason::BodyDecodeFailed { .. } => "body_decode_failed",
         FailClosedReason::MissingValue(_) => "missing_value",
         FailClosedReason::WrongType { .. } => "wrong_type",
     }
@@ -1074,99 +1052,9 @@ pub(crate) fn body_failure(e: &BodyError) -> ParseError {
 // Request steps
 // ---------------------------------------------------------------------------
 
-/// Bounded buffering in front of body-inspecting rules.
-async fn inspect_request_body(
-    cx: &mut FlowCx,
-    mut req: CanonicalRequest,
-    io: &mut dyn BodyIo,
-) -> Verdict {
-    if !cx.snap.policy.needs_request_body() {
-        return Verdict::Continue(req);
-    }
-    if known_empty(&req.body) {
-        if let Some(f) = cx.facts.request.as_mut() {
-            f.body_size = Some(0);
-            f.body = Inspected::empty();
-        }
-        return Verdict::Continue(req);
-    }
-    let cap = cx.snap.limits.max_inspect_body_bytes;
-    let Some(mut lease) = reserve_decoded_inspection(cx, &req.headers, &req.body, cap) else {
-        return Verdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
-    };
-    let shared = cx.shared.clone();
-    let mut meter = |held: u64| shared.grow_buffer(&mut lease, held);
-    let inspected = match io.collect(&mut req.body, cap, &mut meter, None).await {
-        Err(e) => return Verdict::Close(e),
-        Ok(Collected::Failed(e)) => return Verdict::Close(body_failure(&e).into()),
-        Ok(Collected::Complete { data, held }) => {
-            if let Some(f) = cx.facts.request.as_mut() {
-                f.body_size = Some(data.len() as u64);
-            }
-            let inspected = match Inspected::decode(&req.headers, &data, cap, &cx.shared) {
-                Ok(i) => i,
-                Err(Exhausted) => return Verdict::Deny(Refusal::fail_closed(budget::EXHAUSTED)),
-            };
-            lease.shrink_to(buffered_bytes(held, &inspected));
-            inspected
-        }
-        Ok(Collected::TooLarge { held }) => {
-            lease.shrink_to(held);
-            Inspected::TooLarge
-        }
-        Ok(Collected::BudgetExhausted) => {
-            return Verdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
-        }
-    };
-    cx.buffers.push(lease);
-    if let Some(f) = cx.facts.request.as_mut() {
-        f.body = inspected;
-    }
-    Verdict::Continue(req)
-}
-
-/// A body that carries no bytes needs no inspection buffer; the rules see
-/// it as empty text.
+/// A body that carries no bytes, whatever its headers say.
 pub(crate) fn known_empty(body: &Body) -> bool {
     body.known_length() == Some(0) || http_body::Body::is_end_stream(body)
-}
-
-/// Reserves the budget a body held as sent can need: its declared length
-/// when the framing gives one, else the whole cap.
-fn reserve_inspection(cx: &FlowCx, body: &Body, cap: u64) -> Option<BufferLease> {
-    let bytes = body.known_length().map_or(cap, |n| n.min(cap));
-    cx.shared.reserve_buffer(bytes)
-}
-
-/// Reserves the budget a body inspected by the rules can need. The facts
-/// hold the body decoded by its `content-encoding`, which can be any size
-/// up to the cap whatever length the framing declares, so an encoded body
-/// reserves the whole cap.
-fn reserve_decoded_inspection(
-    cx: &FlowCx,
-    headers: &Headers,
-    body: &Body,
-    cap: u64,
-) -> Option<BufferLease> {
-    let encoded = roxy_http::coding::content_codings(headers).is_ok_and(|c| !c.is_empty());
-    if encoded {
-        cx.shared.reserve_buffer(cap)
-    } else {
-        reserve_inspection(cx, body, cap)
-    }
-}
-
-/// What a completely buffered body holds for the rest of the exchange: the
-/// bytes as sent with their trailers (they go on to be forwarded) and, if
-/// `content-encoding` was decoded, the text the facts carry, which can be
-/// larger.
-fn buffered_bytes(held: u64, inspected: &Inspected) -> u64 {
-    let text = if let Inspected::Text(t) = inspected {
-        t.len() as u64
-    } else {
-        0
-    };
-    held.max(text)
 }
 
 /// The admission decision and its effects.
@@ -1221,14 +1109,9 @@ fn request_rules(cx: &mut FlowCx, mut req: CanonicalRequest) -> Verdict {
 /// The in-flight rules and the log see the request as it will be
 /// forwarded; what was learnt about the body stays.
 fn settle_request_facts(cx: &mut FlowCx, req: &CanonicalRequest) {
-    let body = cx
-        .facts
-        .request
-        .as_ref()
-        .map(|r| (r.body.clone(), r.body_size));
+    let size = cx.facts.request.as_ref().map(|r| r.body_size);
     let mut facts = request_facts(req);
-    if let Some((inspected, size)) = body {
-        facts.body = inspected;
+    if let Some(size) = size {
         facts.body_size = size;
     }
     cx.facts.request = Some(facts);
@@ -1257,7 +1140,7 @@ async fn sign_request(cx: &mut FlowCx, mut req: CanonicalRequest, io: &mut dyn B
     } else if known_empty(&req.body) {
         SignableBody::Bytes(&[])
     } else if let Some(b) = req.body.as_bytes() {
-        // Already buffered (inspected for the rules); its lease is held.
+        // Already in memory (a layer's body); nothing more to hold.
         buffered = b.clone();
         SignableBody::Bytes(&buffered)
     } else {
@@ -1271,10 +1154,10 @@ async fn sign_request(cx: &mut FlowCx, mut req: CanonicalRequest, io: &mut dyn B
         };
         let shared = cx.shared.clone();
         let mut meter = |held: u64| shared.grow_buffer(&mut lease, held);
-        buffered = match io.collect(&mut req.body, cap, &mut meter, None).await {
+        buffered = match io.collect(&mut req.body, cap, &mut meter).await {
             Err(e) => return Verdict::Close(e),
             Ok(Collected::Failed(e)) => return Verdict::Close(body_failure(&e).into()),
-            Ok(Collected::TooLarge { .. }) => return Verdict::Deny(Refusal::sign_body_too_large()),
+            Ok(Collected::TooLarge) => return Verdict::Deny(Refusal::sign_body_too_large()),
             Ok(Collected::BudgetExhausted) => {
                 return Verdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
             }
@@ -1470,83 +1353,6 @@ fn apply_request_effect(
 // Response steps
 // ---------------------------------------------------------------------------
 
-/// Bounded buffering of the response body for `response.body.text`.
-async fn inspect_response_body(
-    cx: &mut FlowCx,
-    mut res: CanonicalResponse,
-    io: &mut dyn BodyIo,
-) -> ResponseVerdict {
-    cx.facts.response = Some(ResponseFacts {
-        status: res.status,
-        headers: res.headers.clone(),
-        body_size: res.body.known_length(),
-        body: Inspected::NotBuffered,
-    });
-    if !cx.snap.policy.needs_response_body() {
-        return ResponseVerdict::Continue(res);
-    }
-    if response_known_empty(cx, &res) {
-        if let Some(f) = cx.facts.response.as_mut() {
-            f.body_size = Some(0);
-            f.body = Inspected::empty();
-        }
-        return ResponseVerdict::Continue(res);
-    }
-    let cap = cx.snap.limits.max_inspect_body_bytes;
-    let Some(mut lease) = reserve_decoded_inspection(cx, &res.headers, &res.body, cap) else {
-        return ResponseVerdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
-    };
-    let shared = cx.shared.clone();
-    let mut meter = |held: u64| shared.grow_buffer(&mut lease, held);
-    let idle = Some(cx.snap.limits.response_body_idle_timeout);
-    let inspected = match io.collect(&mut res.body, cap, &mut meter, idle).await {
-        Err(e) => return ResponseVerdict::Close(e),
-        // The same stall the transport would cut mid-body, caught before the
-        // head went out: the client gets an answer instead of a cut.
-        Ok(Collected::Failed(BodyError::Timeout)) => {
-            let e = WriteFailure::UpstreamStalled;
-            tracing::info!(flow = %cx.flow, error = %e, "upstream response body stalled");
-            emit_response_error(cx, "response_body_timeout", &e);
-            return ResponseVerdict::Deny(Refusal::upstream(
-                StatusCode::GATEWAY_TIMEOUT,
-                "response_body_timeout",
-            ));
-        }
-        Ok(Collected::Failed(e)) => {
-            tracing::info!(flow = %cx.flow, error = %e, "upstream response body failed");
-            return ResponseVerdict::Deny(Refusal::upstream(
-                StatusCode::BAD_GATEWAY,
-                "upstream_body_failed",
-            ));
-        }
-        Ok(Collected::Complete { data, held }) => {
-            if let Some(f) = cx.facts.response.as_mut() {
-                f.body_size = Some(data.len() as u64);
-            }
-            let inspected = match Inspected::decode(&res.headers, &data, cap, &cx.shared) {
-                Ok(i) => i,
-                Err(Exhausted) => {
-                    return ResponseVerdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
-                }
-            };
-            lease.shrink_to(buffered_bytes(held, &inspected));
-            inspected
-        }
-        Ok(Collected::TooLarge { held }) => {
-            lease.shrink_to(held);
-            Inspected::TooLarge
-        }
-        Ok(Collected::BudgetExhausted) => {
-            return ResponseVerdict::Deny(Refusal::fail_closed(budget::EXHAUSTED));
-        }
-    };
-    cx.buffers.push(lease);
-    if let Some(f) = cx.facts.response.as_mut() {
-        f.body = inspected;
-    }
-    ResponseVerdict::Continue(res)
-}
-
 /// A response with no body by its status, its framing, or because the
 /// request was a `HEAD`. A body of length 0 can still end with trailers.
 pub(crate) fn response_known_empty(cx: &FlowCx, res: &CanonicalResponse) -> bool {
@@ -1609,7 +1415,7 @@ mod tests {
         let res = r.response(&flow);
         assert_eq!(res.status, StatusCode::FORBIDDEN);
         assert_eq!(res.headers.get("x-roxy-rule"), Some("_default"));
-        let r = Refusal::fail_closed("body_too_large_to_inspect");
+        let r = Refusal::fail_closed("body_decode_failed");
         assert_eq!(r.status, 503);
         assert_eq!(
             r.rule,

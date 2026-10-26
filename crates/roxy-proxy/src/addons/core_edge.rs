@@ -6,7 +6,6 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
 
 use roxy_http::layer::to_layer_response;
 use roxy_http::{Body, CanonicalRequest};
@@ -242,9 +241,8 @@ impl BodyIo for LaneTransport {
         body: &'a mut Body,
         cap: u64,
         meter: &'a mut (dyn FnMut(u64) -> bool + Send),
-        idle: Option<Duration>,
     ) -> CollectFuture<'a, Result<Collected, roxy_http::DriveError>> {
-        Box::pin(async move { Ok(collect_prefix(body, cap, meter, idle).await) })
+        Box::pin(async move { Ok(collect_prefix(body, cap, meter).await) })
     }
 }
 
@@ -264,6 +262,8 @@ impl ClientTransport for LaneTransport {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
     use roxy_http::layer::from_layer_request;
 

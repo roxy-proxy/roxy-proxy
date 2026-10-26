@@ -30,7 +30,7 @@ The first directory is the working corpus, which grows as the fuzzer runs.
 | `client_hello_rustls` | `roxy-tls` `sniff` against rustls | **The sniffer and rustls agree on the SNI.** When `sniff` accepts a hello and a rustls server gets as far as choosing a certificate for the same bytes, the name rustls acts on is the host roxy keys on (none for an IP literal). rustls rejecting the hello is fine. |
 | `rule_compile` | `roxy-rules` lexer, parser, type-checker, compiler | A policy that compiles evaluates without panicking, and a fail-closed outcome is never an allow. |
 | `content_coding` | `roxy-http` `coding::Decoder` (gzip, deflate, br, zstd, stacked) | The result does not depend on how input is fed or output read, and the decoded-size limit holds exactly: a body of `n` decoded bytes is refused under a limit of `n - 1`. |
-| `rule_eval` | `Policy::evaluate_admission` on generated policies | **Unavailable inputs only ever fail closed.** Making one input unavailable (a metric, the body text, the address list) leaves the outcome exactly as it was, or turns it into the fail-closed deny, never into a different decision. |
+| `rule_eval` | `Policy::evaluate_admission` on generated policies | **Unavailable inputs only ever fail closed.** Making one input unavailable (a metric, the address list) leaves the outcome exactly as it was, or turns it into the fail-closed deny, never into a different decision. |
 
 The input format is in each target's doc comment. For the HTTP targets the
 first byte selects the parser flags and the role (see `src/lib.rs`).

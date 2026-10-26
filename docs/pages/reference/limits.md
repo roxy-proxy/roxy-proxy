@@ -13,8 +13,8 @@ connection rather than letting traffic through
 | a rule denies | the deny response, then the connection is closed |
 | a metric, address list or secret is unavailable | `503`, `_fail_closed` |
 | a metric table is full | `503`, `_fail_closed`, `metric_table_full` |
-| a body is too large to inspect, or cannot be decoded | `503`, `_fail_closed` |
-| a response that [masking](/reference/secrets#redacting-responses) cannot read whole: a coding roxy does not decode, or a `206` | `503`, `_fail_closed`, `unsupported_content_encoding` or `partial_response` |
+| a body that rules read cannot be decoded | `503`, `_fail_closed`, `body_decode_failed`, or the body is cut if its head has gone |
+| a response that [masking](/reference/secrets#redacting-responses) or a [body rule](/reference/rule-language#body-rules) cannot read whole: a coding roxy does not decode, or a `206` | `503`, `_fail_closed`, `unsupported_content_encoding` or `partial_response` |
 | a body to sign is over `max_sign_body_bytes` | `413`, `_sign` |
 | the buffer budget is used up | `503`, `_fail_closed`, `buffer_budget_exhausted` |
 | a body or header limit is exceeded mid-stream | both sides are closed |
@@ -51,7 +51,6 @@ limits:
   response_body_idle_timeout: 30m # the upstream stalls mid-body
 
   # buffering
-  max_inspect_body_bytes: 1mb     # body.text, response.body.text, and addons' default
   max_sign_body_bytes: 100mb      # a body hashed for sign: aws_sigv4
   max_capture_body_bytes: 16mb    # per direction per exchange
   max_ws_message_bytes: 16mb      # a WebSocket message, when rules read messages
@@ -90,18 +89,17 @@ and records `upstream_body_timeout`.
 ### Buffer budget
 
 `max_buffered_bytes` bounds everything roxy buffers to inspect or copy:
-bodies that rules read, bodies being decoded, compressed again or signed,
+bodies being decoded, compressed again or signed,
 WebSocket messages that rules read, endpoint call bodies, and copies for observing addons.
 Each exchange reserves what it needs before it buffers. If the budget
 cannot cover a reservation, the exchange fails at once
 (`buffer_budget_exhausted`). Nothing waits and nothing is evicted.
 
-A body of unknown length that a rule reads reserves the whole
-`max_inspect_body_bytes`, so the defaults allow 1024 such bodies at once.
 The budget is not a cap on the process's memory: socket buffers, streaming
-buffers and addon memory are separate. So are the bytes that the masking
-of secrets holds back from a streaming response, one fewer than the
-longest injected secret.
+buffers and addon memory are separate. So are the bytes held back from a
+streaming body: by the masking of secrets, one fewer than the longest
+injected secret, and by [body rules](/reference/rule-language#body-rules),
+the length of the longest string they compare with, plus one.
 
 ## Connections
 

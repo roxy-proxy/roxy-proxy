@@ -16,6 +16,10 @@
 //!   ends the body with [`BodyError::Stopped`], so the HTTP/1.1 transport breaks
 //!   the connection without a terminating chunk and the HTTP/2 transport
 //!   resets the stream.
+//! - **Body text.** [`crate::scan`] feeds each body's decoded bytes to its
+//!   text tests through [`InFlight::on_text`], and the rules reading
+//!   `body.text` or `response.body.text` are re-checked whenever a test is
+//!   decided.
 //! - **WebSocket relay.** [`InFlight::on_ws_chunk`] before each write, and
 //!   [`InFlight::on_ws_message`] before each message when rules read `ws.*`.
 //!
@@ -52,7 +56,7 @@ use bytes::Bytes;
 use http_body::{Frame, SizeHint};
 use roxy_http::ws::frame::Message;
 use roxy_http::{Body, BodyError, CanonicalResponse};
-use roxy_rules::{Deny, InFlightEffect, InFlightState, Reads, RuleId};
+use roxy_rules::{BodySide, Deny, InFlightEffect, InFlightState, Reads, RuleId, TextScan};
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
@@ -142,7 +146,8 @@ impl std::fmt::Debug for InFlight {
 
 impl InFlight {
     /// The in-flight checker for an exchange about to be forwarded:
-    /// `body.bytes` is known (0) from now on.
+    /// `body.bytes` is known (0) from now on, and so is `body.text`, its
+    /// tests undecided.
     pub(crate) fn new(cx: &FlowCx) -> Arc<Self> {
         let policy = &cx.snap.policy;
         let bm = policy.byte_metrics();
@@ -153,6 +158,7 @@ impl InFlight {
             || bm.intersects(Reads::METRIC_RESPONSE_BYTES);
         let mut facts = cx.facts.clone();
         facts.request_body_bytes = Some(0);
+        facts.request_text = scan(policy, BodySide::Request);
         Arc::new(Self {
             meta: cx.meta.clone(),
             stop: CancellationToken::new(),
@@ -162,7 +168,7 @@ impl InFlight {
                 meta: cx.meta.clone(),
                 facts,
                 st: policy.in_flight_state(),
-                known: Reads::BODY_BYTES,
+                known: Reads::BODY_BYTES | Reads::BODY_TEXT,
                 stopped: None,
                 rules: Vec::new(),
                 mutations: Vec::new(),
@@ -230,6 +236,7 @@ impl InFlight {
         }
         g.facts.response = Some(facts);
         g.facts.response_body_bytes = Some(0);
+        g.facts.response_text = scan(&g.meta.snap.policy, BodySide::Response);
         let changed = Reads::RESPONSE_HEAD | Reads::RESPONSE_BODY_BYTES | Reads::RESPONSE_BODY_TEXT;
         g.known |= changed;
         let effects = g.evaluate(changed, Stage::ResponseHead);
@@ -289,6 +296,70 @@ impl InFlight {
         };
         g.bytes(dir, n, changed, stage);
         self.publish(&g)
+    }
+
+    /// The next decoded bytes of a body whose text the rules read. Rules
+    /// are re-checked if a test was decided. `Ok` is how many of the latest
+    /// bytes must still be held back ([`TextScan::hold`]); `Err` means none
+    /// may be forwarded: the exchange is stopped.
+    pub(crate) fn on_text(&self, dir: Dir, bytes: &[u8]) -> Result<usize, Stopped> {
+        self.text(dir, |scan| scan.feed(bytes))
+    }
+
+    /// The body whose text the rules read has ended: every test is decided
+    /// and the rules re-checked. `Err` means the held bytes must not be
+    /// forwarded.
+    pub(crate) fn on_text_end(&self, dir: Dir) -> Result<(), Stopped> {
+        self.text(dir, TextScan::finish).map(drop)
+    }
+
+    /// The body failed on roxy's side, not either peer's: its coding
+    /// failed, or the budget refused a coder's window. The exchange stops,
+    /// failing closed with that code; other failures are left to the
+    /// caller.
+    pub(crate) fn body_failed(&self, dir: Dir, e: &BodyError) {
+        let code = match e {
+            BodyError::Undecodable(_) => "body_decode_failed",
+            BodyError::BudgetExhausted => crate::budget::EXHAUSTED,
+            BodyError::TooLarge { .. }
+            | BodyError::LengthMismatch
+            | BodyError::Incomplete
+            | BodyError::Closed
+            | BodyError::Abandoned
+            | BodyError::Timeout
+            | BodyError::Invalid(_)
+            | BodyError::Upstream(_)
+            | BodyError::Stopped => return,
+        };
+        let mut g = self.lock();
+        g.stop_with(Refusal::fail_closed(code), body_stage(dir));
+        let _ = self.publish(&g);
+    }
+
+    fn text(&self, dir: Dir, step: impl FnOnce(&mut TextScan) -> bool) -> Result<usize, Stopped> {
+        let mut g = self.lock();
+        if let Some(s) = &g.stopped {
+            return Err(s.clone());
+        }
+        let (scan, changed) = match dir {
+            Dir::Request => (g.facts.request_text.as_mut(), Reads::BODY_TEXT),
+            Dir::Response => (g.facts.response_text.as_mut(), Reads::RESPONSE_BODY_TEXT),
+        };
+        // A body is scanned only when its tests exist, and they are set
+        // before its first byte; never forward an unscanned one.
+        let Some(scan) = scan else {
+            g.stop_with(Refusal::fail_closed("body_unavailable"), body_stage(dir));
+            return self.publish(&g).map(|()| 0);
+        };
+        let decided = step(scan);
+        let hold = scan.hold();
+        if decided {
+            let effects = g.evaluate(changed, body_stage(dir));
+            if !effects.is_empty() && g.stopped.is_none() {
+                g.stop_with(Refusal::fail_closed("unsupported_effect"), body_stage(dir));
+            }
+        }
+        self.publish(&g).map(|()| hold)
     }
 
     /// One whole WebSocket message is about to be relayed:
@@ -371,6 +442,20 @@ impl InFlight {
             Some(s) => Err(s),
             None => Ok(()),
         }
+    }
+}
+
+/// The scan of a body for the policy's text tests; `None` when no rule
+/// reads its text.
+fn scan(policy: &roxy_rules::Policy, side: BodySide) -> Option<TextScan> {
+    let tests = policy.texts(side);
+    (!tests.is_empty()).then(|| tests.scan())
+}
+
+fn body_stage(dir: Dir) -> Stage {
+    match dir {
+        Dir::Request => Stage::RequestBody,
+        Dir::Response => Stage::ResponseBody,
     }
 }
 

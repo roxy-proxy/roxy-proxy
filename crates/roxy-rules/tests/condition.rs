@@ -90,6 +90,7 @@ fn rejects_late_fields() {
     for (src, field) in [
         ("body.bytes > 10", "`body.bytes`"),
         (r#"body.text contains "x""#, "`body.text`"),
+        (r#"response.body.text contains "x""#, "`response.body.text`"),
         ("response.status == 200", "`response.status`"),
         (r#"response.header["x"] == "y""#, "`response.header"),
         ("ws.opcode == 1", "`ws.opcode`"),

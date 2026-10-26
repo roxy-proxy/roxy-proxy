@@ -1,11 +1,12 @@
-//! Body rules on encoded bodies: the rules see
-//! the decoded text, the bytes forwarded are the bytes received, and a body
-//! that cannot be decoded fails closed.
+//! Body rules on encoded bodies: the rules see the decoded text, a body
+//! that streams goes on encoded again in its own codings, and a body that
+//! cannot be decoded fails closed.
 
 use std::io::Write as _;
 
 use bytes::Bytes;
 use roxy_http::Body;
+use roxy_http::coding::{self, Coding};
 
 use super::{AddonDef, Answer, Client, Kit};
 
@@ -22,11 +23,7 @@ const RULES: &str = r#"
 "#;
 
 async fn kit() -> Kit {
-    Kit::builder()
-        .rules(RULES)
-        .limits(|l| l.max_inspect_body_bytes = 64 * 1024)
-        .start()
-        .await
+    Kit::builder().rules(RULES).start().await
 }
 
 fn gzip(b: &[u8]) -> Vec<u8> {
@@ -36,8 +33,7 @@ fn gzip(b: &[u8]) -> Vec<u8> {
 }
 
 fn gunzip(b: &[u8]) -> Vec<u8> {
-    use roxy_http::coding::{Coding, decode, unmetered};
-    decode(&[Coding::Gzip], b, 1 << 20, unmetered()).expect("a gzip body")
+    coding::decode(&[Coding::Gzip], b, 1 << 20, coding::unmetered()).expect("a gzip body")
 }
 
 async fn post(c: &mut Client, path: &str, headers: &[(&str, &str)], body: Vec<u8>) -> Answer {
@@ -48,28 +44,55 @@ async fn post(c: &mut Client, path: &str, headers: &[(&str, &str)], body: Vec<u8
     Answer::read(c.send(req).await.expect("response")).await
 }
 
-/// The response's `content-encoding` comes from the request's
-/// `x-echo-encoding`, which the request rules never see as an encoding.
-async fn echo(kit: &Kit, h2: bool, encoding: &str, body: Vec<u8>) -> Answer {
-    let mut c = if h2 {
+async fn client(kit: &Kit, h2: bool) -> Client {
+    if h2 {
         kit.tunnel("up.test", true).await
     } else {
         kit.h1().await
-    };
-    post(&mut c, "/echo", &[("x-echo-encoding", encoding)], body).await
+    }
+}
+
+/// The response's `content-encoding` comes from the request's
+/// `x-echo-encoding`, which the request rules never see as an encoding.
+async fn echo(kit: &Kit, h2: bool, encoding: &str, body: Vec<u8>) -> Answer {
+    try_echo(kit, h2, encoding, body).await.expect("response")
+}
+
+/// [`echo`], for a response that may be reset before its head is read.
+async fn try_echo(kit: &Kit, h2: bool, encoding: &str, body: Vec<u8>) -> Result<Answer, String> {
+    let mut c = client(kit, h2).await;
+    let req = c
+        .request("POST", "/echo", &[("x-echo-encoding", encoding)])
+        .body(Body::from_bytes(Bytes::from(body)))
+        .unwrap();
+    match c.send(req).await {
+        Ok(res) => Ok(Answer::read(res).await),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// The response was stopped mid-body by `rule` (`reason` for a fail
+/// closed): its head had gone, so the client sees the body cut, or over
+/// h2 perhaps only the reset.
+async fn assert_cut(kit: &Kit, a: Result<Answer, String>, rule: &str, reason: Option<&str>) {
+    if let Ok(a) = a {
+        assert_eq!(a.status, 200, "{a:?}");
+        assert!(a.body.is_err(), "the body is cut: {a:?}");
+    }
+    let ev = kit.request_event().await;
+    assert_eq!(ev["terminal_rule"], rule, "{ev:#}");
+    assert_eq!(ev["stage"], "response_body", "{ev:#}");
+    if let Some(reason) = reason {
+        assert_eq!(ev["reason"], reason, "{ev:#}");
+    }
 }
 
 #[tokio::test]
 async fn a_rule_reads_a_gzip_request_body() {
     let kit = kit().await;
     for h2 in [false, true] {
-        let mut c = if h2 {
-            kit.tunnel("up.test", true).await
-        } else {
-            kit.h1().await
-        };
         let a = post(
-            &mut c,
+            &mut client(&kit, h2).await,
             "/x",
             &[("content-encoding", "gzip")],
             gzip(b"the SECRET"),
@@ -79,45 +102,104 @@ async fn a_rule_reads_a_gzip_request_body() {
         let ev = kit.request_event().await;
         assert_eq!(ev["terminal_rule"], "no-secret-out", "{ev:#}");
     }
-    assert!(kit.upstream.seen().is_empty());
+    let seen = kit.upstream.seen();
+    assert!(seen.iter().all(|s| s.complete != Some(true)), "{seen:#?}");
 }
 
+/// A streamed encoded body is decoded for the rules and encoded again, in
+/// the same coding, for the upstream.
 #[tokio::test]
-async fn an_encoded_request_body_is_forwarded_as_received() {
+async fn an_encoded_request_body_goes_on_in_its_coding() {
     let kit = kit().await;
-    let enc = gzip(b"nothing to see");
-    let a = post(
-        &mut kit.h1().await,
-        "/x",
-        &[("content-encoding", "gzip")],
-        enc.clone(),
-    )
-    .await;
-    assert_eq!(a.status, 200, "{a:?}");
-    let seen = kit.upstream.wait_seen(1).await;
-    assert_eq!(seen[0].body, enc);
-    assert_eq!(seen[0].headers["content-encoding"], "gzip");
+    for h2 in [false, true] {
+        let a = post(
+            &mut client(&kit, h2).await,
+            "/x",
+            &[("content-encoding", "gzip")],
+            gzip(b"nothing to see"),
+        )
+        .await;
+        assert_eq!(a.status, 200, "h2 {h2}: {a:?}");
+    }
+    for seen in kit.upstream.wait_seen(2).await {
+        assert_eq!(seen.headers["content-encoding"], "gzip");
+        assert_eq!(gunzip(&seen.body), b"nothing to see");
+    }
+}
+
+/// `body` in `codings`, as a client would send it.
+async fn encode(codings: &[Coding], body: &[u8]) -> Vec<u8> {
+    let body = coding::encode_body(
+        Body::from_bytes(Bytes::copy_from_slice(body)),
+        codings,
+        coding::unmetered(),
+    );
+    http_body_util::BodyExt::collect(body)
+        .await
+        .expect("encoded")
+        .to_bytes()
+        .to_vec()
+}
+
+/// Every coding roxy decodes, alone and stacked, is read by the rules and
+/// goes on in its own codings.
+#[tokio::test]
+async fn every_coding_is_read_and_goes_on_in_it() {
+    let kit = kit().await;
+    let cases: [&[Coding]; 5] = [
+        &[Coding::Gzip],
+        &[Coding::Deflate],
+        &[Coding::Br],
+        &[Coding::Zstd],
+        &[Coding::Gzip, Coding::Br],
+    ];
+    for codings in cases {
+        let header = coding::header_value(codings);
+        let mut c = kit.h1().await;
+        let a = post(
+            &mut c,
+            "/x",
+            &[("content-encoding", &header)],
+            encode(codings, b"the SECRET").await,
+        )
+        .await;
+        assert_eq!(a.status, 403, "{header}: {a:?}");
+        let mut c = kit.h1().await;
+        let a = post(
+            &mut c,
+            "/x",
+            &[("content-encoding", &header)],
+            encode(codings, b"nothing to see").await,
+        )
+        .await;
+        assert_eq!(a.status, 200, "{header}: {a:?}");
+        let seen = kit.upstream.seen();
+        let last = seen.last().unwrap();
+        assert_eq!(last.headers["content-encoding"], header.as_str());
+        assert_eq!(
+            coding::decode(codings, &last.body, 1 << 20, coding::unmetered()).unwrap(),
+            b"nothing to see",
+            "{header}"
+        );
+    }
 }
 
 #[tokio::test]
 async fn a_rule_reads_a_gzip_response_body() {
     let kit = kit().await;
     for h2 in [false, true] {
-        let a = echo(&kit, h2, "gzip", gzip(b"the SECRET")).await;
-        assert_eq!(a.status, 403, "h2 {h2}: {a:?}");
-        let ev = kit.request_event().await;
-        assert_eq!(ev["terminal_rule"], "no-secret-in", "{ev:#}");
+        let a = try_echo(&kit, h2, "gzip", gzip(b"the SECRET")).await;
+        assert_cut(&kit, a, "no-secret-in", None).await;
     }
 }
 
 #[tokio::test]
-async fn an_encoded_response_is_forwarded_as_received() {
+async fn an_encoded_response_goes_on_in_its_coding() {
     let kit = kit().await;
-    let enc = gzip(b"nothing to see");
-    let a = echo(&kit, false, "gzip", enc.clone()).await;
+    let a = echo(&kit, false, "gzip", gzip(b"nothing to see")).await;
     assert_eq!(a.status, 200, "{a:?}");
     assert_eq!(a.headers["content-encoding"], "gzip");
-    assert_eq!(a.body.as_deref().unwrap(), enc.as_slice());
+    assert_eq!(gunzip(a.body.as_deref().unwrap()), b"nothing to see");
 }
 
 /// The flow fails closed with `reason`.
@@ -134,8 +216,8 @@ async fn a_corrupt_body_fails_closed() {
     let mut enc = gzip(b"nothing to see");
     let n = enc.len();
     enc[n - 8] ^= 1;
-    let a = echo(&kit, false, "gzip", enc.clone()).await;
-    assert_fails_closed(&kit, &a, "body_decode_failed").await;
+    let a = try_echo(&kit, false, "gzip", enc.clone()).await;
+    assert_cut(&kit, a, "_fail_closed", Some("body_decode_failed")).await;
 
     // Bytes after the end of the stream: a rule cannot see them, so they
     // may not pass.
@@ -144,6 +226,46 @@ async fn a_corrupt_body_fails_closed() {
     let mut c = kit.h1().await;
     let a = post(&mut c, "/x", &[("content-encoding", "gzip")], enc).await;
     assert_fails_closed(&kit, &a, "body_decode_failed").await;
+}
+
+/// A decoder window the buffer budget cannot cover is the budget's
+/// refusal, not a body the client cut short.
+#[tokio::test]
+async fn a_decoder_window_the_budget_cannot_cover_fails_closed() {
+    // Under the 32 KiB window gzip charges on its first byte.
+    let kit = || {
+        Kit::builder()
+            .rules(RULES)
+            .limits(|l| l.max_buffered_bytes = 1024)
+            .start()
+    };
+    let k = kit().await;
+    let mut c = k.h1().await;
+    let a = post(
+        &mut c,
+        "/x",
+        &[("content-encoding", "gzip")],
+        gzip(b"hello"),
+    )
+    .await;
+    assert_fails_closed(&k, &a, "buffer_budget_exhausted").await;
+    let kit = kit().await;
+    let a = try_echo(&kit, false, "gzip", gzip(b"hello")).await;
+    assert_cut(&kit, a, "_fail_closed", Some("buffer_budget_exhausted")).await;
+}
+
+/// The same through a layer: the response is encoded again at the
+/// client's edge of the stack, and that encoder's refusal is named too.
+#[tokio::test]
+async fn a_coder_window_the_budget_cannot_cover_under_a_layer_fails_closed() {
+    let kit = Kit::builder()
+        .rules(RULES)
+        .addon(AddonDef::test_layer("a"))
+        .limits(|l| l.max_buffered_bytes = 1024)
+        .start()
+        .await;
+    let a = try_echo(&kit, false, "gzip", gzip(b"hello")).await;
+    assert_cut(&kit, a, "_fail_closed", Some("buffer_budget_exhausted")).await;
 }
 
 #[tokio::test]
@@ -159,23 +281,31 @@ async fn an_unknown_coding_fails_closed() {
     .await;
     assert_fails_closed(&kit, &a, "unsupported_content_encoding").await;
     assert!(kit.upstream.seen().is_empty());
-}
-
-#[tokio::test]
-async fn the_inspect_cap_applies_to_the_decoded_body() {
-    let kit = kit().await;
-    // 1 MiB of zeros gzips to about 1 KiB, well under the 64 KiB cap.
-    let enc = gzip(&vec![0u8; 1 << 20]);
-    assert!(enc.len() < 4096);
-    let a = echo(&kit, false, "gzip", enc).await;
-    assert_fails_closed(&kit, &a, "body_too_large_to_inspect").await;
+    // A response is refused before its head goes.
+    let a = echo(&kit, false, "compress", b"x".to_vec()).await;
+    assert_fails_closed(&kit, &a, "unsupported_content_encoding").await;
 }
 
 #[tokio::test]
 async fn identity_and_no_coding_read_as_before() {
+    // The echoed request carries the text plain, so only the response rule
+    // may see it.
+    let inbound = Kit::builder()
+        .rules(
+            r#"
+- id: no-secret-in
+  when: host == "up.test" and response.body.text contains "SECRET"
+  then: deny
+- id: up
+  when: host == "up.test"
+  then: allow
+"#,
+        )
+        .start()
+        .await;
+    let a = try_echo(&inbound, false, "identity", b"the SECRET".to_vec()).await;
+    assert_cut(&inbound, a, "no-secret-in", None).await;
     let kit = kit().await;
-    let a = echo(&kit, false, "identity", b"the SECRET".to_vec()).await;
-    assert_eq!(a.status, 403, "{a:?}");
     let mut c = kit.h1().await;
     let a = post(&mut c, "/x", &[], b"the SECRET".to_vec()).await;
     assert_eq!(a.status, 403, "{a:?}");

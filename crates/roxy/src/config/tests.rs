@@ -38,7 +38,6 @@ fn full_config_parses_and_validates() {
     assert!(cfg.http.enable_h2);
     assert!(!cfg.http.strip_accept_encoding);
     assert!(cfg.http.decode_for_addons);
-    assert_eq!(cfg.limits.max_inspect_body_bytes.as_u64(), 1024 * 1024);
     assert_eq!(cfg.upstream.dns.resolver, Resolver::System);
     assert_eq!(
         cfg.secrets["openai"],
@@ -113,7 +112,6 @@ fn minimal_config_uses_defaults() {
     assert_eq!(l.max_headers, 100);
     assert_eq!(l.max_request_body_bytes.as_u64(), 1 << 30);
     assert_eq!(l.max_response_body_bytes.as_u64(), 1 << 30);
-    assert_eq!(l.max_inspect_body_bytes.as_u64(), 1 << 20);
     assert_eq!(l.max_sign_body_bytes.as_u64(), 100 << 20);
     assert_eq!(l.max_ws_message_bytes.as_u64(), 16 << 20);
     assert_eq!(l.max_observer_lag_bytes.as_u64(), 16 << 20);

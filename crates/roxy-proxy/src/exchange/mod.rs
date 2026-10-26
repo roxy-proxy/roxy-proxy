@@ -22,7 +22,7 @@ use roxy_http::{
     Body, BodyError, CanonicalRequest, CanonicalResponse, DriveError, Limits, ParseError, Reason,
     RequestMeta, WriteError,
 };
-use roxy_rules::RuleId;
+use roxy_rules::{BodySide, RuleId};
 use tokio_util::sync::CancellationToken;
 
 use crate::addons::Reclaim;
@@ -754,6 +754,9 @@ async fn forward<F: ClientTransport>(
         });
         req.meta.upgrade = None;
     }
+    if let Err(r) = crate::scan::request(cx, &mut req, &in_flight) {
+        return Outcome::Refuse(r);
+    }
     if let Err(e) = cx
         .snap
         .upstream
@@ -784,11 +787,13 @@ async fn forward<F: ClientTransport>(
         }
     };
     let res = from_upstream_response(res, &cx.snap.limits);
-    match response_steps(cx, res, transport).await {
+    match response_steps(cx, res) {
         ResponseVerdict::Continue(mut res) => {
             let needles = crate::redact::needles(cx);
             let need = if crate::redact::masks_body(cx) {
                 Need::Masking
+            } else if !cx.snap.policy.texts(BodySide::Response).is_empty() {
+                Need::Rules
             } else if matches!(cx.response_leg, Leg::Stack { decode: true, .. }) {
                 Need::Layers
             } else {
@@ -806,9 +811,14 @@ async fn forward<F: ClientTransport>(
             }
             if upgrade.is_none() {
                 let body = std::mem::take(&mut res.body);
-                res.body = in_flight_body(body, in_flight, Dir::Response, down_tap.take());
+                res.body = in_flight_body(body, in_flight.clone(), Dir::Response, down_tap.take());
             }
             crate::recode::decode_response(cx, &mut res, codings);
+            // The rules read the response as the upstream sent it, before
+            // masking.
+            if let Err(r) = crate::scan::response(cx, &mut res, &in_flight) {
+                return Outcome::Refuse(r);
+            }
             if let Some(needles) = needles {
                 crate::redact::response(cx, &mut res, needles);
             }
@@ -825,10 +835,10 @@ async fn forward<F: ClientTransport>(
             if matches!(cx.response_leg, Leg::Direct) {
                 crate::recode::encode_response(&cx.shared, &mut res);
             }
+            crate::scan::watch_response_coders(cx, &mut res, &in_flight);
             Outcome::Respond(res)
         }
         ResponseVerdict::Deny(r) => Outcome::Refuse(r),
-        ResponseVerdict::Close(e) => Outcome::Close(e),
     }
 }
 
