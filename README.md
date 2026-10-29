@@ -13,7 +13,7 @@ workloads, or a gateway in front of the APIs your clients call.
 - **Rules.** A YAML policy in a small, typed rule language. Deny always wins,
   anything no rule allows is denied, and rules can keep checking bodies as
   they stream. Metrics give rate limits and byte budgets, and secret
-  injection means clients only hold placeholders.
+  injection means clients only hold placeholders..
 - **Addons.** WASM components or external services that every exchange
   streams through. They can rewrite, withhold, answer or block, and the
   rules judge whatever they pass on.
