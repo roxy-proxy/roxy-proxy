@@ -17,7 +17,7 @@
     "react-dom": "~19.3.1",
     "vite": "^8.3.4",
     "vocs": "2.10.3",
-    "waku": "1.0.0-rc.3"
+    "waku": "1.0.0-rc.4"
   },
   "devDependencies": {
     "github-slugger": "^2.0.0"
