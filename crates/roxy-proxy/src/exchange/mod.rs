@@ -41,7 +41,7 @@ use crate::server::Shared;
 use crate::upstream::{ConnectError, ConnectInfo, Protocols, UpstreamBody, classify, describe};
 use crate::view::host_text;
 
-pub(crate) use ws::{CLOSE_TIMEOUT, close_upstream_ws, prepare_websocket, relay_websocket};
+pub(crate) use ws::{CLOSE_TIMEOUT, Until, close_upstream_ws, prepare_websocket, relay_websocket};
 
 /// The client connection after an exchange: `None` once it is closed.
 pub(crate) type Next = Option<ServerConn<ClientIo>>;
