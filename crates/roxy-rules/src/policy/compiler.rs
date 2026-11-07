@@ -311,6 +311,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             MetricCount::Requests
             | MetricCount::RequestBytes
             | MetricCount::ResponseBytes
+            | MetricCount::Bytes
             | MetricCount::Errors
             | MetricCount::Denied => None,
         };

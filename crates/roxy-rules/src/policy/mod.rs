@@ -299,7 +299,9 @@ impl Policy {
         let in_flight_triggers = in_flight
             .iter()
             .fold(Reads::NONE, |acc, &i| acc | rules[i].shape.triggers);
-        let byte_metrics = metrics.iter().filter_map(|m| m.count.in_flight()).collect();
+        let byte_metrics = metrics
+            .iter()
+            .fold(Reads::NONE, |bits, m| bits | m.count.in_flight());
         Ok(Policy {
             rules,
             admission,

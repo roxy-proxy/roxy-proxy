@@ -558,7 +558,14 @@ impl Compiler<'_, '_> {
                 }
                 let in_flight = match &access {
                     Access::Metric(id) => metric(id).and_then(|count| {
-                        Some((count.in_flight()?, format!("metric.{id} ({count})")))
+                        let name = format!("metric.{id} ({count})");
+                        let mut values = count.in_flight().iter();
+                        let first = values.next()?;
+                        // A count over both directions is re-checked on either.
+                        for w in values {
+                            self.needs.add_in_flight(w, name.clone());
+                        }
+                        Some((first, name))
                     }),
                     a @ (Access::Scalar(_)
                     | Access::Header(_)

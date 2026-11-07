@@ -12,7 +12,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 
-use crate::types::InFlightValue;
+use crate::types::Reads;
 
 // ----- expressions ----------------------------------------------------------
 
@@ -626,6 +626,8 @@ pub enum MetricCount {
     Requests,
     RequestBytes,
     ResponseBytes,
+    /// Request and response bytes together.
+    Bytes,
     Errors,
     Denied,
     /// `unique(<field>)`: distinct values of a field (`HyperLogLog`).
@@ -633,22 +635,23 @@ pub enum MetricCount {
 }
 
 impl MetricCount {
-    /// The in-flight value a read of this metric carries: a byte metric grows
+    /// The in-flight values a read of this metric carries: a byte metric grows
     /// as this exchange streams, so a `deny` or `quarantine` reading it is
-    /// re-checked as bytes arrive. `None` for a count that does not change
+    /// re-checked as bytes arrive. Empty for a count that does not change
     /// while an exchange streams.
-    pub fn in_flight(&self) -> Option<InFlightValue> {
+    pub fn in_flight(&self) -> Reads {
         match self {
-            Self::RequestBytes => Some(InFlightValue::MetricRequestBytes),
-            Self::ResponseBytes => Some(InFlightValue::MetricResponseBytes),
-            Self::Requests | Self::Errors | Self::Denied | Self::Unique(_) => None,
+            Self::RequestBytes => Reads::METRIC_REQUEST_BYTES,
+            Self::ResponseBytes => Reads::METRIC_RESPONSE_BYTES,
+            Self::Bytes => Reads::METRIC_REQUEST_BYTES | Reads::METRIC_RESPONSE_BYTES,
+            Self::Requests | Self::Errors | Self::Denied | Self::Unique(_) => Reads::NONE,
         }
     }
 
     /// Whether this metric grows as bytes stream (and so is *in-flight* by deny
     /// rules that read it).
     pub fn counts_bytes(&self) -> bool {
-        self.in_flight().is_some()
+        !self.in_flight().is_empty()
     }
 }
 
@@ -659,6 +662,7 @@ impl fmt::Display for MetricCount {
             Self::Requests => f.write_str("requests"),
             Self::RequestBytes => f.write_str("request_bytes"),
             Self::ResponseBytes => f.write_str("response_bytes"),
+            Self::Bytes => f.write_str("bytes"),
             Self::Errors => f.write_str("errors"),
             Self::Denied => f.write_str("denied"),
             Self::Unique(field) => write!(f, "unique({field})"),
@@ -674,6 +678,7 @@ impl<'de> Deserialize<'de> for MetricCount {
             "requests" => Self::Requests,
             "request_bytes" => Self::RequestBytes,
             "response_bytes" => Self::ResponseBytes,
+            "bytes" => Self::Bytes,
             "errors" => Self::Errors,
             "denied" => Self::Denied,
             _ => {
@@ -685,7 +690,7 @@ impl<'de> Deserialize<'de> for MetricCount {
                     .ok_or_else(|| {
                         de::Error::custom(format!(
                             "unknown metric count {s:?}: expected requests, request_bytes, \
-                             response_bytes, errors, denied or unique(<field>)"
+                             response_bytes, bytes, errors, denied or unique(<field>)"
                         ))
                     })?;
                 Self::Unique(field.to_owned())
@@ -955,6 +960,10 @@ mod tests {
         assert_eq!(c, MetricCount::Unique("host".into()));
         assert!(crate::yaml::from_str::<MetricCount>("unique()").is_err());
         assert!(MetricCount::ResponseBytes.counts_bytes());
+        assert!(MetricCount::Bytes.counts_bytes());
+        let c: MetricCount = crate::yaml::from_str("bytes").unwrap();
+        assert_eq!(c, MetricCount::Bytes);
+        assert_eq!(c.to_string(), "bytes");
         assert!(!MetricCount::Requests.counts_bytes());
     }
 }

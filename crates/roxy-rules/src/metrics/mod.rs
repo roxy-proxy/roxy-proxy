@@ -403,6 +403,7 @@ impl Metric {
             MetricCount::Requests | MetricCount::Unique(_) => sample.admission,
             MetricCount::RequestBytes => sample.request_bytes > 0,
             MetricCount::ResponseBytes => sample.response_bytes > 0,
+            MetricCount::Bytes => sample.request_bytes > 0 || sample.response_bytes > 0,
             MetricCount::Errors => sample.error,
             MetricCount::Denied => sample.denied,
         }
@@ -573,6 +574,9 @@ impl MetricStore {
             MetricCount::Requests => Delta::Add(u64::from(sample.admission)),
             MetricCount::RequestBytes => Delta::Add(sample.request_bytes),
             MetricCount::ResponseBytes => Delta::Add(sample.response_bytes),
+            MetricCount::Bytes => {
+                Delta::Add(sample.request_bytes.saturating_add(sample.response_bytes))
+            }
             MetricCount::Errors => Delta::Add(u64::from(sample.error)),
             MetricCount::Denied => Delta::Add(u64::from(sample.denied)),
             MetricCount::Unique(_) => {
