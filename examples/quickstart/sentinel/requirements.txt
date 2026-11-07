@@ -5,4 +5,4 @@
 inspect_sentinel @ git+https://github.com/meridianlabs-ai/inspect_sentinel@083a3a0c34fc55ef79e1314bbc622e89580011d4
 anthropic==1.17.0
 httpx2==2.16.0
-websockets==17.3
+websockets==17.4
