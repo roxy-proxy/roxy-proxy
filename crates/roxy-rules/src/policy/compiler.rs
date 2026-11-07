@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::net::Ipv4Addr;
 use std::num::NonZeroU16;
+use std::sync::Arc;
 
 use regex::Regex;
 use roxy_http::Host;
@@ -15,13 +16,14 @@ use super::{
 };
 use crate::compile::{Env, Needs, Pred, ROperand, build_shared_regex, compile};
 use crate::config::{
-    Action, AllowArgs, AwsSigV4Args, DenyArgs, MetricConfig, MetricCount, RedirectArgs,
-    RewritePathArgs, RuleConfig, SetStateArgs, Upgrade,
+    Action, AllowArgs, AwsSigV4Args, CaptureTarget, DenyArgs, MetricConfig, MetricCount,
+    RedirectArgs, RespondArgs, RewritePathArgs, RuleConfig, SetStateArgs, Upgrade,
 };
 use crate::diag::{Diagnostic, RuleId};
 use crate::eval::{
-    AllowOpts, AwsSigV4, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Deny, DenyStatus,
-    Effect, InFlightEffect, SetHeaderValue,
+    AllowOpts, AwsSigV4, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, DEFAULT_RESPOND_CONTENT_TYPE,
+    DEFAULT_RESPOND_STATUS, Decision, Deny, DenyStatus, Effect, InFlightEffect, Respond,
+    RespondStatus, SetHeaderValue,
 };
 use crate::lexer::is_ident;
 use crate::template::{
@@ -171,6 +173,28 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 None
             }
         }
+    }
+
+    /// Advice that does not stop a policy compiling: a `respond` rule
+    /// answers without forwarding, so its actions that change or record the
+    /// request compile but do nothing.
+    pub(super) fn rule_warnings(rules: &[RuleConfig]) -> Vec<Diagnostic> {
+        let mut out = Vec::new();
+        for (i, rule) in rules.iter().enumerate() {
+            let actions = &rule.then.0;
+            if !actions.iter().any(|a| matches!(a, Action::Respond(_))) {
+                continue;
+            }
+            for (j, a) in actions.iter().enumerate() {
+                if let Some(msg) = inert_beside_respond(a) {
+                    out.push(
+                        Diagnostic::new(format!("rules[{i}].then[{j}]"), msg)
+                            .with_rule(Some(RuleId::new(&rule.id))),
+                    );
+                }
+            }
+        }
+        out
     }
 
     /// Advice that does not stop a policy compiling: a metric keyed on a
@@ -570,6 +594,10 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             Action::Allow(a) => vec![CAction::Terminal(allow(a))],
             Action::Deny(d) => vec![CAction::Terminal(Decision::Deny(self.deny(d, rule, apath)))],
             Action::Quarantine => vec![CAction::Terminal(Decision::Deny(Deny::quarantine()))],
+            Action::Respond(r) => {
+                let r = self.respond(r, rule, apath);
+                vec![CAction::Terminal(Decision::Respond(Arc::new(r)))]
+            }
             Action::SetHeader(pairs) => self.set_header(pairs, rule, apath),
             Action::RemoveHeader(names) => names
                 .iter()
@@ -646,13 +674,18 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
         let rule = Some(rid);
         self.secrets_outside_header(action, rule, apath);
         let out = match action {
-            Action::Allow(_) => {
+            Action::Allow(_) | Action::Respond(_) => {
+                let advice = if matches!(action, Action::Allow(_)) {
+                    ". Write the allow as an admission rule and this rule as a `deny`"
+                } else {
+                    ""
+                };
                 self.push(
                     rule,
                     apath,
                     format!(
-                        "`allow` is only possible in admission rules; {}. \
-                         Write the allow as an admission rule and this rule as a `deny`",
+                        "`{}` is only possible in admission rules; {}{advice}",
+                        action.name(),
                         shape.forwarded_why()
                     ),
                 );
@@ -798,6 +831,94 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 .clone()
                 .unwrap_or_else(|| DEFAULT_DENY_MESSAGE.into()),
             close: close.unwrap_or(true),
+        }
+    }
+
+    /// `respond`: every field is checked here, so the proxy can build the
+    /// answer without failing. On an error the compile fails and the
+    /// returned value is never served.
+    fn respond(&mut self, r: &RespondArgs, rule: Option<&RuleId>, apath: &str) -> Respond {
+        let RespondArgs {
+            status,
+            body,
+            content_type,
+            headers,
+            close,
+        } = r;
+        let status = match status.map(|s| (s, RespondStatus::new(s))) {
+            None => DEFAULT_RESPOND_STATUS,
+            Some((_, Some(s))) => s,
+            Some((s, None)) => {
+                self.push(
+                    rule,
+                    apath,
+                    format!("respond status {s} must be 200 to 599"),
+                );
+                DEFAULT_RESPOND_STATUS
+            }
+        };
+        let body = body.clone().unwrap_or_default();
+        let max = self.input.max_respond_body_bytes;
+        if body.len() as u64 > max {
+            self.push(
+                rule,
+                apath,
+                format!(
+                    "respond body is {} bytes, over `limits.max_respond_body_bytes` ({max})",
+                    body.len()
+                ),
+            );
+        }
+        if matches!(status.get(), 204 | 304) && !body.is_empty() {
+            self.push(
+                rule,
+                apath,
+                format!("respond status {status} has no body, so `body` must be empty"),
+            );
+        }
+        let content_type = content_type
+            .clone()
+            .unwrap_or_else(|| DEFAULT_RESPOND_CONTENT_TYPE.to_owned());
+        if content_type.trim().is_empty() || !is_header_value(&content_type) {
+            self.push(
+                rule,
+                apath,
+                format!(
+                    "respond content_type {content_type:?} is not a valid header value \
+                     (non-empty; visible ASCII, space and tab only)"
+                ),
+            );
+        }
+        let mut out = Vec::with_capacity(headers.len());
+        for (name, value) in headers {
+            if !is_token(name) {
+                self.push(rule, apath, format!("invalid header name {name:?}"));
+                continue;
+            }
+            let lower = name.to_ascii_lowercase();
+            if let Some(why) = respond_header_problem(&lower) {
+                self.push(rule, apath, format!("respond header `{lower}` {why}"));
+                continue;
+            }
+            if !is_header_value(value) {
+                self.push(
+                    rule,
+                    apath,
+                    format!(
+                        "respond header `{lower}`: value {value:?} is not a valid header value \
+                         (visible ASCII, space and tab only)"
+                    ),
+                );
+                continue;
+            }
+            out.push((lower, value.clone()));
+        }
+        Respond {
+            status,
+            body,
+            content_type,
+            headers: out,
+            close: close.unwrap_or(false),
         }
     }
 
@@ -1129,6 +1250,61 @@ impl RuleShape {
     }
 }
 
+/// Why a `respond` header cannot be set, if it cannot: roxy writes the
+/// framing and hop-by-hop fields itself, as for an addon's response head,
+/// and `content-type` and `cache-control` are part of every answer.
+fn respond_header_problem(lower: &str) -> Option<&'static str> {
+    match lower {
+        "content-type" => Some("is set by `content_type`"),
+        "cache-control" => Some("is always `no-store` on an answer"),
+        n if roxy_http::is_reserved(n) => Some("is managed by roxy and cannot be set"),
+        _ => None,
+    }
+}
+
+/// The warning for an action beside `respond` that would change or record
+/// the request, which is never forwarded; `None` for an action that still
+/// applies (`tag`, `log`, `set_state`, and `capture` / `digest` of the
+/// response, which record the answer).
+fn inert_beside_respond(a: &Action) -> Option<String> {
+    const WHY: &str = "this rule answers with `respond`, so the request is never forwarded";
+    match a {
+        Action::SetHeader(_)
+        | Action::RemoveHeader(_)
+        | Action::RewritePath(_)
+        | Action::SetQuery(_)
+        | Action::RemoveQuery(_)
+        | Action::Redirect(_)
+        | Action::Sign(_) => Some(format!(
+            "`{}` changes the request and has no effect: {WHY}",
+            a.name()
+        )),
+        Action::Capture(CaptureTarget::Request) | Action::Digest(CaptureTarget::Request) => {
+            Some(format!(
+                "`{}: request` has no effect: {WHY}; write `{}: response` to record the answer",
+                a.name(),
+                a.name()
+            ))
+        }
+        Action::Capture(CaptureTarget::Both) | Action::Digest(CaptureTarget::Both) => {
+            Some(format!(
+                "`{}: both` records only the answer: {WHY}; write `{}: response`",
+                a.name(),
+                a.name()
+            ))
+        }
+        Action::Capture(CaptureTarget::Response)
+        | Action::Digest(CaptureTarget::Response)
+        | Action::Allow(_)
+        | Action::Deny(_)
+        | Action::Quarantine
+        | Action::Respond(_)
+        | Action::Tag(_)
+        | Action::Log(_)
+        | Action::SetState(_) => None,
+    }
+}
+
 /// Group references in a `rewrite_path` replacement that `re` cannot
 /// satisfy. The replacement syntax is the regex crate's: `$1`, `$name`,
 /// `${name}`, with `$$` for a literal dollar. The crate expands a reference
@@ -1209,6 +1385,13 @@ fn non_header_strings(a: &Action) -> Vec<&str> {
             .collect(),
         Action::RemoveHeader(v) | Action::RemoveQuery(v) => v.iter().map(String::as_str).collect(),
         Action::Deny(d) => d.message.as_deref().into_iter().collect(),
+        Action::Respond(r) => r
+            .body
+            .iter()
+            .chain(&r.content_type)
+            .map(String::as_str)
+            .chain(r.headers.iter().flat_map(|(k, v)| [k.as_str(), v.as_str()]))
+            .collect(),
         Action::RewritePath(r) => vec![&r.pattern, &r.to],
         Action::Redirect(r) => vec![&r.host],
         Action::Tag(s) => vec![s],

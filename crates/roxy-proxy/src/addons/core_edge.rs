@@ -70,6 +70,11 @@ pub(super) async fn run(st: Arc<StackFlow>, io: CoreIo) {
     let snap = st.snap.clone();
     match outcome {
         Outcome::Respond(mut res) => {
+            // Only a `respond` rule's answer asks to close; an upstream's
+            // `connection: close` is never the client's.
+            if res.meta.close {
+                st.close.store(true, Ordering::Relaxed);
+            }
             res.body = attributed(&st, Side::Upstream, std::mem::take(&mut res.body));
             // A response body no layer reads passes through unchanged.
             if snap.http.decode_for_addons && st.body_subscribed(crate::in_flight::Dir::Response) {

@@ -65,7 +65,80 @@ pub struct AllowOpts {
 pub enum Decision {
     Allow(AllowOpts),
     Deny(Deny),
+    /// A `respond` rule's fixed answer: nothing is forwarded.
+    Respond(Arc<Respond>),
 }
+
+/// A `respond` action: the response roxy sends instead of forwarding the
+/// request. Its fields are checked when the policy compiles: the headers
+/// are valid end-to-end fields that roxy does not set itself, and the body
+/// is within `limits.max_respond_body_bytes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Respond {
+    pub status: RespondStatus,
+    pub body: String,
+    pub content_type: String,
+    /// Extra response headers, lower-case names, in config order.
+    pub headers: Vec<(String, String)>,
+    /// Close the client connection after the answer (h1 `connection:
+    /// close`, h2 `GOAWAY`). Defaults to `false`: unlike a deny, an answer
+    /// leaves the connection reusable.
+    pub close: bool,
+}
+
+impl Respond {
+    /// The response's header fields as roxy sends them, in order, except
+    /// `content-length`, which the transport writes from the body:
+    /// `content-type`, `cache-control: no-store`, then the configured
+    /// headers. A fixed answer must not be cached as if the upstream had
+    /// given it.
+    pub fn header_fields(&self) -> impl Iterator<Item = (&str, &str)> {
+        [
+            ("content-type", self.content_type.as_str()),
+            ("cache-control", "no-store"),
+        ]
+        .into_iter()
+        .chain(self.headers.iter().map(|(n, v)| (n.as_str(), v.as_str())))
+    }
+}
+
+/// A `respond` status code: always 200 to 599.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct RespondStatus(u16);
+
+impl RespondStatus {
+    /// `None` unless `code` is 200 to 599.
+    pub const fn new(code: u16) -> Option<Self> {
+        if code >= 200 && code <= 599 {
+            Some(Self(code))
+        } else {
+            None
+        }
+    }
+
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+}
+
+impl fmt::Display for RespondStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl PartialEq<u16> for RespondStatus {
+    fn eq(&self, other: &u16) -> bool {
+        self.0 == *other
+    }
+}
+
+/// Default `respond` status and content type.
+pub const DEFAULT_RESPOND_STATUS: RespondStatus = RespondStatus(200);
+pub const DEFAULT_RESPOND_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
+
+/// Default `limits.max_respond_body_bytes`: 64 KiB.
+pub const DEFAULT_MAX_RESPOND_BODY_BYTES: u64 = 64 * 1024;
 
 /// A deny: the admission decision refusing the request, or an in-flight rule
 /// stopping the exchange. The only decision an in-flight rule can reach.
@@ -125,6 +198,10 @@ impl Decision {
         matches!(self, Self::Deny(_))
     }
 
+    pub fn is_respond(&self) -> bool {
+        matches!(self, Self::Respond(_))
+    }
+
     /// The decision when no rule decides: 403, closing the connection.
     pub fn default_deny() -> Self {
         Self::Deny(Deny::default_deny())
@@ -166,8 +243,10 @@ impl Deny {
 pub const FAIL_CLOSED_STATUS: DenyStatus = DenyStatus(503);
 
 /// Why an evaluation failed closed (`terminal_rule = "_fail_closed"`), for
-/// the proxy's `policy_input_unavailable` flow event. Carries names only,
-/// never secret values.
+/// the proxy's `policy_input_unavailable` flow event (every reason but
+/// [`FailClosedReason::TerminalConflict`], which is the policy's own
+/// conflict, not a missing input). Carries names only, never secret
+/// values.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FailClosedReason {
     /// `FlowView::metric(id)` returned `None`.
@@ -204,6 +283,10 @@ pub enum FailClosedReason {
     /// missing (`null`) value, which has no answer. Carries the field
     /// as written, e.g. `body.size`.
     MissingValue(String),
+    /// Two rules that each decide the request on their own matched, and no
+    /// deny did: an `allow` and a `respond`, or two `respond`s. No order
+    /// makes both right, so neither wins.
+    TerminalConflict(TerminalConflict),
     /// The view gave a field a value of another type than the field's. A
     /// bug in the view, not in the rule: the predicate has no answer.
     WrongType {
@@ -239,11 +322,40 @@ impl fmt::Display for FailClosedReason {
                     "`{field}` is null; guard the rule with `{field} != null and ...`"
                 )
             }
+            Self::TerminalConflict(c) => c.fmt(f),
             Self::WrongType {
                 field,
                 expected,
                 found,
             } => write!(f, "`{field}` is {expected} but the flow view gave {found}"),
+        }
+    }
+}
+
+/// The two rules of a [`FailClosedReason::TerminalConflict`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalConflict {
+    /// The first matching allow and the first matching respond.
+    AllowAndRespond { allow: RuleId, respond: RuleId },
+    /// The first two matching responds, in list order.
+    TwoResponds { first: RuleId, second: RuleId },
+}
+
+impl fmt::Display for TerminalConflict {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AllowAndRespond { allow, respond } => write!(
+                f,
+                "rule {:?} allows and rule {:?} responds; only one can decide",
+                allow.as_str(),
+                respond.as_str()
+            ),
+            Self::TwoResponds { first, second } => write!(
+                f,
+                "rules {:?} and {:?} both respond; only one can decide",
+                first.as_str(),
+                second.as_str()
+            ),
         }
     }
 }
@@ -266,7 +378,18 @@ impl fmt::Display for Decision {
                 Ok(())
             }
             Decision::Deny(d) => d.fmt(f),
+            Decision::Respond(r) => r.fmt(f),
         }
+    }
+}
+
+impl fmt::Display for Respond {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "respond {}", self.status)?;
+        if self.close {
+            f.write_str(" (close)")?;
+        }
+        Ok(())
     }
 }
 
@@ -662,8 +785,9 @@ pub struct Outcome {
     /// Every admission rule whose `when` matched, in list order.
     pub matched: Vec<RuleId>,
     /// The rule that decided: the first matching deny, else the first
-    /// matching allow; `_default` when none matched; `_fail_closed` when a
-    /// policy input was unavailable.
+    /// matching allow, else the one matching respond; `_default` when none
+    /// matched; `_fail_closed` when a policy input was unavailable or two
+    /// rules that each decide alone matched (a terminal conflict).
     pub terminal_rule: RuleId,
     /// Set exactly when `terminal_rule` is `_fail_closed`.
     pub fail_closed_reason: Option<FailClosedReason>,
@@ -672,8 +796,8 @@ pub struct Outcome {
     /// quarantine, as a deny anywhere refuses the request.
     pub quarantine: Option<RuleId>,
     /// Effects of non-terminal actions of matched rules, in list order.
-    /// When the decision is not an allow, only `log` and `set_state`
-    /// remain.
+    /// When the decision is a deny, only `log` and `set_state` remain; when
+    /// it is a respond, `capture` and `digest` of the response remain too.
     pub effects: Vec<Effect>,
     /// `initial_tags` plus tags set by matched rules, without duplicates.
     pub tags: Vec<String>,

@@ -10,7 +10,8 @@ roxy rule test --config roxy.yaml --metric github_writes=30 POST https://api.git
 ```
 
 `roxy rule test` prints the matching rules, their effects and the
-decision. It exits 0 on allow and 3 on deny. The request arrives on the
+decision. When a `respond` rule answers, it also prints the answer's
+status and headers. It exits 0 on allow or an answer, and 3 on deny. The request arrives on the
 config's first listener.
 
 The rules see the request as `roxy run` would: the URL is normalised

@@ -25,6 +25,9 @@ pub struct PolicyInput<'a> {
     /// Names defined under `address_lists:` (for `ip in @name`; the data
     /// stays with the proxy).
     pub address_lists: &'a HashSet<String>,
+    /// `limits.max_respond_body_bytes`: the largest `respond` body
+    /// ([`crate::DEFAULT_MAX_RESPOND_BODY_BYTES`] by default).
+    pub max_respond_body_bytes: u64,
 }
 
 /// A compiled metric definition. Counting is the proxy's job; this
@@ -149,7 +152,7 @@ impl InFlightAction {
                     ttl: *ttl,
                 }))
             }
-            CAction::Terminal(Decision::Allow(_))
+            CAction::Terminal(Decision::Allow(_) | Decision::Respond(_))
             | CAction::SetHeader { .. }
             | CAction::Sign(_)
             | CAction::Effect(_) => None,
@@ -316,6 +319,13 @@ impl Policy {
     /// `url`, `query.raw`) on a metric with no `where`.
     pub fn metric_warnings(metrics: &[MetricConfig]) -> Vec<Diagnostic> {
         compiler::PolicyCompiler::metric_warnings(metrics)
+    }
+
+    /// Problems worth reporting that do not stop `rules` compiling, for
+    /// `roxy check`: an action in a `respond` rule that changes or records
+    /// the request, which is never forwarded.
+    pub fn rule_warnings(rules: &[RuleConfig]) -> Vec<Diagnostic> {
+        compiler::PolicyCompiler::rule_warnings(rules)
     }
 
     /// Whether any rule or metric filter reads `body.text`.

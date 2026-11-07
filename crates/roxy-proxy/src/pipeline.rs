@@ -12,10 +12,11 @@
 //!
 //! No step can forward anything itself: each returns a [`Verdict`] (or
 //! [`ResponseVerdict`]), and the only variant that leads toward the upstream
-//! is [`Verdict::Continue`]. Every error a step meets (body failure,
-//! unavailable policy input, invalid mutation, denied redirect target,
-//! state store full, unsupported effect) is mapped to [`Verdict::Deny`] or
-//! [`Verdict::Close`]. The steps and their caller (`exchange::core`) match
+//! is [`Verdict::Continue`]. A `respond` rule's answer is
+//! [`Verdict::Answer`], which goes to the client without dialling. Every
+//! error a step meets (body failure, unavailable policy input, invalid
+//! mutation, denied redirect target, state store full, unsupported effect)
+//! is mapped to [`Verdict::Deny`] or [`Verdict::Close`]. The steps and their caller (`exchange::core`) match
 //! verdicts exhaustively with no wildcard arm, so a new variant cannot
 //! silently fall through to forwarding.
 
@@ -38,7 +39,7 @@ use roxy_http::{
 };
 use roxy_rules::{
     AllowOpts, AwsSigV4, CaptureTarget, DEFAULT_DENY_MESSAGE, Decision, Deny, DenyStatus, Effect,
-    EvalContext, FAIL_CLOSED_STATUS, FailClosedReason, LogLevel, Outcome, RuleId,
+    EvalContext, FAIL_CLOSED_STATUS, FailClosedReason, LogLevel, Outcome, Respond, RuleId,
 };
 use ulid::Ulid;
 
@@ -294,6 +295,10 @@ impl Refusal {
 pub(crate) enum Verdict {
     /// Proceed with this (possibly mutated) request.
     Continue(CanonicalRequest),
+    /// Answer with this response from a `respond` rule. The request is
+    /// dropped unforwarded: the codec drains its body, or the connection
+    /// closes.
+    Answer(CanonicalResponse),
     /// Answer locally (deny or fail-closed).
     Deny(Refusal),
     /// The client side ended the exchange (body framing, timeout, cap, a
@@ -350,11 +355,13 @@ pub(crate) async fn request_steps(
 ) -> Verdict {
     let req = match inspect_request_body(cx, req, io).await {
         Verdict::Continue(req) => req,
+        Verdict::Answer(res) => return Verdict::Answer(res),
         Verdict::Deny(d) => return Verdict::Deny(d),
         Verdict::Close(e) => return Verdict::Close(e),
     };
     match request_rules(cx, req) {
         Verdict::Continue(req) => sign_request(cx, req, io).await,
+        Verdict::Answer(res) => Verdict::Answer(res),
         Verdict::Deny(d) => Verdict::Deny(d),
         Verdict::Close(e) => Verdict::Close(e),
     }
@@ -818,8 +825,13 @@ impl FlowCx {
         let mut refusal = None;
         if let Some(reason) = &out.fail_closed_reason {
             let code = fail_closed_code(reason, metric_err.as_ref());
-            self.meta
-                .input_unavailable(Stage::Head, code, reason, metric_err.as_ref());
+            if let FailClosedReason::TerminalConflict(_) = reason {
+                // The policy contradicts itself; no input was missing.
+                tracing::warn!(flow = %self.flow, %reason, "terminal conflict; failing closed");
+            } else {
+                self.meta
+                    .input_unavailable(Stage::Head, code, reason, metric_err.as_ref());
+            }
             refusal = Some(Refusal::fail_closed(code));
         } else {
             match &out.decision {
@@ -835,7 +847,7 @@ impl FlowCx {
                         *close,
                     ));
                 }
-                Decision::Allow(_) => {}
+                Decision::Allow(_) | Decision::Respond(_) => {}
             }
         }
         (out, refusal)
@@ -1034,6 +1046,7 @@ pub(crate) fn fail_closed_code(
         FailClosedReason::UnsupportedContentEncoding { .. } => "unsupported_content_encoding",
         FailClosedReason::BodyDecodeFailed { .. } => "body_decode_failed",
         FailClosedReason::MissingValue(_) => "missing_value",
+        FailClosedReason::TerminalConflict(_) => "terminal_conflict",
         FailClosedReason::WrongType { .. } => "wrong_type",
     }
 }
@@ -1171,14 +1184,24 @@ fn request_rules(cx: &mut FlowCx, mut req: CanonicalRequest) -> Verdict {
         .effects
         .into_iter()
         .partition(|e| !matches!(e, Effect::Log { .. } | Effect::SetState { .. }));
+    let mut answer = None;
     if refusal.is_none() {
-        if let Decision::Allow(opts) = &out.decision {
-            cx.opts = *opts;
+        match &out.decision {
+            Decision::Allow(opts) => cx.opts = *opts,
+            Decision::Respond(r) => match respond_response(r) {
+                Ok(res) => answer = Some(res),
+                Err(r) => refusal = Some(r),
+            },
+            Decision::Deny(_) => {}
         }
-        refusal = changes
-            .into_iter()
-            .try_for_each(|e| apply_request_effect(cx, &mut req, e))
-            .err();
+        // An answered outcome carries only `capture` and `digest` here,
+        // which select what is recorded of the answer.
+        refusal = refusal.or_else(|| {
+            changes
+                .into_iter()
+                .try_for_each(|e| apply_request_effect(cx, &mut req, e))
+                .err()
+        });
     }
     for effect in side_effects {
         if let Err(r) = apply_request_effect(cx, &mut req, effect) {
@@ -1199,8 +1222,29 @@ fn request_rules(cx: &mut FlowCx, mut req: CanonicalRequest) -> Verdict {
     if let Some(r) = refusal {
         return Verdict::Deny(r);
     }
+    if let Some(res) = answer {
+        return Verdict::Answer(res);
+    }
     settle_request_facts(cx, &req);
     Verdict::Continue(req)
+}
+
+/// A `respond` rule's answer, as sent: its status and `content-type`,
+/// `cache-control: no-store`, its headers, and its body, whose length the
+/// transport writes as `content-length`. No `x-roxy-rule`: the client sees
+/// an ordinary response, not a refusal. The compiler checked every field,
+/// so the error is unreachable; it fails closed all the same.
+fn respond_response(r: &Respond) -> Result<CanonicalResponse, Refusal> {
+    let status = StatusCode::from_u16(r.status.get()).map_err(|e| invalid("respond", &e))?;
+    let mut res = CanonicalResponse::new(status);
+    for (name, value) in r.header_fields() {
+        res.headers
+            .append(name, value)
+            .map_err(|e| invalid("respond", &e))?;
+    }
+    res.body = Body::from_bytes(Bytes::from(r.body.clone()));
+    res.meta.close = r.close;
+    Ok(res)
 }
 
 /// The in-flight rules and the log see the request as it will be

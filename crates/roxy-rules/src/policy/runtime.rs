@@ -5,10 +5,11 @@ use super::{
     CAction, Condition, InFlightAction, InFlightState, MetricDef, Part, Policy, SignSpec,
     is_header_value,
 };
+use crate::config::CaptureTarget;
 use crate::diag::RuleId;
 use crate::eval::{
     AwsSigV4, Credential, Decision, Deny, Effect, EvalContext, FailClosedReason, InFlightEffect,
-    InFlightOutcome, Outcome, PendingState, Scope, SetHeaderValue,
+    InFlightOutcome, Outcome, PendingState, Scope, SetHeaderValue, TerminalConflict,
 };
 use crate::types::Reads;
 use crate::view::FlowView;
@@ -38,6 +39,32 @@ fn refused_effects(effects: &mut Vec<Effect>) {
     effects.retain(|e| matches!(e, Effect::Log { .. } | Effect::SetState { .. }));
 }
 
+/// Keep only the effects that still apply when a `respond` rule answers:
+/// those a refusal keeps, plus the response half of `capture` and
+/// `digest`, which record the answer. Nothing changes or records a request
+/// that is never forwarded.
+fn answered_effects(effects: &mut Vec<Effect>) {
+    let response = |t| match t {
+        CaptureTarget::Request => None,
+        CaptureTarget::Response | CaptureTarget::Both => Some(CaptureTarget::Response),
+    };
+    *effects = std::mem::take(effects)
+        .into_iter()
+        .filter_map(|e| match e {
+            Effect::Log { .. } | Effect::SetState { .. } => Some(e),
+            Effect::Capture(t) => response(t).map(Effect::Capture),
+            Effect::Digest(t) => response(t).map(Effect::Digest),
+            Effect::SetHeader { .. }
+            | Effect::RemoveHeader(_)
+            | Effect::RewritePath { .. }
+            | Effect::SetQuery { .. }
+            | Effect::RemoveQuery(_)
+            | Effect::Redirect { .. }
+            | Effect::Sign(_) => None,
+        })
+        .collect();
+}
+
 /// Keep only the effects that still apply when the exchange is stopped.
 fn stopped_effects(effects: &mut Vec<InFlightEffect>) {
     effects.retain(|e| {
@@ -59,16 +86,23 @@ impl Policy {
     ///
     /// * if any matching rule denies, the request is denied
     ///   (`terminal_rule` = the first matching deny in list order);
+    /// * else if a matching rule allows and another responds, or two
+    ///   matching rules respond, the result fails closed
+    ///   ([`FailClosedReason::TerminalConflict`]): no order makes both
+    ///   right;
     /// * else if any matching rule allows, it is allowed (`terminal_rule` =
     ///   the first matching allow, whose options — `upgrade`, `private_ok`
     ///   — are the only ones granted; options are never merged);
+    /// * else if one matching rule responds, it is answered with that
+    ///   rule's response (`terminal_rule` = that rule);
     /// * else it is denied (`terminal_rule` = `_default`).
     ///
     /// Tags set by a matching rule are visible to the rules below it, and
     /// `state["k"]` sees earlier `set_state` effects. Effects of every
     /// matching rule are returned in list order when the request is
     /// allowed; when it is denied only `log` and `set_state` remain (tags
-    /// are in [`Outcome::tags`]).
+    /// are in [`Outcome::tags`]); when it is answered, `capture` and
+    /// `digest` of the response remain too.
     ///
     /// Fail closed: if evaluating *any* admission rule reaches a metric
     /// the view reports unavailable, an address list it cannot answer for,
@@ -85,6 +119,8 @@ impl Policy {
         let mut matched: Vec<RuleId> = Vec::new();
         let mut deny: Option<(usize, Decision)> = None;
         let mut allow: Option<(usize, &Decision)> = None;
+        let mut respond: Option<(usize, &Decision)> = None;
+        let mut second_respond: Option<usize> = None;
         let mut quarantine: Option<RuleId> = None;
         for &i in &self.admission {
             let rule = &self.rules[i];
@@ -130,17 +166,45 @@ impl Policy {
                     CAction::Terminal(d @ Decision::Deny(_)) => {
                         deny.get_or_insert_with(|| (i, d.clone()));
                     }
+                    CAction::Terminal(d @ Decision::Respond(_)) => match respond {
+                        None => respond = Some((i, d)),
+                        Some(_) => {
+                            second_respond.get_or_insert(i);
+                        }
+                    },
                 }
             }
         }
-        let (decision, terminal_rule) = match (deny, allow) {
-            // Deny wins; otherwise the first matching allow.
-            (Some((i, d)), _) => (d, self.rules[i].id.clone()),
-            (None, Some((i, d))) => (d.clone(), self.rules[i].id.clone()),
-            (None, None) => (Decision::default_deny(), self.default_id.clone()),
+        let id = |i: usize| self.rules[i].id.clone();
+        let (decision, terminal_rule) = match (deny, allow, respond, second_respond) {
+            // Deny wins.
+            (Some((i, d)), ..) => (d, id(i)),
+            // Two rules that each decide alone conflict: no order makes
+            // both right.
+            (None, Some((a, _)), Some((r, _)), _) => {
+                let c = TerminalConflict::AllowAndRespond {
+                    allow: id(a),
+                    respond: id(r),
+                };
+                let reason = FailClosedReason::TerminalConflict(c);
+                return self.fail(reason, matched, effects, tags, quarantine);
+            }
+            (None, None, Some((r, _)), Some(s)) => {
+                let c = TerminalConflict::TwoResponds {
+                    first: id(r),
+                    second: id(s),
+                };
+                let reason = FailClosedReason::TerminalConflict(c);
+                return self.fail(reason, matched, effects, tags, quarantine);
+            }
+            // Otherwise the first matching allow, or the one respond.
+            (None, Some((i, d)), None, _) | (None, None, Some((i, d)), None) => (d.clone(), id(i)),
+            (None, None, None, _) => (Decision::default_deny(), self.default_id.clone()),
         };
-        if !decision.is_allow() {
-            refused_effects(&mut effects);
+        match decision {
+            Decision::Allow(_) => {}
+            Decision::Respond(_) => answered_effects(&mut effects),
+            Decision::Deny(_) => refused_effects(&mut effects),
         }
         Outcome {
             decision,

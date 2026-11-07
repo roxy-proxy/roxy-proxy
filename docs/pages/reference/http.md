@@ -212,6 +212,31 @@ inspected, and a rule that reads it fails closed.
 `http.strip_accept_encoding` (default false) removes `accept-encoding`
 from every request, so origins answer uncompressed.
 
+## Answers
+
+A `respond` rule's answer is sent as the rule wrote it, without dialling
+the upstream ([actions](/reference/rule-language#actions)):
+
+```
+HTTP/1.1 200 OK
+content-type: <content_type>
+content-length: <body length>
+cache-control: no-store
+<the rule's headers>
+
+<body>
+```
+
+There is no `x-roxy-rule`: the client sees an ordinary response, not a
+refusal. roxy reads and discards the request body, then keeps the
+connection open for the next request. A body over 1 MiB is not read to its
+end, and the connection is closed instead. With `respond: { close: true }`
+the connection is closed after the answer without reading the body. On
+HTTP/2 the stream ends with the answer, and `close: true` sends `GOAWAY`.
+
+A WebSocket upgrade request that a `respond` rule matches gets the answer
+as an ordinary response, without the upgrade.
+
 ## Deny responses
 
 Every refusal roxy makes has the same shape:

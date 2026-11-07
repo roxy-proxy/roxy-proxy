@@ -89,6 +89,7 @@ impl Config {
             metrics: &self.metrics,
             secret_names: &secret_names,
             address_lists: &address_lists,
+            max_respond_body_bytes: self.limits.max_respond_body_bytes.as_u64(),
         })
     }
 

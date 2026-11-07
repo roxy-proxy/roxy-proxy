@@ -161,6 +161,7 @@ pub mod rules {
             metrics: &metrics,
             secret_names: &secrets,
             address_lists: &lists,
+            max_respond_body_bytes: roxy_rules::DEFAULT_MAX_RESPOND_BODY_BYTES,
         })
         .ok()
     }

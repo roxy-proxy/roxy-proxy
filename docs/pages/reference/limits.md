@@ -53,6 +53,7 @@ limits:
   max_inspect_body_bytes: 1mb     # body.text, response.body.text, and addons' default
   max_sign_body_bytes: 100mb      # a body hashed for sign: aws_sigv4
   max_capture_body_bytes: 16mb    # per direction per exchange
+  max_respond_body_bytes: 64kb    # a respond rule's body; larger fails the config
   max_ws_message_bytes: 16mb      # a WebSocket message, when rules read messages
   max_observer_lag_bytes: 16mb    # how far an observing addon may fall behind
   max_buffered_bytes: 1gb         # all of the above together, across the process

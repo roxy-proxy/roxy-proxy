@@ -31,6 +31,7 @@ pub(crate) fn try_compile(metrics_yaml: &str, rules_yaml: &str) -> Result<Policy
         metrics: &metrics,
         secret_names: &secrets,
         address_lists: &lists,
+        max_respond_body_bytes: roxy_rules::DEFAULT_MAX_RESPOND_BODY_BYTES,
     })
     .map_err(|ds| ds.iter().map(render).collect())
 }

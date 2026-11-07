@@ -968,6 +968,7 @@ pub(crate) mod testing {
             metrics: &[],
             secret_names: &none,
             address_lists: &none,
+            max_respond_body_bytes: roxy_rules::DEFAULT_MAX_RESPOND_BODY_BYTES,
         };
         let a = Arc::get_mut(&mut addon).expect("a fresh addon");
         a.when = Some(
@@ -1009,6 +1010,7 @@ pub(crate) mod testing {
             metrics: &[],
             secret_names: &secret_names,
             address_lists: &none,
+            max_respond_body_bytes: roxy_rules::DEFAULT_MAX_RESPOND_BODY_BYTES,
         };
         let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));
         let mut upstream = UpstreamSettings {

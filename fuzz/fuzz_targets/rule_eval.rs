@@ -13,7 +13,11 @@
 //!   body text, the address list). The outcome is either exactly the same
 //!   (the input was not reached) or a fail-closed deny. It is never a
 //!   different decision, in particular never an allow that the available
-//!   flow did not get.
+//!   flow did not get. That covers `respond`: an unavailable input never
+//!   turns a deny into an answer, or an answer into an allow;
+//! - an answer is never given when a `quarantine` matched (deny wins), and
+//!   a terminal conflict (an allow beside a respond, or two responds) names
+//!   two different rules that both matched.
 #![no_main]
 
 use std::net::Ipv4Addr;
@@ -21,7 +25,9 @@ use std::net::Ipv4Addr;
 use arbitrary::{Arbitrary, Result, Unstructured};
 use ipnet::{IpNet, Ipv4Net};
 use libfuzzer_sys::fuzz_target;
-use roxy_rules::{Decision, EvalContext, Field, MapView, Outcome};
+use roxy_rules::{
+    Decision, EvalContext, FailClosedReason, Field, MapView, Outcome, TerminalConflict,
+};
 use serde_json::json;
 
 const STR_FIELDS: &[&str] = &[
@@ -99,12 +105,14 @@ fn expr(u: &mut Unstructured<'_>, depth: u8) -> Result<String> {
 }
 
 fn then(u: &mut Unstructured<'_>) -> Result<serde_json::Value> {
-    Ok(match u.int_in_range(0..=5)? {
+    Ok(match u.int_in_range(0..=7)? {
         0 => json!("allow"),
         1 => json!("deny"),
         2 => json!({ "deny": { "status": 429 } }),
         3 => json!([{ "tag": "t0" }]),
         4 => json!("quarantine"),
+        5 => json!({ "respond": { "status": 200, "body": "stub" } }),
+        6 => json!([{ "tag": "t0" }, { "respond": { "status": 404 } }]),
         _ => json!([{ "tag": "t0" }, "allow"]),
     })
 }
@@ -173,6 +181,18 @@ fn check(out: &Outcome) {
     // A matched `quarantine` is a deny, whichever deny decided.
     if out.quarantine.is_some() {
         assert!(out.decision.is_deny(), "{out:?}");
+    }
+    // An answer comes from a rule, never from a reserved id.
+    if out.decision.is_respond() {
+        assert!(!out.terminal_rule.as_str().starts_with('_'), "{out:?}");
+    }
+    // A terminal conflict names two different rules that both matched.
+    if let Some(FailClosedReason::TerminalConflict(c)) = &out.fail_closed_reason {
+        let (a, b) = match c {
+            TerminalConflict::AllowAndRespond { allow, respond } => (allow, respond),
+            TerminalConflict::TwoResponds { first, second } => (first, second),
+        };
+        assert!(a != b && out.matched.contains(a) && out.matched.contains(b), "{out:?}");
     }
 }
 

@@ -48,6 +48,8 @@ mod lease_tests;
 mod quarantine_tests;
 mod reclamation_tests;
 #[cfg(test)]
+mod respond_tests;
+#[cfg(test)]
 mod rules_tests;
 #[cfg(test)]
 mod sign_tests;
@@ -248,6 +250,7 @@ impl AddonDef {
             metrics: &[],
             secret_names: &none,
             address_lists: &none,
+            max_respond_body_bytes: roxy_rules::DEFAULT_MAX_RESPOND_BODY_BYTES,
         };
         self.load(&input).await
     }
@@ -522,6 +525,7 @@ impl KitBuilder {
             metrics: &metric_defs,
             secret_names: &secret_names,
             address_lists: &list_names,
+            max_respond_body_bytes: roxy_rules::DEFAULT_MAX_RESPOND_BODY_BYTES,
         };
         let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));
 
@@ -1029,6 +1033,7 @@ impl Kit {
             metrics: &[],
             secret_names: &secret_names,
             address_lists: &list_names,
+            max_respond_body_bytes: roxy_rules::DEFAULT_MAX_RESPOND_BODY_BYTES,
         };
         let policy = Policy::compile(&input).unwrap_or_else(|d| panic!("rules: {d:?}"));
         self.server
