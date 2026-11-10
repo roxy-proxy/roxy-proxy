@@ -1,7 +1,7 @@
 {
   "version": 1,
   "files": {
-    "/changelog.md": "9d255398ed56f699ec4bfa7b4b1a65ea2f6eb62a60f9f98e1b243da1b76d2400",
+    "/changelog.md": "68beecada7ba44b1df2466fd9b1eec1fafc0d216c32c8fd5a7670543833fac16",
     "/design/addon-model.md": "0010aa1fcdc0e33ecf87f28627b38c9df0f38145e00e5a675e8e23ac11ccf868",
     "/design/how-it-works.md": "04a8fcc1d39b2eb37166ab121898a61dd55eef9e3ac1431e0dcd654d255f21d7",
     "/design/performance.md": "484bbcbaddac71c179a6f1259e7252733250dee8a7d72f483c4eabaf70a92bb3",
@@ -16,10 +16,10 @@
     "/guides/testing-a-policy.md": "22b9e5f1c095f597c1a86dfff4bc2bad9b1ba2089d364a3d3cc79023c406b432",
     "/guides/writing-addons.md": "bcd9fb5c54a0f4ee9bdc916e1028b56a8eee2bcf4c585fa3c8adbee90008070a",
     "/index.md": "bc5e8c006448dc620547c335ad122fd48f936e9432761ef3f9a9956fa436cb9a",
-    "/llms-full.txt": "b496e2813f16aa9b0512a6fab9de30949ef0e772d84ad0f62de096290919fc0e",
+    "/llms-full.txt": "01238f7ad8b6c6669728f5682a0053c06e4c739d5cbfa0c0bc5f3ed3a61cc195",
     "/llms.txt": "23845c06e6a6a4640825673fe71e6893efc5b6e5a7ebfd34556eae7213da587a",
     "/quickstart.md": "0024b6a7dd5444c2e881cecdd37e15779ee8cb350d0f68f39481745feed7622d",
-    "/reference/addon-configuration.md": "978230a18cfaf480b7f7593ed8247ecef94915d3f202193ef6c4d61e5b2f5c1e",
+    "/reference/addon-configuration.md": "6fd434cc29f5aac744d9fb1498118b640fea726d3e965a1a524eed0f30e73be0",
     "/reference/address-lists.md": "cfc140c8a581c37ab8ebecda390949a2fb0cb88387ca6f6e5f102502ba84cba6",
     "/reference/architecture.md": "02aa55af09b6451e892114cc69905eb6fa407bbe8fdc6c0379894c91fbc54cce",
     "/reference/configuration.md": "7c41d3c67333c5d46c35596552d138000cc24c01694eacf687c999520914edd5",
