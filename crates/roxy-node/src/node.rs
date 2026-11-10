@@ -1101,6 +1101,25 @@ mod tests {
         }
     }
 
+    fn log_capture_callsite_ordering_marker() {
+        tracing::trace!("log-capture callsite-ordering marker");
+    }
+
+    #[test]
+    fn callsite_first_hit_without_capture_is_captured_later() {
+        let logs = LogCapture::start();
+        std::thread::spawn(log_capture_callsite_ordering_marker)
+            .join()
+            .unwrap();
+        log_capture_callsite_ordering_marker();
+        assert_eq!(
+            logs.count("log-capture callsite-ordering marker"),
+            1,
+            "{}",
+            logs.text()
+        );
+    }
+
     const ENROL: &str = "/roxy/v1/enrol";
     const RENEW: &str = "/roxy/v1/renew";
     const LEASE: &str = "/roxy/v1/lease";
