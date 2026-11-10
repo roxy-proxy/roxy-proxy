@@ -1022,19 +1022,33 @@ mod tests {
         }
     }
 
-    /// Everything logged on this thread while the guard lives, at every
-    /// level, so a token leaking through a dependency's trace line shows.
-    struct LogCapture {
-        lines: Arc<Mutex<Vec<u8>>>,
-        _guard: tracing::subscriber::DefaultGuard,
+    thread_local! {
+        /// The `LogCapture` running on this thread, if any.
+        static CAPTURE: std::cell::RefCell<Option<Arc<Mutex<Vec<u8>>>>> =
+            const { std::cell::RefCell::new(None) };
     }
 
-    #[derive(Clone)]
-    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+    /// Everything logged on this thread while the capture lives, at every
+    /// level, so a token leaking through a dependency's trace line shows.
+    ///
+    /// One process-wide subscriber writes each thread's lines to that
+    /// thread's capture. A thread-scoped subscriber is not enough:
+    /// `tracing` caches a callsite's interest process-wide, and a callsite
+    /// first hit on a test thread with no subscriber is cached as never
+    /// interesting, so a capturing test on another thread loses its lines.
+    struct LogCapture {
+        lines: Arc<Mutex<Vec<u8>>>,
+    }
+
+    struct CaptureWriter;
 
     impl std::io::Write for CaptureWriter {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            lock(&self.0).extend_from_slice(buf);
+            CAPTURE.with(|c| {
+                if let Some(lines) = c.borrow().as_ref() {
+                    lock(lines).extend_from_slice(buf);
+                }
+            });
             Ok(buf.len())
         }
 
@@ -1047,22 +1061,29 @@ mod tests {
         type Writer = Self;
 
         fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
+            Self
         }
     }
 
     impl LogCapture {
         fn start() -> Self {
+            static INSTALL: std::sync::Once = std::sync::Once::new();
+            INSTALL.call_once(|| {
+                use tracing_subscriber::Layer as _;
+                use tracing_subscriber::layer::SubscriberExt as _;
+                let capturing = tracing_subscriber::filter::dynamic_filter_fn(|_, _| {
+                    CAPTURE.with(|c| c.borrow().is_some())
+                });
+                let layer = tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(CaptureWriter)
+                    .with_filter(capturing);
+                tracing::subscriber::set_global_default(tracing_subscriber::registry().with(layer))
+                    .expect("the test binary sets no other global subscriber");
+            });
             let lines = Arc::new(Mutex::new(Vec::new()));
-            let subscriber = tracing_subscriber::fmt()
-                .with_max_level(tracing::Level::TRACE)
-                .with_ansi(false)
-                .with_writer(CaptureWriter(lines.clone()))
-                .finish();
-            Self {
-                lines,
-                _guard: tracing::subscriber::set_default(subscriber),
-            }
+            CAPTURE.with(|c| *c.borrow_mut() = Some(lines.clone()));
+            Self { lines }
         }
 
         fn text(&self) -> String {
@@ -1072,6 +1093,31 @@ mod tests {
         fn count(&self, needle: &str) -> usize {
             self.text().matches(needle).count()
         }
+    }
+
+    impl Drop for LogCapture {
+        fn drop(&mut self) {
+            CAPTURE.with(|c| *c.borrow_mut() = None);
+        }
+    }
+
+    fn log_capture_callsite_ordering_marker() {
+        tracing::trace!("log-capture callsite-ordering marker");
+    }
+
+    #[test]
+    fn callsite_first_hit_without_capture_is_captured_later() {
+        let logs = LogCapture::start();
+        std::thread::spawn(log_capture_callsite_ordering_marker)
+            .join()
+            .unwrap();
+        log_capture_callsite_ordering_marker();
+        assert_eq!(
+            logs.count("log-capture callsite-ordering marker"),
+            1,
+            "{}",
+            logs.text()
+        );
     }
 
     const ENROL: &str = "/roxy/v1/enrol";
