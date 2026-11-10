@@ -4,40 +4,42 @@ A strict, programmable HTTP firewall: an egress proxy for untrusted workloads, o
 
 <!--
 Sitemap:
-- [Overview](/index): roxy is a strict, programmable HTTP firewall: an egress proxy for untrusted workloads, or a gateway in front of the APIs your clients call.
-- [Quickstart](/quickstart): Watch generated traffic go through roxy with an auth check, a per-user token quota and an inspect_sentinel sidecar, against a scripted model.
-- [Changelog](/changelog)
-- [Sandbox containment](/guides/containment): Run roxy as the only way out of a sandbox: the workload points HTTPS_PROXY at roxy's proxy port, trusts roxy's CA, and the network gives it no other route.
-- [HTTP gateway](/guides/gateway): Put roxy in front of the APIs your clients call: a load balancer terminates TLS, an http listener takes each request, and rules route it by host and inject the real key.
-- [Run roxy](/guides/run)
-- [Node mode](/guides/node-mode): Run roxy without a config file: it enrols with a control plane, leases its policy and secrets, and sends its flow log back.
-- [Operations](/guides/operations)
-- [Managing the CA](/guides/ca-certificates)
-- [Testing a policy](/guides/testing-a-policy)
-- [Writing addons](/guides/writing-addons)
-- [How roxy works](/design/how-it-works): One exchange through roxy: decrypt and parse, the addons, the rules, the upstream connection, and the response back the same way, with every step written to the flow log.
-- [Threat model and guarantees](/design/threat-model)
-- [Policy evaluation](/design/policy-evaluation): How the rules decide an exchange: one decision before the request is forwarded, further checks as the bytes stream, and deny always wins.
-- [Addon model](/design/addon-model): What an addon is: a step every exchange it runs on streams through, in both directions. How addons are ordered, what they are held to, and what the modes mean.
-- [Performance](/design/performance)
-- [Configuration](/reference/configuration)
-- [Rule language](/reference/rule-language)
-- [Secrets](/reference/secrets)
-- [Rate limits and state](/reference/rate-limits)
-- [Address floor and lists](/reference/address-lists)
-- [WebSockets](/reference/websockets)
-- [HTTP](/reference/http)
-- [Upstream](/reference/upstream)
-- [TLS](/reference/tls)
-- [Resource limits](/reference/limits)
-- [Addon configuration](/reference/addon-configuration)
-- [Service layer protocol](/reference/service-layers)
-- [Host services](/reference/host-services)
-- [Flow log and capture](/reference/flow-log)
-- [Node protocol](/reference/node-protocol)
-- [Architecture](/reference/architecture)
-- [Development](/reference/development)
+- [Overview](/index.md): roxy is a strict, programmable HTTP firewall: an egress proxy for untrusted workloads, or a gateway in front of the APIs your clients call.
+- [Quickstart](/quickstart.md): Watch generated traffic go through roxy with an auth check, a per-user token quota and an inspect_sentinel sidecar, against a scripted model.
+- [Changelog](/changelog.md)
+- [Sandbox containment](/guides/containment.md): Run roxy as the only way out of a sandbox: the workload points HTTPS_PROXY at roxy's proxy port, trusts roxy's CA, and the network gives it no other route.
+- [HTTP gateway](/guides/gateway.md): Put roxy in front of the APIs your clients call: a load balancer terminates TLS, an http listener takes each request, and rules route it by host and inject the real key.
+- [Run roxy](/guides/run.md)
+- [Node mode](/guides/node-mode.md): Run roxy without a config file: it enrols with a control plane, leases its policy and secrets, and sends its flow log back.
+- [Operations](/guides/operations.md)
+- [Managing the CA](/guides/ca-certificates.md)
+- [Testing a policy](/guides/testing-a-policy.md)
+- [Writing addons](/guides/writing-addons.md)
+- [How roxy works](/design/how-it-works.md): One exchange through roxy: decrypt and parse, the addons, the rules, the upstream connection, and the response back the same way, with every step written to the flow log.
+- [Threat model and guarantees](/design/threat-model.md)
+- [Policy evaluation](/design/policy-evaluation.md): How the rules decide an exchange: one decision before the request is forwarded, further checks as the bytes stream, and deny always wins.
+- [Addon model](/design/addon-model.md): What an addon is: a step every exchange it runs on streams through, in both directions. How addons are ordered, what they are held to, and what the modes mean.
+- [Performance](/design/performance.md)
+- [Configuration](/reference/configuration.md)
+- [Rule language](/reference/rule-language.md)
+- [Secrets](/reference/secrets.md)
+- [Rate limits and state](/reference/rate-limits.md)
+- [Address floor and lists](/reference/address-lists.md)
+- [WebSockets](/reference/websockets.md)
+- [HTTP](/reference/http.md)
+- [Upstream](/reference/upstream.md)
+- [TLS](/reference/tls.md)
+- [Resource limits](/reference/limits.md)
+- [Addon configuration](/reference/addon-configuration.md)
+- [Service layer protocol](/reference/service-layers.md)
+- [Host services](/reference/host-services.md)
+- [Flow log and capture](/reference/flow-log.md)
+- [Node protocol](/reference/node-protocol.md)
+- [Architecture](/reference/architecture.md)
+- [Development](/reference/development.md)
 -->
+
+<!-- Source: / -->
 
 # Overview
 
@@ -64,6 +66,8 @@ The [quickstart](/quickstart) runs generated traffic through roxy with an auth c
 ## Open source
 
 roxy is [open source](https://github.com/roxy-proxy/roxy-proxy), written in Rust, and dual-licensed under Apache 2.0 and MIT. Outstanding work is tracked in [issues](https://github.com/roxy-proxy/roxy-proxy/issues).
+
+<!-- Source: /quickstart -->
 
 # Quickstart
 
@@ -209,6 +213,8 @@ A client follows `HTTP_PROXY` because it chooses to. To contain an agent, run it
 * [Writing addons](/guides/writing-addons) covers the SDK the two addons here use.
 * [Sandbox containment](/guides/containment) has the network setup for containing an agent.
 * [Policy evaluation](/design/policy-evaluation) explains how rules are evaluated.
+
+<!-- Source: /changelog -->
 
 # Changelog
 
@@ -382,6 +388,8 @@ The first release: a strict, programmable HTTP firewall.
 * A JSONL flow log naming the rule or addon behind every decision, with optional body capture and digests; backpressure holds traffic until the log catches up.
 * Node mode: roxy enrols with a control plane, leases its policy and secrets into memory, and ships its flow log.
 
+<!-- Source: /guides/containment -->
+
 # Sandbox containment
 
 An untrusted workload runs where its only route out is roxy. It sends its
@@ -484,6 +492,8 @@ refuses by default. A rule that lets the workload reach one needs
 `then: { allow: { private_ok: true } }`
 ([address floor](/reference/address-lists#address-floor)).
 
+<!-- Source: /guides/gateway -->
+
 # HTTP gateway
 
 An `http` listener lets roxy stand in for an origin. Clients send ordinary
@@ -583,6 +593,8 @@ is another addon.
   shuts the whole process, so one client's bad requests would lock out
   every other client.
 
+<!-- Source: /guides/run -->
+
 # Run roxy
 
 ## Container image
@@ -670,6 +682,8 @@ rules:
 
 `run --state-dir DIR` keeps state that must survive a restart. A config
 that can [quarantine](/guides/operations#quarantine) roxy requires it.
+
+<!-- Source: /guides/node-mode -->
 
 # Node mode
 
@@ -770,6 +784,8 @@ ten seconds.
 [operations](/guides/operations#health): ready means an unexpired lease is
 in force.
 
+<!-- Source: /guides/operations -->
+
 # Operations
 
 roxy's own logs go to stderr (`--log-format json|pretty`, `--log-level`
@@ -866,6 +882,8 @@ exists. To lift it, stop roxy, remove `DIR/quarantine` and start it again.
 In [node mode](/guides/node-mode#the-lease) the control plane lifts it
 instead.
 
+<!-- Source: /guides/ca-certificates -->
+
 # Managing the CA
 
 On a proxy listener roxy terminates every TLS connection with a
@@ -931,6 +949,8 @@ curl -s -x http://<proxy> http://roxy.internal/roxy-ca.pem        # through the 
 The `ca_server` listener is separate from the proxy port so it can be
 firewalled separately.
 
+<!-- Source: /guides/testing-a-policy -->
+
 # Testing a policy
 
 `roxy check` validates a config. `roxy rule test` shows what the policy
@@ -992,6 +1012,8 @@ so `grep '"trial-no-gists"' flow.jsonl` lists them. Because a matching
 `deny` always wins, each of these is a request the real rule would have
 refused. When you are happy with what it catches, replace the `tag` with
 `deny`.
+
+<!-- Source: /guides/writing-addons -->
 
 # Writing addons
 
@@ -1187,6 +1209,8 @@ Build a component against the `wit/` of the roxy version it runs on. A
 component built against another version fails when the config loads,
 naming the imports that do not match.
 
+<!-- Source: /design/how-it-works -->
+
 # How roxy works
 
 <img src={howItWorks} alt="One exchange through roxy, top to bottom. The client's request enters roxy and passes through four stages: decrypt and parse (CONNECT, TLS, strict parse into the canonical request, and the lease check), the addon stack (enforce layers in order, with observers beside them on a copy), the rules (lease checked again; deny wins; effects: secrets, headers, redirect, sign) and connect (DNS, address floor, upstream TLS), then reaches the upstream. The response returns up the same stages: re-framed by the connector, re-checked by the rules, seen by the addons, and canonically re-serialised to the client. Each stage has an exit branching to the right: a parse failure is refused with parse_error, an expired policy denies with _expired at either lease check, an addon can answer the client directly or deny with layer:name, the rules deny with the rule id, and the address floor denies with _address_policy. A dotted line between the rules and connect marks where capture records what the rules allow. A flow-log strip down the right edge is fed by every stage and every exit: one record per exchange, never dropped." />
@@ -1267,6 +1291,8 @@ The compiled config is swapped in whole when it changes. An exchange
 finishes under the config it started with
 ([reload](/guides/operations#reload)). In [node mode](/guides/node-mode)
 the config comes from a control plane instead of a file.
+
+<!-- Source: /design/threat-model -->
 
 # Threat model and guarantees
 
@@ -1384,6 +1410,8 @@ doing ordinary things (large uploads, keep-alive, `100-continue`,
 WebSockets, compression) through an allowed rule should notice nothing
 except the CA. A default that breaks a conforming client is a bug.
 
+<!-- Source: /design/policy-evaluation -->
+
 # Policy evaluation
 
 The policy is a list of rules. Each rule has an `id`, a `when` condition
@@ -1461,6 +1489,8 @@ with `503`. roxy never guesses that the condition was false. A value that
 is just absent, like a header the client did not send, is `null` and
 compares normally
 ([missing values](/reference/rule-language#missing-values-null)).
+
+<!-- Source: /design/addon-model -->
 
 # Addon model
 
@@ -1554,6 +1584,8 @@ already made.
   copy, and the exchange carries on
   ([observers](/reference/addon-configuration#observers)).
 
+<!-- Source: /design/performance -->
+
 # Performance
 
 On ordinary HTTP traffic roxy is on a par with Envoy. Doing TLS
@@ -1591,6 +1623,8 @@ through a service layer, even when the layer leaves them untouched. A
 These figures come from one machine. No run uses body rules, capture,
 body digests or a real addon. A body digest costs about one core per
 400 MB/s on a CPU without SHA extensions, which is why it is opt-in.
+
+<!-- Source: /reference/configuration -->
 
 # Configuration
 
@@ -1660,6 +1694,8 @@ rules:
     when: host == "api.openai.com" and body.bytes > 10mb
     then: { deny: { status: 413 } }
 ```
+
+<!-- Source: /reference/rule-language -->
 
 # Rule language
 
@@ -1824,6 +1860,8 @@ The text is the body decoded from its `content-encoding`
 ([content codings](/reference/http#content-codings)). A body that cannot
 be decoded also denies the exchange.
 
+<!-- Source: /reference/secrets -->
+
 # Secrets
 
 `secrets:` maps names to where their values come from. `${secret:name}`
@@ -1903,6 +1941,8 @@ config that declares one. When the control plane changes a secret, the
 next request uses the new value, while an exchange in progress keeps the
 value it started with.
 
+<!-- Source: /reference/rate-limits -->
+
 # Rate limits and state
 
 Metrics count requests or bytes over a sliding window, for rules to
@@ -1980,6 +2020,8 @@ the store holds `limits.max_state_entries` (100 000) entries, a request
 that needs a new key is denied (`state_unavailable`). Addons can read and
 write the same store ([host services](/reference/host-services#state-state)).
 
+<!-- Source: /reference/address-lists -->
+
 # Address floor and lists
 
 Rules decide by name. The address floor decides by IP address: before
@@ -2051,6 +2093,8 @@ address_lists:
 * `roxy check` reports how many entries each list has. In
   `roxy rule test`, a list that fails to load makes every rule that reads
   it deny.
+
+<!-- Source: /reference/websockets -->
 
 # WebSockets
 
@@ -2141,6 +2185,8 @@ or `1009` for a message over the limit.
 A denied message is logged as a `ws_message` event. With
 `log.flow.ws_message_every: N`, every Nth message is logged as well.
 Message contents are never logged.
+
+<!-- Source: /reference/http -->
 
 # HTTP
 
@@ -2399,6 +2445,8 @@ A rule sets the status and message with
 closed, unless the rule says `deny: { close: false }`. After an upstream
 failure the connection stays open.
 
+<!-- Source: /reference/upstream -->
+
 # Upstream
 
 How roxy reaches the origin: it resolves names itself, checks every
@@ -2468,6 +2516,8 @@ The client gets the usual refusal body
 ([deny responses](/reference/http#deny-responses)). The reason is in the
 flow log only.
 
+<!-- Source: /reference/tls -->
+
 # TLS
 
 How roxy speaks TLS to clients on a proxy listener. Setting up the CA is
@@ -2496,6 +2546,8 @@ After a CONNECT, roxy reads the first TLS message to confirm that the
 tunnel carries TLS and to find the SNI. A ClientHello that is malformed,
 over 16 KiB, or split across several TLS records is treated as not TLS,
 and the connection is closed.
+
+<!-- Source: /reference/limits -->
 
 # Resource limits
 
@@ -2610,6 +2662,8 @@ buffers and addon memory are separate.
   sent upstream, outside the buffer budget.
 * Metric and state tables never evict entries
   ([never evict](/design/threat-model#never-evict)).
+
+<!-- Source: /reference/addon-configuration -->
 
 # Addon configuration
 
@@ -2871,6 +2925,8 @@ Only one party is blamed for a failed exchange: the first to fail.
   (`buffer_budget_exhausted`).
 * **An observer is never blamed.**
 
+<!-- Source: /reference/service-layers -->
+
 # Service layer protocol
 
 A `kind: service` addon is an external service that each exchange streams
@@ -3048,6 +3104,8 @@ roxy offers only `roxy.layer.v7`. WASM addons use `roxy:addon@0.3.0`.
   `request_end` before the `101`, so the service must forward the upgrade
   as it arrives rather than waiting for the request to end.
 
+<!-- Source: /reference/host-services -->
+
 # Host services
 
 What an addon can ask roxy to do beyond handling its own traffic. Each
@@ -3122,6 +3180,8 @@ the current exchange and every one after it are refused until an operator
 or the control plane lifts it. Use it only when the workload must be
 stopped; to refuse one request, answer it. Only enforcing addons can call
 it, and a config that grants it needs `roxy run --state-dir`.
+
+<!-- Source: /reference/flow-log -->
 
 # Flow log and capture
 
@@ -3291,6 +3351,8 @@ One JSON object per line:
 A body is its `data` records joined in `seq` order. Each `data` record
 holds at most 48 KiB of body, so lines stay under 64 KiB plus a little
 JSON, apart from head lines, which can be up to `limits.max_header_bytes`.
+
+<!-- Source: /reference/node-protocol -->
 
 # Node protocol
 
@@ -3524,6 +3586,8 @@ A batch the server refuses with `400` stays queued on the node, so under
 server wants no more flows until it sends a new lease. Other responses
 are handled as in the [errors table](/reference/node-protocol#errors).
 
+<!-- Source: /reference/architecture -->
+
 # Architecture
 
 ## Crates
@@ -3566,6 +3630,8 @@ no such ambiguities, so roxy uses an existing HTTP/2 implementation.
 * **Layer:** one addon in the stack.
 * **Address floor:** the check on every upstream address before roxy
   connects ([address floor](/reference/address-lists#address-floor)).
+
+<!-- Source: /reference/development -->
 
 # Development
 
