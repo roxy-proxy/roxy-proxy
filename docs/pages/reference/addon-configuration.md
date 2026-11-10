@@ -220,9 +220,16 @@ upstream's, for as long as the WebSocket is open. The addon can read,
 change or hold either direction, or refuse the upgrade by answering it.
 
 - The addon must handle both directions at once, since the request body
-  only ends when the client closes. The `roxy-addon` SDK does this.
+  ends only when the client closes, or when the relay ends. The
+  `roxy-addon` SDK does this.
 - Frames from the client are masked, as the WebSocket protocol requires.
 - An addon that turns the `101` into another status fails the exchange.
+- The relay ends when the upstream closes, or when nothing moves for the
+  relay's idle timeout, whatever the addons still hold of its bodies. The
+  request body then ends for the addons as it does when the client
+  closes, bytes already on their way to the client get a second to
+  arrive, and roxy closes the client's connection whether or not the
+  addons have ended their bodies.
 
 ### Failure
 

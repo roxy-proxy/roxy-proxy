@@ -277,9 +277,7 @@ fn sse_approval(req: &RequestHead, body: InputStream, response: bool) {
 /// The default: pass the exchange through, streaming both bodies, chunk by
 /// chunk (upper-cased when `x-upper` is set, each byte shifted up by one
 /// when `x-shift` is). With `x-hold`, neither body
-/// it passes on is ended until the client's request body goes away; with
-/// `x-keep-request`, the request body is relayed until it ends even after
-/// the response from below has, as the SDK's pump does.
+/// it passes on is ended until the client's request body goes away.
 /// Unbuffered, the response from below goes out with `x-status` as its
 /// status, if set. `x-delay-request-ms` holds the request head before
 /// `next`; buffered, `x-delay-response-ms` holds the response head after it.
@@ -288,7 +286,6 @@ fn pass(req: &RequestHead, body: InputStream, buffer_first: bool) {
     let tweaks = Tweaks {
         transform,
         hold: header(req, "x-hold").is_some(),
-        keep_request: header(req, "x-keep-request").is_some(),
         status: header(req, "x-status").map(|v| v.parse().expect("x-status")),
     };
     let next_head = forward_head(req);
@@ -312,7 +309,6 @@ fn pass(req: &RequestHead, body: InputStream, buffer_first: bool) {
 struct Tweaks {
     transform: Transform,
     hold: bool,
-    keep_request: bool,
     status: Option<u16>,
 }
 
@@ -364,8 +360,9 @@ fn copy_ready(
 /// Streams both bodies at once: the request body into `next` and the
 /// response from below back out, each chunk as it comes, neither waiting
 /// for the other to end. A WebSocket's request body only ends when the
-/// client closes, while its response streams all along. The response
-/// ending ends the request direction too, unless `keep_request`.
+/// client closes, while its response streams all along. The request body
+/// is relayed until it ends even after the response from below has, as the
+/// SDK's pump does.
 fn duplex(
     req_in: InputStream,
     req_out: OutputStream,
@@ -373,7 +370,6 @@ fn duplex(
     Tweaks {
         transform,
         hold,
-        keep_request,
         status,
     }: Tweaks,
 ) {
@@ -427,9 +423,6 @@ fn duplex(
                 return;
             }
             types::finish(output);
-            if !keep_request {
-                break;
-            }
             resp_done = true;
         }
         if resp_done && !req_open {
@@ -456,12 +449,6 @@ fn duplex(
         let refs: Vec<&Pollable> = wait.iter().collect();
         wasi::io::poll::poll(&refs);
     }
-    // Close the request direction too, however far it got.
-    drop(req_in);
-    if let Some(o) = req_out.take() {
-        types::finish(o);
-    }
-    drop(pending);
 }
 
 /// Like `pass`, but it streams the request body into `next` while watching

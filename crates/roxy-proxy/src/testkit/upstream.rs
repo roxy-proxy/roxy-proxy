@@ -347,8 +347,9 @@ impl Upstream {
     /// * a WebSocket upgrade: `101`, then echoes bytes; with
     ///   `x-echo: once`, echoes the first read and closes; with
     ///   `x-echo: frames`, echoes whole messages as a WebSocket server
-    ///   would and answers a close; with `x-accept-extension`, accepts
-    ///   `permessage-deflate`;
+    ///   would and answers a close; with `x-echo: frames-once`, echoes one
+    ///   message and closes from its own side; with `x-accept-extension`,
+    ///   accepts `permessage-deflate`;
     /// * anything else: reads the body, answers `200` with JSON
     ///   `{method, path, host, body_len, via}`.
     async fn answer(
@@ -383,11 +384,12 @@ impl Upstream {
         {
             lock(&entry).complete = Some(true);
             self.changed.notify_waiters();
-            let echo = req.headers().get("x-echo").cloned();
-            if echo.as_ref().is_some_and(|v| v == "frames") {
-                return self.upgrade_and_echo_frames(&mut req, &key);
-            }
-            let once = echo.is_some_and(|v| v == "once");
+            let once = match req.headers().get("x-echo").map(http::HeaderValue::as_bytes) {
+                Some(b"frames") => return self.upgrade_and_echo_frames(&mut req, &key, false),
+                Some(b"frames-once") => return self.upgrade_and_echo_frames(&mut req, &key, true),
+                Some(b"once") => true,
+                _ => false,
+            };
             return self.upgrade_and_echo(&mut req, &key, once);
         }
         if path.starts_with("/drip?") {
@@ -494,11 +496,13 @@ impl Upstream {
 
     /// Answers a WebSocket upgrade with `101`, then echoes each data
     /// message as one unmasked frame, recording it, and answers a close
-    /// with a close.
+    /// with a close; when `once`, closes from its own side after the first
+    /// echo instead.
     fn upgrade_and_echo_frames(
         self: &Arc<Self>,
         req: &mut http::Request<Incoming>,
         key: &http::HeaderValue,
+        once: bool,
     ) -> http::Response<Body> {
         let on = hyper::upgrade::on(req);
         let me = self.clone();
@@ -520,6 +524,14 @@ impl Upstream {
                 if msg.is_text() || msg.is_binary() {
                     lock(&me.ws_received).push(msg.clone().into_data().to_vec());
                     if ws.send(msg).await.is_err() {
+                        break;
+                    }
+                    if once {
+                        // Close from this side, without waiting for the
+                        // client's reply: the client is still open when
+                        // the upstream is gone.
+                        let _ = ws.close(None).await;
+                        let _ = ws.get_mut().flush().await;
                         break;
                     }
                 }
