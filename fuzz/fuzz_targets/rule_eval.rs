@@ -43,7 +43,7 @@ const STR_FIELDS: &[&str] = &[
     "state[\"k\"]",
     "body.text",
 ];
-const INT_FIELDS: &[&str] = &["port", "body.size", "metric.m0", "metric.m1"];
+const INT_FIELDS: &[&str] = &["port", "body.size", "metric.m0", "metric.m1", "metric.m2"];
 const STR_OPS: &[&str] = &[
     "==",
     "!=",
@@ -129,6 +129,7 @@ struct Flow<'a> {
     state: Option<&'a str>,
     m0: i64,
     m1: i64,
+    m2: i64,
     body: &'a str,
     in_list: bool,
 }
@@ -147,6 +148,7 @@ fn view(f: &Flow<'_>) -> MapView {
         .with(Field::ClientIp, roxy_rules::Value::Ip(ip.into()))
         .with_metric("m0", f.m0)
         .with_metric("m1", f.m1)
+        .with_metric("m2", f.m2)
         .with_body(f.body);
     if let Some(h) = f.header {
         v = v.with_header("x-a", h);
@@ -220,7 +222,7 @@ fuzz_target!(|data: &[u8]| {
     check(&base);
 
     let mut degraded = Vec::new();
-    for metric in ["m0", "m1"] {
+    for metric in ["m0", "m1", "m2"] {
         let mut v = full.clone();
         v.metrics.remove(metric);
         degraded.push((format!("metric {metric} unavailable"), v));

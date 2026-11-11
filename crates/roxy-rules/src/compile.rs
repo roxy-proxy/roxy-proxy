@@ -73,13 +73,22 @@ impl Needs {
         }
     }
 
-    /// Names of the in-flight values in `mask`, as written, for messages and
-    /// `roxy check`.
-    pub(crate) fn in_flight_names(&self, mask: Reads) -> Vec<String> {
+    /// The in-flight values in `mask` with their names as written, for
+    /// messages and `roxy check`. A `bytes` metric is one read under one
+    /// name, whichever direction `mask` asks about.
+    pub(crate) fn in_flight_reads(&self, mask: Reads) -> Vec<(InFlightValue, String)> {
         self.in_flight
             .iter()
             .filter(|(w, _)| mask.contains(*w))
-            .map(|(_, n)| n.clone())
+            .cloned()
+            .collect()
+    }
+
+    /// Names of the in-flight values in `mask`, as written.
+    pub(crate) fn in_flight_names(&self, mask: Reads) -> Vec<String> {
+        self.in_flight_reads(mask)
+            .into_iter()
+            .map(|(_, n)| n)
             .collect()
     }
 }

@@ -260,6 +260,20 @@ fn errors_stop_the_exchange() {
     );
 }
 
+/// A message about a `bytes` metric names it as written, not as the two
+/// directions it reads.
+#[test]
+fn a_bytes_metric_is_named_as_written() {
+    let err = try_compile(
+        "- { id: q, count: bytes }",
+        "- { id: a, when: 'response.status == 1 and metric.q > 1', then: { set_header: { x: y } } }",
+    )
+    .unwrap_err()
+    .join("\n");
+    assert!(err.contains("also reads metric.q (bytes), which"), "{err}");
+    assert!(!err.contains("request_bytes metric"), "{err}");
+}
+
 /// A budget on `bytes` counts both directions, so it is re-checked as either
 /// the request or the response streams.
 #[test]

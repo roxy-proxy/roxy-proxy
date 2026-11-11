@@ -171,7 +171,7 @@ pub enum RuleKind {
     /// is known.
     InFlight,
     /// A `deny` or `quarantine` rule that reads a byte metric
-    /// (`request_bytes` / `response_bytes`) and no in-flight field: takes
+    /// (`request_bytes`, `response_bytes` or `bytes`) and no in-flight field: takes
     /// part in the admission decision like an admission rule, and is
     /// re-checked as this exchange adds bytes to the metric.
     AdmissionAndInFlight,
@@ -212,8 +212,9 @@ pub(crate) struct RuleShape {
     pub fields: Reads,
     /// Changes that re-check the rule (fields plus byte metrics).
     pub triggers: Reads,
-    /// What puts it in flight, as written; empty for an admission rule.
-    pub in_flight_reads: Vec<String>,
+    /// What puts it in flight, each value with its name as written; empty
+    /// for an admission rule.
+    pub in_flight_reads: Vec<(InFlightValue, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -367,7 +368,7 @@ impl Policy {
             .map(|r| RuleInfo {
                 id: r.id.clone(),
                 kind: r.shape.kind,
-                in_flight_reads: r.shape.in_flight_reads.clone(),
+                in_flight_reads: r.shape.read_names(Reads::ALL),
                 triggers: r.shape.triggers,
             })
             .collect()
