@@ -34,8 +34,8 @@ no such ambiguities, so roxy uses an existing HTTP/2 implementation.
   Also called a flow; each has an id in the flow log.
 - **Canonical:** roxy's validated, normalised form of a request.
 - **Admission rule, in-flight rule:** a rule decided before the request is
-  forwarded, which can allow or deny, versus one checked as the exchange
-  streams, which can only deny or add effects.
+  forwarded, which can allow, deny or respond, versus one checked as the
+  exchange streams, which can only deny or add effects.
 - **Policy:** the compiled config, swapped in whole on reload.
 - **Layer:** one addon in the stack.
 - **Address floor:** the check on every upstream address before roxy

@@ -559,7 +559,10 @@ fn check(path: &Path) -> ExitCode {
                 policy,
                 addon_conditions,
             } = compiled;
-            for w in roxy_rules::Policy::metric_warnings(&config.metrics) {
+            for w in roxy_rules::Policy::rule_warnings(&config.rules)
+                .into_iter()
+                .chain(roxy_rules::Policy::metric_warnings(&config.metrics))
+            {
                 eprintln!("{}:{}: warning: {}", path.display(), w.path, w.message);
             }
             let (warnings, errs) = startup_checks(&config, addon_conditions);

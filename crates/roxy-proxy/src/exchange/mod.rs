@@ -538,6 +538,7 @@ pub(crate) async fn core<F: ClientTransport>(
             cx.record.decision = Some(DecisionKind::Allow);
             forward(transport, cx, req).await
         }
+        Verdict::Answer(res) => answered(cx, res),
         Verdict::Deny(refusal) => Outcome::Refuse(refusal),
         Verdict::Close(e) => Outcome::Close(e),
     };
@@ -547,6 +548,29 @@ pub(crate) async fn core<F: ClientTransport>(
         drop(cx.request_delivery.take());
     }
     outcome
+}
+
+/// A `respond` rule's answer. Nothing was forwarded, so there is no
+/// in-flight checker and no upgrade: an `Upgrade` request gets the answer
+/// as an ordinary response. A `capture` of the response records the answer
+/// whole, as it is known before it is sent.
+fn answered(cx: &mut FlowCx, res: CanonicalResponse) -> Outcome {
+    cx.record.decision = Some(DecisionKind::Answered);
+    if let Some(mut tap) = taps(cx).response {
+        tap.response_head(&res);
+        let head = cx
+            .facts
+            .request
+            .as_ref()
+            .is_some_and(|r| r.method == roxy_http::Method::Head);
+        if let Some(body) = res.body.as_bytes()
+            && !head
+        {
+            tap.data(body);
+        }
+        tap.end(false);
+    }
+    Outcome::Respond(res)
 }
 
 /// Runs one exchange on the h1 codec.

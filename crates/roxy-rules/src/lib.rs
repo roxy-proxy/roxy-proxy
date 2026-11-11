@@ -30,6 +30,7 @@
 //! let none = HashSet::new();
 //! let policy = Policy::compile(&PolicyInput {
 //!     rules: &rules, metrics: &[], secret_names: &none, address_lists: &none,
+//!     max_respond_body_bytes: roxy_rules::DEFAULT_MAX_RESPOND_BODY_BYTES,
 //! }).unwrap();
 //! let flow = MapView::new()
 //!     .with_str(Field::Host, "api.github.com")
@@ -66,12 +67,17 @@
 //!   every admission rule top to bottom (in-flight rules are skipped, not
 //!   false). A matching
 //!   deny anywhere wins (`terminal_rule` = the first matching deny); else a
-//!   matching allow (the first one; only its `upgrade`/`private_ok` options
-//!   apply); else it is denied, `terminal_rule = "_default"`. Tags
+//!   matching allow beside a matching `respond`, or two matching
+//!   `respond`s, fail closed ([`FailClosedReason::TerminalConflict`]);
+//!   else a matching allow (the first one; only its `upgrade`/`private_ok`
+//!   options apply); else the one matching `respond` answers; else it is
+//!   denied,
+//!   `terminal_rule = "_default"`. Tags
 //!   set by a matching rule are visible to the rules below it. If allowed,
 //!   every matching rule's effects apply in list order (a later
 //!   `set_header` of the same name wins); if denied, only `log`, `tag` and
-//!   `set_state` remain.
+//!   `set_state` remain; if answered, `capture` and `digest` of the
+//!   response remain too.
 //! * **In flight** ([`Policy::evaluate_in_flight`]): after forwarding, the
 //!   proxy reports each change (`changed`, a [`Reads`] mask) and what is
 //!   known so far. Rules whose triggers intersect the change and whose
@@ -84,7 +90,7 @@
 //!   `set_header`/`remove_header` change the request. An in-flight rule
 //!   cannot `allow`, `rewrite_path`, `set_query`, `remove_query`,
 //!   `redirect` or use `${secret:..}` (the request is already on its way):
-//!   compile errors. **In an in-flight rule, `set_header` and
+//!   compile errors, and neither can it `respond`. **In an in-flight rule, `set_header` and
 //!   `remove_header` change the response**: they are legal only when the
 //!   rule reads response values and everything that can re-check it is
 //!   known before the response head is sent (`response.status`,
@@ -95,7 +101,8 @@
 //!   compile errors. There is no explicit target key: the rule's reads
 //!   decide it.
 //! * **Denies close.** A deny closes the client connection after the
-//!   response unless the rule says `deny: { close: false }`.
+//!   response unless the rule says `deny: { close: false }`. A `respond`
+//!   answer leaves it open unless the rule says `respond: { close: true }`.
 //! * **Unavailable inputs fail closed.** If evaluation reaches a metric the
 //!   view reports unavailable ([`FlowView::metric`] → `None`), an address
 //!   list it cannot answer for, a body predicate whose body is too large to
@@ -174,14 +181,15 @@ pub mod yaml;
 pub use compile::{MAX_GLOB_BYTES, REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT};
 pub use config::{
     Action, AllowArgs, AwsSigV4Args, CaptureTarget, DenyArgs, Expr, LogArgs, LogLevel,
-    MetricConfig, MetricCount, RedirectArgs, RewritePathArgs, RuleConfig, Scheme, SetStateArgs,
-    SignArgs, Then, Upgrade,
+    MetricConfig, MetricCount, RedirectArgs, RespondArgs, RewritePathArgs, RuleConfig, Scheme,
+    SetStateArgs, SignArgs, Then, Upgrade,
 };
 pub use diag::{Diagnostic, RuleId, Span};
 pub use eval::{
-    AllowOpts, AwsSigV4, Credential, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS, Decision, Deny,
-    DenyStatus, Effect, EvalContext, FAIL_CLOSED_STATUS, FailClosedReason, InFlightEffect,
-    InFlightOutcome, Outcome, SetHeaderValue,
+    AllowOpts, AwsSigV4, Credential, DEFAULT_DENY_MESSAGE, DEFAULT_DENY_STATUS,
+    DEFAULT_MAX_RESPOND_BODY_BYTES, DEFAULT_RESPOND_CONTENT_TYPE, DEFAULT_RESPOND_STATUS, Decision,
+    Deny, DenyStatus, Effect, EvalContext, FAIL_CLOSED_STATUS, FailClosedReason, InFlightEffect,
+    InFlightOutcome, Outcome, Respond, RespondStatus, SetHeaderValue, TerminalConflict,
 };
 pub use metrics::{
     CarryOverReport, Clock, DEFAULT_MAX_METRIC_BYTES, DEFAULT_MAX_METRIC_KEYS, MetricError,

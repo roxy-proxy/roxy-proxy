@@ -708,8 +708,21 @@ pub fn report(
             }
         }
     }
-    let _ = writeln!(s, "decision: {}", run.decision());
+    let decision = run.decision();
+    let _ = writeln!(s, "decision: {decision}");
     let _ = writeln!(s, "rule:     {}", run.terminal_rule());
+    if let Decision::Respond(r) = &decision {
+        let _ = writeln!(s, "answer:");
+        let _ = writeln!(s, "  status: {}", r.status);
+        let mut fields = r.header_fields();
+        if let Some((name, value)) = fields.next() {
+            let _ = writeln!(s, "  {name}: {value}");
+        }
+        let _ = writeln!(s, "  content-length: {}", r.body.len());
+        for (name, value) in fields {
+            let _ = writeln!(s, "  {name}: {value}");
+        }
+    }
     if let Some(rule) = run.quarantine() {
         let _ = writeln!(s, "quarantine: yes (rule {rule})");
     }
@@ -724,7 +737,7 @@ pub fn report(
     s
 }
 
-/// Process exit code for a decision: 0 allow, 3 deny.
+/// Process exit code for a decision: 0 allow or respond, 3 deny.
 pub fn exit_code(d: &Decision) -> u8 {
     if d.is_deny() { 3 } else { 0 }
 }

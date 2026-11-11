@@ -494,6 +494,132 @@ fn check_catches_expression_type_errors() {
     assert!(err.contains("1 problem(s) found"), "{err}");
 }
 
+const RESPOND_CONFIG: &str = r#"version: 1
+listeners: [{ name: p, bind: 127.0.0.1:3128 }]
+rules:
+  - id: token-stub
+    when: host == "auth.test" and path == "/oauth/token"
+    then:
+      - set_header: { x-a: "1" }
+      - digest: request
+      - tag: stubbed
+      - respond:
+          status: 201
+          body: '{"access_token":"placeholder"}'
+          content_type: application/json
+          headers: { x-stub: "yes" }
+  - id: open
+    when: header["x-allow"] == "1"
+    then: allow
+"#;
+
+#[test]
+fn check_warns_on_request_actions_beside_respond() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("roxy.yaml");
+    std::fs::write(&cfg, RESPOND_CONFIG).unwrap();
+    let out = roxy(&["check", "--config", cfg.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains(": OK"));
+    let err = text(&out.stderr);
+    assert!(
+        err.contains(&format!(
+            "{}:rules[0].then[0]: warning: `set_header` changes the request and has no effect: \
+             this rule answers with `respond`, so the request is never forwarded",
+            cfg.display()
+        )),
+        "{err}"
+    );
+    assert!(
+        err.contains(&format!(
+            "{}:rules[0].then[1]: warning: `digest: request` has no effect",
+            cfg.display()
+        )),
+        "{err}"
+    );
+    assert_eq!(err.matches("warning:").count(), 2, "{err}");
+}
+
+#[test]
+fn check_enforces_the_respond_body_limit() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("roxy.yaml");
+    let rules = "rules:\n  - { id: big, then: { respond: { body: \"0123456789a\" } } }\n";
+    std::fs::write(
+        &cfg,
+        format!(
+            "version: 1\nlisteners: [{{ name: p, bind: 127.0.0.1:3128 }}]\n\
+             limits: {{ max_respond_body_bytes: 10 }}\n{rules}"
+        ),
+    )
+    .unwrap();
+    let out = roxy(&["check", "--config", cfg.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(1), "{}", text(&out.stdout));
+    let err = text(&out.stderr);
+    assert!(
+        err.contains(
+            "rules[0].then[0]: respond body is 11 bytes, over `limits.max_respond_body_bytes` (10)"
+        ),
+        "{err}"
+    );
+    std::fs::write(
+        &cfg,
+        format!(
+            "version: 1\nlisteners: [{{ name: p, bind: 127.0.0.1:3128 }}]\n\
+             limits: {{ max_respond_body_bytes: 11 }}\n{rules}"
+        ),
+    )
+    .unwrap();
+    let out = roxy(&["check", "--config", cfg.to_str().unwrap()]);
+    assert!(out.status.success(), "{}", text(&out.stderr));
+}
+
+#[test]
+fn rule_test_prints_the_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg = dir.path().join("roxy.yaml");
+    std::fs::write(&cfg, RESPOND_CONFIG).unwrap();
+    let test = |args: &[&str]| {
+        let mut all = vec!["rule", "test", "--config", cfg.to_str().unwrap()];
+        all.extend_from_slice(args);
+        roxy(&all)
+    };
+    let out = test(&["POST", "https://auth.test/oauth/token"]);
+    assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(
+        stdout.contains(
+            "decision: respond 201\n\
+             rule:     token-stub\n\
+             answer:\n  \
+             status: 201\n  \
+             content-type: application/json\n  \
+             content-length: 30\n  \
+             cache-control: no-store\n  \
+             x-stub: yes\n"
+        ),
+        "{stdout}"
+    );
+    // The request change and the request digest are inert, so neither is
+    // among the effects.
+    assert!(stdout.contains("effects:  (none)"), "{stdout}");
+    assert!(stdout.contains("tags:     stubbed"), "{stdout}");
+
+    // Beside a matching allow it fails closed.
+    let out = test(&["-H", "x-allow: 1", "POST", "https://auth.test/oauth/token"]);
+    assert_eq!(out.status.code(), Some(3), "{}", text(&out.stderr));
+    let stdout = text(&out.stdout);
+    assert!(stdout.contains("rule:     _fail_closed"), "{stdout}");
+    assert!(
+        stdout.contains(
+            "reason:   rule \"open\" allows and rule \"token-stub\" responds; only one can \
+             decide (fail closed)"
+        ),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("answer:"), "{stdout}");
+}
+
 fn rule_test(args: &[&str]) -> Output {
     let cfg = fixture("full.yaml");
     let mut all = vec!["rule", "test", "--config", cfg.to_str().unwrap()];

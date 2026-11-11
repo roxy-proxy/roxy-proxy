@@ -48,6 +48,7 @@ fn compile(metrics_yaml: &str) -> Policy {
         metrics: &metrics,
         secret_names: &none,
         address_lists: &none,
+        max_respond_body_bytes: crate::DEFAULT_MAX_RESPOND_BODY_BYTES,
     })
     .unwrap()
 }

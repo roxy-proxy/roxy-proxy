@@ -53,6 +53,7 @@ fn policy() -> Policy {
         metrics: &metrics,
         secret_names: &none,
         address_lists: &none,
+        max_respond_body_bytes: roxy_rules::DEFAULT_MAX_RESPOND_BODY_BYTES,
     })
     .unwrap()
 }

@@ -2,8 +2,8 @@
 //! type-checker and compiler (`roxy_rules::parse`, `Policy::compile`).
 //!
 //! Invariants:
-//! - nothing panics, for any expression text, as an `allow` or a `deny`
-//!   rule, and as a metric's `where` filter;
+//! - nothing panics, for any expression text, as an `allow`, `deny` or
+//!   `respond` rule, and as a metric's `where` filter;
 //! - a policy that compiles can be evaluated (at admission and in flight) on an
 //!   empty and on a populated flow without panicking, and a fail-closed
 //!   admission outcome is never an allow.
@@ -30,6 +30,7 @@ fuzz_target!(|data: &[u8]| {
             metrics: &metrics,
             secret_names: &none,
             address_lists: &none,
+            max_respond_body_bytes: roxy_rules::DEFAULT_MAX_RESPOND_BODY_BYTES,
         });
     }
 
@@ -49,6 +50,7 @@ fuzz_target!(|data: &[u8]| {
         json!("deny"),
         json!("quarantine"),
         json!([{ "tag": "t0" }, "allow"]),
+        json!({ "respond": { "body": "stub" } }),
     ] {
         let Some(policy) =
             roxy_fuzz::rules::compile(json!([{ "id": "r", "when": src, "then": then }]))

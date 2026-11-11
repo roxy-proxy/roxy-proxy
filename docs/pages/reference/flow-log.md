@@ -30,9 +30,9 @@ The flow log is one JSON object per line, written to stdout or to
 | `body_sha256` | a SHA-256 of the body, only when a rule's `digest` action asked for it ([actions](/reference/rule-language#actions)) |
 | `timing.upstream_connect_ms` | time to open the upstream connection; `null` if an existing one was reused |
 | `timing.upstream_ttfb_ms` | time from forwarding the request to the response head |
-| `decision` | `allow`, `deny`, or `answered` when an addon answered the request itself |
+| `decision` | `allow`, `deny`, or `answered` when a `respond` rule or an addon answered the request itself |
 | `rules` | the rules that matched |
-| `terminal_rule` | what decided: a rule id, or one of `_default`, `_fail_closed`, `_address_policy`, `_expired`, `_quarantined`, `_sign`, `_websocket` or `layer:<name>` |
+| `terminal_rule` | what decided: a rule id (for an answer, the `respond` rule), or one of `_default`, `_fail_closed`, `_address_policy`, `_expired`, `_quarantined`, `_sign`, `_websocket` or `layer:<name>` |
 | `stage` | `head`, or where a rule stopped the exchange: `request_body`, `response_head`, `response_body` or `websocket` |
 | `addons` | the addons that ran, in order |
 | `reason` | why the exchange was refused or failed, when it was |
@@ -41,7 +41,7 @@ Common reasons, by `terminal_rule`:
 
 | `terminal_rule` | `reason` |
 |---|---|
-| `_fail_closed` | `metric_unavailable`, `metric_table_full`, `address_list_unavailable`, `secret_missing`, `secret_invalid`, `body_too_large_to_inspect`, `body_decode_failed`, `unsupported_content_encoding`, `buffer_budget_exhausted`, `missing_value`, `state_unavailable`, `sign_conflict`, `effect_invalid` |
+| `_fail_closed` | `metric_unavailable`, `metric_table_full`, `address_list_unavailable`, `secret_missing`, `secret_invalid`, `body_too_large_to_inspect`, `body_decode_failed`, `unsupported_content_encoding`, `buffer_budget_exhausted`, `missing_value`, `state_unavailable`, `sign_conflict`, `terminal_conflict` ([deny wins](/design/policy-evaluation#deny-wins)), `effect_invalid` |
 | `_address_policy` | `address_policy` |
 | `_expired` | `policy_expired` ([lease](/guides/operations#lease)) |
 | `_quarantined` | `quarantined` ([quarantine](/guides/operations#quarantine)) |

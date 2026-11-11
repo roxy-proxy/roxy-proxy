@@ -456,8 +456,8 @@ impl Stage {
 pub enum DecisionKind {
     Allow,
     Deny,
-    /// An addon layer answered: its request never reached the upstream,
-    /// or it abandoned the forwarded request.
+    /// A `respond` rule or an addon layer answered: the request never
+    /// reached the upstream, or the layer abandoned the forwarded request.
     Answered,
 }
 

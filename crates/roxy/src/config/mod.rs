@@ -286,6 +286,9 @@ pub struct Limits {
     pub max_ws_message_bytes: ByteSize,
     #[serde(deserialize_with = "units::size")]
     pub max_capture_body_bytes: ByteSize,
+    /// Largest `respond` body; a larger one fails the config.
+    #[serde(deserialize_with = "units::size")]
+    pub max_respond_body_bytes: ByteSize,
     /// Bytes buffered per direction for an observe-mode addon's copy of a
     /// body; an observer further behind the real exchange than this has its
     /// copy cut.
@@ -355,6 +358,7 @@ impl Default for Limits {
             max_sign_body_bytes: ByteSize::b(100 * MIB),
             max_ws_message_bytes: ByteSize::b(16 * MIB),
             max_capture_body_bytes: ByteSize::b(16 * MIB),
+            max_respond_body_bytes: ByteSize::b(roxy_rules::DEFAULT_MAX_RESPOND_BODY_BYTES),
             max_observer_lag_bytes: ByteSize::b(16 * MIB),
             max_buffered_bytes: ByteSize::b(GIB),
             header_timeout: Duration::from_secs(10),

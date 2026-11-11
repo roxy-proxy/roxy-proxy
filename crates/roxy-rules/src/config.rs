@@ -112,6 +112,9 @@ pub enum Action {
     /// Terminal. Bare `quarantine`: a 403 deny that closes the connection
     /// and puts the whole proxy into quarantine.
     Quarantine,
+    /// Terminal. `respond: { status, body, content_type, headers, close }`:
+    /// answer the request with a fixed response and dial nothing.
+    Respond(RespondArgs),
     /// `set_header: { name: value, ... }`, in YAML order.
     SetHeader(Vec<(String, String)>),
     /// `remove_header: [names]`
@@ -144,6 +147,7 @@ impl Action {
         "allow",
         "deny",
         "quarantine",
+        "respond",
         "set_header",
         "remove_header",
         "rewrite_path",
@@ -178,6 +182,7 @@ impl Action {
             Self::Allow(_) => "allow",
             Self::Deny(_) => "deny",
             Self::Quarantine => "quarantine",
+            Self::Respond(_) => "respond",
             Self::SetHeader(_) => "set_header",
             Self::RemoveHeader(_) => "remove_header",
             Self::RewritePath(_) => "rewrite_path",
@@ -195,7 +200,10 @@ impl Action {
 
     /// Whether this action is terminal (decides the rule's outcome).
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Allow(_) | Self::Deny(_) | Self::Quarantine)
+        matches!(
+            self,
+            Self::Allow(_) | Self::Deny(_) | Self::Quarantine | Self::Respond(_)
+        )
     }
 
     /// Whether this action refuses the request (`deny` or `quarantine`).
@@ -236,6 +244,27 @@ pub struct DenyArgs {
     /// Close the connection after the deny response (default `true`). A
     /// deny that stops an exchange whose response has started always closes
     /// the connection (h1) or resets the stream (h2).
+    #[serde(default)]
+    pub close: Option<bool>,
+}
+
+/// Arguments of `respond`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RespondArgs {
+    /// Response status; default 200. Must be 200 to 599.
+    #[serde(default)]
+    pub status: Option<u16>,
+    /// Response body; default empty.
+    #[serde(default)]
+    pub body: Option<String>,
+    /// `content-type`; default `text/plain; charset=utf-8`.
+    #[serde(default)]
+    pub content_type: Option<String>,
+    /// Extra end-to-end response headers, in YAML order.
+    #[serde(default, deserialize_with = "string_pairs")]
+    pub headers: Vec<(String, String)>,
+    /// Close the connection after the answer (default `false`).
     #[serde(default)]
     pub close: Option<bool>,
 }
@@ -420,6 +449,7 @@ impl Action {
         let action = match name.as_str() {
             "allow" => Self::Allow(arg!(Option<AllowArgs>).unwrap_or_default()),
             "deny" => Self::Deny(arg!(Option<DenyArgs>).unwrap_or_default()),
+            "respond" => Self::Respond(arg!(Option<RespondArgs>).unwrap_or_default()),
             "quarantine" => {
                 let _ = arg!(de::IgnoredAny);
                 return Err(de::Error::custom(
@@ -533,6 +563,10 @@ impl<'de> Deserialize<'de> for StringPairs {
         }
         d.deserialize_map(V)
     }
+}
+
+fn string_pairs<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<(String, String)>, D::Error> {
+    StringPairs::deserialize(d).map(|p| p.0)
 }
 
 /// A list of strings; a single string is accepted as a one-element list.
@@ -689,6 +723,37 @@ mod tests {
             then("[tag: x, allow]").unwrap(),
             [Action::Tag("x".into()), Action::Allow(AllowArgs::default())]
         );
+    }
+
+    #[test]
+    fn respond_parses_with_defaults_and_in_order_headers() {
+        assert_eq!(
+            then("{ respond: {} }").unwrap(),
+            [Action::Respond(RespondArgs::default())]
+        );
+        assert_eq!(
+            then("{ respond: null }").unwrap(),
+            [Action::Respond(RespondArgs::default())]
+        );
+        let got = then(
+            r#"{ respond: { status: 201, body: "{}", content_type: application/json, headers: { x-b: "2", x-a: "1" }, close: true } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            [Action::Respond(RespondArgs {
+                status: Some(201),
+                body: Some("{}".into()),
+                content_type: Some("application/json".into()),
+                headers: vec![("x-b".into(), "2".into()), ("x-a".into(), "1".into())],
+                close: Some(true),
+            })]
+        );
+        assert!(got[0].is_terminal() && !got[0].is_deny());
+        let e = then("{ respond: { headers: { x-a: \"1\", x-a: \"2\" } } }").unwrap_err();
+        assert!(e.contains("duplicate"), "{e}");
+        let e = then("{ respond: { headers: {} } }").unwrap_err();
+        assert!(e.contains("must name at least one entry"), "{e}");
     }
 
     #[test]
