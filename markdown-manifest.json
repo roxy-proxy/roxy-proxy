@@ -1,7 +1,7 @@
 {
   "version": 1,
   "files": {
-    "/changelog.md": "a485c5e65bcc5266599da2cd54e534a69325b2d13612ca2c3db5e09068e62a99",
+    "/changelog.md": "219fefde453d1721faa3643ec77f99b37465860b43b525eb21ef06dc1b6ffa46",
     "/design/addon-model.md": "0010aa1fcdc0e33ecf87f28627b38c9df0f38145e00e5a675e8e23ac11ccf868",
     "/design/how-it-works.md": "04a8fcc1d39b2eb37166ab121898a61dd55eef9e3ac1431e0dcd654d255f21d7",
     "/design/performance.md": "484bbcbaddac71c179a6f1259e7252733250dee8a7d72f483c4eabaf70a92bb3",
@@ -16,7 +16,7 @@
     "/guides/testing-a-policy.md": "5b1804bb4bfd3112ea1511814ae011eaa90664ff3b6079b11f45bac7736fe557",
     "/guides/writing-addons.md": "bcd9fb5c54a0f4ee9bdc916e1028b56a8eee2bcf4c585fa3c8adbee90008070a",
     "/index.md": "bc5e8c006448dc620547c335ad122fd48f936e9432761ef3f9a9956fa436cb9a",
-    "/llms-full.txt": "eafb273acfa08e7a7fe1031a68c7abb8c7ce30c3635a2eabdeea1bf313d256b4",
+    "/llms-full.txt": "59c10ce2b7b39434dd4a62c2afed604f66cef671b1bb181a939f1ceb9f18e95f",
     "/llms.txt": "23845c06e6a6a4640825673fe71e6893efc5b6e5a7ebfd34556eae7213da587a",
     "/quickstart.md": "0024b6a7dd5444c2e881cecdd37e15779ee8cb350d0f68f39481745feed7622d",
     "/reference/addon-configuration.md": "6fd434cc29f5aac744d9fb1498118b640fea726d3e965a1a524eed0f30e73be0",
@@ -29,7 +29,7 @@
     "/reference/http.md": "6d620233d313ddcad1af2e3708e2ca1ae9ae45f0098b56f041b628d440d2a2d0",
     "/reference/limits.md": "1b9256edacbcf91236f86421fc88a24606b7b70b592dbf7aa8f52d0ef21c978e",
     "/reference/node-protocol.md": "f43a2f55e986d40d1bd77bd244cab2682cd0b11698210fe855b496d132f91637",
-    "/reference/rate-limits.md": "cd81d825130759c17665ec4aab830258ef1fe6c92d6f2eda735b79ea158a174e",
+    "/reference/rate-limits.md": "97e3e32bb881db94860e8f67e6b66d0031d8e9f79edad2cc9e41451a9d5bf9ad",
     "/reference/rule-language.md": "384fb7875dfe4a3ad9bc3a2de150ca512a47803ab5d40bef6ec8defce8b8a39e",
     "/reference/secrets.md": "cb73828a7f402cff1c00dc11bda68fd7927fe53b3f0bac9b6ce838e234635f92",
     "/reference/service-layers.md": "a3222de0caefce3e75822a2c4bf7eecda24cd9a0c0c27f164f473056a1c7de0f",

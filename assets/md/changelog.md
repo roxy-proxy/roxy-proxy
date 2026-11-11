@@ -6,7 +6,7 @@ come first. Each release's GitHub page lists every merged pull request.
 
 ## Unreleased
 
-A rule can answer a request itself with a fixed response, the request trailers a service layer passes on are validated as a client's before they reach an origin, captures are written as JSON lines for line-oriented shippers, and upstream TLS no longer trusts the compromised eMudhra emSign hierarchy.
+A rule can answer a request itself with a fixed response, a metric can count request and response bytes together, the request trailers a service layer passes on are validated as a client's before they reach an origin, captures are written as JSON lines for line-oriented shippers, and upstream TLS no longer trusts the compromised eMudhra emSign hierarchy.
 
 <details>
   <summary>Details</summary>
@@ -21,6 +21,7 @@ A rule can answer a request itself with a fixed response, the request trailers a
   ### Added
 
   * A `respond` action answers a request with a fixed response and dials nothing upstream: `respond: { status, body, content_type, headers, close }` in admission rules, with a body of at most `limits.max_respond_body_bytes` (64 KiB). The flow log records `decision: answered` with the rule as `terminal_rule`. A deny or quarantine still wins over it, and a matching `respond` beside a matching `allow` or another matching `respond` fails closed with reason `terminal_conflict`. `roxy check` warns about actions in a `respond` rule that would change the request, and `roxy rule test` prints the answer's status and headers ([#523](https://github.com/roxy-proxy/roxy-proxy/issues/523)).
+  * A metric can count `bytes`: request and response bytes together, so one budget covers an exchange's whole transfer. A `deny` or `quarantine` reading it is re-checked as either direction streams ([#630](https://github.com/roxy-proxy/roxy-proxy/issues/630)).
 
   ### Changed
 
