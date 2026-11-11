@@ -103,8 +103,8 @@ first: `body.size != null and body.size > 10mb`, or
 
 ## Actions
 
-`then` is one action, or a list ending with at most one of `allow`, `deny`
-or `quarantine`.
+`then` is one action, or a list ending with at most one of `allow`, `deny`,
+`quarantine` or `respond`.
 
 ```yaml
 then: allow
@@ -123,6 +123,34 @@ These decide the exchange:
 | `allow` | admission rules | Forward the request. `upgrade: websocket` allows a WebSocket upgrade. `private_ok: true` allows private addresses ([address floor](/reference/address-lists#address-floor)). |
 | `deny` | all rules | Refuse, with `status` (default 403), `message` and `close` ([deny responses](/reference/http#deny-responses)). In flight, it stops the exchange. On a WebSocket, it closes both sides. |
 | `quarantine` | all rules | Deny, and [quarantine](/guides/operations#quarantine) roxy so it refuses every later request. Needs `--state-dir`. |
+| `respond: { status, body, content_type, headers, close }` | admission rules | Answer the request with a fixed response, and dial nothing upstream ([answers](/reference/http#answers)). |
+
+`respond` takes:
+
+| key | default | meaning |
+|---|---|---|
+| `status` | `200` | 200 to 599 |
+| `body` | empty | a string of at most `limits.max_respond_body_bytes` (64 KiB). It must be empty for 204 and 304 |
+| `content_type` | `text/plain; charset=utf-8` | the `content-type` |
+| `headers` | none | more response headers, as `{ name: value }`. `content-length`, `content-type`, `cache-control`, `host`, `expect` and the hop-by-hop fields are refused |
+| `close` | `false` | close the connection after the answer |
+
+`${secret:name}` is refused anywhere in `respond`. Its rule's actions that
+change or record the request (`set_header`, `remove_header`,
+`rewrite_path`, `set_query`, `remove_query`, `redirect`, `sign`, and the
+request half of `capture` and `digest`) compile but do nothing, since the
+request is never forwarded; `roxy check` warns about them. `tag`, `log`,
+`set_state`, and `capture` or `digest` of the response still apply. The
+same is true of the effects of other matching rules.
+
+```yaml
+- id: token-stub
+  when: host == "auth.example.com" and path == "/oauth/token"
+  then:
+    respond:
+      body: '{"access_token":"placeholder","token_type":"Bearer","expires_in":3600}'
+      content_type: application/json
+```
 
 These add effects:
 

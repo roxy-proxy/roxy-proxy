@@ -224,7 +224,7 @@ come first. Each release's GitHub page lists every merged pull request.
 
 ## Unreleased
 
-The request trailers a service layer passes on are validated as a client's before they reach an origin, captures are written as JSON lines for line-oriented shippers, and upstream TLS no longer trusts the compromised eMudhra emSign hierarchy.
+A rule can answer a request itself with a fixed response, the request trailers a service layer passes on are validated as a client's before they reach an origin, captures are written as JSON lines for line-oriented shippers, and upstream TLS no longer trusts the compromised eMudhra emSign hierarchy.
 
 <details>
   <summary>Details</summary>
@@ -235,6 +235,10 @@ The request trailers a service layer passes on are validated as a client's befor
   * The flow log's `forward_aborted`, `answer_aborted` and `upstream_aborted` reasons are one, `layer_aborted`. A cut that follows a fault or the client's loss is no longer a layer's abort, so a body cut on its way through a layer is the client's or the upstream's. A layer's answer is its own when it gives it before taking the response from upstream, whether or not that response had arrived ([#593](https://github.com/roxy-proxy/roxy-proxy/issues/593)).
   * A raw backtick in an HTTP/1 request path is rejected with `invalid_path` instead of being percent-encoded; HTTP/2 already refused it. In a query it is still percent-encoded to `%60` ([#582](https://github.com/roxy-proxy/roxy-proxy/pull/582)).
   * Capture is written to `capture.jsonl` with one JSON object per line, in place of `capture.rxc` and its length-framed records: the head nested under `head`, body bytes base64 under `data`, and at most 48 KiB of body per line. A line-oriented shipper such as Vector or Fluent Bit can take the file as it is ([#527](https://github.com/roxy-proxy/roxy-proxy/issues/527)).
+
+  ### Added
+
+  * A `respond` action answers a request with a fixed response and dials nothing upstream: `respond: { status, body, content_type, headers, close }` in admission rules, with a body of at most `limits.max_respond_body_bytes` (64 KiB). The flow log records `decision: answered` with the rule as `terminal_rule`. A deny or quarantine still wins over it, and a matching `respond` beside a matching `allow` or another matching `respond` fails closed with reason `terminal_conflict`. `roxy check` warns about actions in a `respond` rule that would change the request, and `roxy rule test` prints the answer's status and headers ([#523](https://github.com/roxy-proxy/roxy-proxy/issues/523)).
 
   ### Changed
 
@@ -967,7 +971,8 @@ roxy rule test --config roxy.yaml --metric github_writes=30 POST https://api.git
 ```
 
 `roxy rule test` prints the matching rules, their effects and the
-decision. It exits 0 on allow and 3 on deny. The request arrives on the
+decision. When a `respond` rule answers, it also prints the answer's
+status and headers. It exits 0 on allow or an answer, and 3 on deny. The request arrives on the
 config's first listener.
 
 The rules see the request as `roxy run` would: the URL is normalised
@@ -1001,7 +1006,7 @@ it the same `when` but only a `tag`:
     then: { tag: trial-no-gists }
 ```
 
-A rule with no `allow`, `deny` or `quarantine` does not change the
+A rule with no `allow`, `deny`, `quarantine` or `respond` does not change the
 decision: other rules still decide the request. The tag is there so you
 can find the requests it matched. Each one's `request` event in the
 [flow log](/reference/flow-log) carries it:
@@ -1447,6 +1452,19 @@ no difference to the decision.
 With the rules above, `GET https://github.com/admin` matches both
 `github-reads` and `no-admin-paths`, and is denied.
 
+A rule can also answer the request itself with `respond`, and roxy then
+dials nothing ([actions](/reference/rule-language#actions)). A matching
+deny or quarantine still wins over it.
+
+A `respond` decides the request alone, so it cannot share it. A matching
+`respond` beside a matching `allow`, or two matching `respond` rules, are
+a conflict: the request is refused with `503`, `terminal_rule` is
+`_fail_closed` and the flow log `reason` is `terminal_conflict`. No order
+of the two rules makes both right, and picking one would make the
+decision depend on where the rules sit. Write the rules so they do not
+match the same request, for example with `not (path == "/oauth/token")`
+in the `allow`.
+
 ## When rules run
 
 roxy decides whether to forward a request as soon as it has the request
@@ -1459,14 +1477,14 @@ these rules again each time the value changes. In the example,
 `upload-cap` is checked as the body streams, and stops the upload once it
 passes 10 MiB.
 
-<img src={requestTiming} alt="The request phase of one exchange through roxy, left to right. The client's request head (a solid line) travels first and its body bytes (a dashed line) stream behind it, through layer A (enforce), past layer B (observe, which gets a copy beside the path), through layer C (enforce) and the rules, then on to the upstream. Each layer's when is evaluated on the head as it reaches the layer. At the rules the admission decision is made once, on the head, after the stack and before anything is forwarded (when a rule reads body.text, the body is buffered first): allow, deny or change the request. As body bytes stream past the rules they are re-checked in flight (body.bytes, byte metrics), which can deny or quarantine but never allow or change the request." />
+<img src={requestTiming} alt="The request phase of one exchange through roxy, left to right. The client's request head (a solid line) travels first and its body bytes (a dashed line) stream behind it, through layer A (enforce), past layer B (observe, which gets a copy beside the path), through layer C (enforce) and the rules, then on to the upstream. Each layer's when is evaluated on the head as it reaches the layer. At the rules the admission decision is made once, on the head, after the stack and before anything is forwarded (when a rule reads body.text, the body is buffered first): allow, deny, respond or change the request. As body bytes stream past the rules they are re-checked in flight (body.bytes, byte metrics), which can deny or quarantine but never allow or change the request." />
 
 The reference calls the first kind *admission* rules and the second
 *in-flight* rules. `roxy check` and `roxy rule test` say which each rule
 is.
 
 A rule checked later can only deny, because by then the request has
-already gone. It can also log, tag, write state, or change response
+already gone. It cannot `allow` or `respond`. It can also log, tag, write state, or change response
 headers that have not been sent yet. When it denies, roxy stops the
 exchange: the client gets an error if its response has not started, and
 otherwise the connection is closed.
@@ -1479,8 +1497,11 @@ the body back until it has read it, and then decides
 
 Order matters for what rules change, not for the decision. When a
 request is allowed, every matching rule's changes apply from top to
-bottom, so if two rules set the same header, the lower one wins. The flow
-log names the rule that decided as `terminal_rule`.
+bottom, so if two rules set the same header, the lower one wins. When a
+`respond` rule answers, nothing is forwarded, so changes to the request do
+nothing; `log`, `set_state`, `tag`, and `capture` or `digest` of the
+response still apply. The flow log names the rule that decided as
+`terminal_rule`.
 
 A tag set by a rule can only be read by rules below it. roxy rejects a
 config where a rule reads a tag that a rule further down sets.
@@ -1806,8 +1827,8 @@ first: `body.size != null and body.size > 10mb`, or
 
 ## Actions
 
-`then` is one action, or a list ending with at most one of `allow`, `deny`
-or `quarantine`.
+`then` is one action, or a list ending with at most one of `allow`, `deny`,
+`quarantine` or `respond`.
 
 ```yaml
 then: allow
@@ -1826,6 +1847,34 @@ These decide the exchange:
 | `allow` | admission rules | Forward the request. `upgrade: websocket` allows a WebSocket upgrade. `private_ok: true` allows private addresses ([address floor](/reference/address-lists#address-floor)). |
 | `deny` | all rules | Refuse, with `status` (default 403), `message` and `close` ([deny responses](/reference/http#deny-responses)). In flight, it stops the exchange. On a WebSocket, it closes both sides. |
 | `quarantine` | all rules | Deny, and [quarantine](/guides/operations#quarantine) roxy so it refuses every later request. Needs `--state-dir`. |
+| `respond: { status, body, content_type, headers, close }` | admission rules | Answer the request with a fixed response, and dial nothing upstream ([answers](/reference/http#answers)). |
+
+`respond` takes:
+
+| key | default | meaning |
+|---|---|---|
+| `status` | `200` | 200 to 599 |
+| `body` | empty | a string of at most `limits.max_respond_body_bytes` (64 KiB). It must be empty for 204 and 304 |
+| `content_type` | `text/plain; charset=utf-8` | the `content-type` |
+| `headers` | none | more response headers, as `{ name: value }`. `content-length`, `content-type`, `cache-control`, `host`, `expect` and the hop-by-hop fields are refused |
+| `close` | `false` | close the connection after the answer |
+
+`${secret:name}` is refused anywhere in `respond`. Its rule's actions that
+change or record the request (`set_header`, `remove_header`,
+`rewrite_path`, `set_query`, `remove_query`, `redirect`, `sign`, and the
+request half of `capture` and `digest`) compile but do nothing, since the
+request is never forwarded; `roxy check` warns about them. `tag`, `log`,
+`set_state`, and `capture` or `digest` of the response still apply. The
+same is true of the effects of other matching rules.
+
+```yaml
+- id: token-stub
+  when: host == "auth.example.com" and path == "/oauth/token"
+  then:
+    respond:
+      body: '{"access_token":"placeholder","token_type":"Bearer","expires_in":3600}'
+      content_type: application/json
+```
 
 These add effects:
 
@@ -2406,6 +2455,34 @@ inspected, and a rule that reads it fails closed.
 `http.strip_accept_encoding` (default false) removes `accept-encoding`
 from every request, so origins answer uncompressed.
 
+## Answers
+
+A `respond` rule's answer is sent as the rule wrote it, without dialling
+the upstream ([actions](/reference/rule-language#actions)):
+
+```
+HTTP/1.1 200 OK
+content-type: <content_type>
+content-length: <body length>
+cache-control: no-store
+<the rule's headers>
+
+<body>
+```
+
+There is no `x-roxy-rule`: the client sees an ordinary response, not a
+refusal. roxy reads and discards the request body, then keeps the
+connection open for the next request. A body over 1 MiB is not read to its
+end, and the connection is closed instead. With `respond: { close: true }`
+the connection is closed after the answer without reading the body. On
+HTTP/2 the stream ends with the answer, and `close: true` sends `GOAWAY`.
+A request that sent `Expect: 100-continue` gets the answer in place of
+`100 Continue`; its body is not read, and the connection is closed after
+the answer.
+
+A WebSocket upgrade request that a `respond` rule matches gets the answer
+as an ordinary response, without the upgrade.
+
 ## Deny responses
 
 Every refusal roxy makes has the same shape:
@@ -2566,6 +2643,7 @@ connection rather than letting traffic through
 | roxy is quarantined | `403`, `_quarantined` ([quarantine](/guides/operations#quarantine)) |
 | a malformed request | the connection is closed, with a `400` if possible, and a `parse_error` event |
 | a rule denies | the deny response, then the connection is closed |
+| a matching `respond` beside a matching `allow`, or two matching `respond` rules | `503`, `_fail_closed`, `terminal_conflict` ([deny wins](/design/policy-evaluation#deny-wins)) |
 | a metric, address list or secret is unavailable | `503`, `_fail_closed` |
 | a metric table is full | `503`, `_fail_closed`, `metric_table_full` |
 | a body is too large to inspect, or cannot be decoded | `503`, `_fail_closed` |
@@ -2608,6 +2686,7 @@ limits:
   max_inspect_body_bytes: 1mb     # body.text, response.body.text, and addons' default
   max_sign_body_bytes: 100mb      # a body hashed for sign: aws_sigv4
   max_capture_body_bytes: 16mb    # per direction per exchange
+  max_respond_body_bytes: 64kb    # a respond rule's body; larger fails the config
   max_ws_message_bytes: 16mb      # a WebSocket message, when rules read messages
   max_observer_lag_bytes: 16mb    # how far an observing addon may fall behind
   max_buffered_bytes: 1gb         # all of the above together, across the process
@@ -3226,9 +3305,9 @@ The flow log is one JSON object per line, written to stdout or to
 | `body_sha256` | a SHA-256 of the body, only when a rule's `digest` action asked for it ([actions](/reference/rule-language#actions)) |
 | `timing.upstream_connect_ms` | time to open the upstream connection; `null` if an existing one was reused |
 | `timing.upstream_ttfb_ms` | time from forwarding the request to the response head |
-| `decision` | `allow`, `deny`, or `answered` when an addon answered the request itself |
+| `decision` | `allow`, `deny`, or `answered` when a `respond` rule or an addon answered the request itself |
 | `rules` | the rules that matched |
-| `terminal_rule` | what decided: a rule id, or one of `_default`, `_fail_closed`, `_address_policy`, `_expired`, `_quarantined`, `_sign`, `_websocket` or `layer:<name>` |
+| `terminal_rule` | what decided: a rule id (for an answer, the `respond` rule), or one of `_default`, `_fail_closed`, `_address_policy`, `_expired`, `_quarantined`, `_sign`, `_websocket` or `layer:<name>` |
 | `stage` | `head`, or where a rule stopped the exchange: `request_body`, `response_head`, `response_body` or `websocket` |
 | `addons` | the addons that ran, in order |
 | `reason` | why the exchange was refused or failed, when it was |
@@ -3237,7 +3316,7 @@ Common reasons, by `terminal_rule`:
 
 | `terminal_rule` | `reason` |
 |---|---|
-| `_fail_closed` | `metric_unavailable`, `metric_table_full`, `address_list_unavailable`, `secret_missing`, `secret_invalid`, `body_too_large_to_inspect`, `body_decode_failed`, `unsupported_content_encoding`, `buffer_budget_exhausted`, `missing_value`, `state_unavailable`, `sign_conflict`, `effect_invalid` |
+| `_fail_closed` | `metric_unavailable`, `metric_table_full`, `address_list_unavailable`, `secret_missing`, `secret_invalid`, `body_too_large_to_inspect`, `body_decode_failed`, `unsupported_content_encoding`, `buffer_budget_exhausted`, `missing_value`, `state_unavailable`, `sign_conflict`, `terminal_conflict` ([deny wins](/design/policy-evaluation#deny-wins)), `effect_invalid` |
 | `_address_policy` | `address_policy` |
 | `_expired` | `policy_expired` ([lease](/guides/operations#lease)) |
 | `_quarantined` | `quarantined` ([quarantine](/guides/operations#quarantine)) |
@@ -3635,8 +3714,8 @@ no such ambiguities, so roxy uses an existing HTTP/2 implementation.
   Also called a flow; each has an id in the flow log.
 * **Canonical:** roxy's validated, normalised form of a request.
 * **Admission rule, in-flight rule:** a rule decided before the request is
-  forwarded, which can allow or deny, versus one checked as the exchange
-  streams, which can only deny or add effects.
+  forwarded, which can allow, deny or respond, versus one checked as the
+  exchange streams, which can only deny or add effects.
 * **Policy:** the compiled config, swapped in whole on reload.
 * **Layer:** one addon in the stack.
 * **Address floor:** the check on every upstream address before roxy

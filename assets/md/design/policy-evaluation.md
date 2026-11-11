@@ -29,6 +29,19 @@ no difference to the decision.
 With the rules above, `GET https://github.com/admin` matches both
 `github-reads` and `no-admin-paths`, and is denied.
 
+A rule can also answer the request itself with `respond`, and roxy then
+dials nothing ([actions](/reference/rule-language#actions)). A matching
+deny or quarantine still wins over it.
+
+A `respond` decides the request alone, so it cannot share it. A matching
+`respond` beside a matching `allow`, or two matching `respond` rules, are
+a conflict: the request is refused with `503`, `terminal_rule` is
+`_fail_closed` and the flow log `reason` is `terminal_conflict`. No order
+of the two rules makes both right, and picking one would make the
+decision depend on where the rules sit. Write the rules so they do not
+match the same request, for example with `not (path == "/oauth/token")`
+in the `allow`.
+
 ## When rules run
 
 roxy decides whether to forward a request as soon as it has the request
@@ -41,14 +54,14 @@ these rules again each time the value changes. In the example,
 `upload-cap` is checked as the body streams, and stops the upload once it
 passes 10 MiB.
 
-<img src={requestTiming} alt="The request phase of one exchange through roxy, left to right. The client's request head (a solid line) travels first and its body bytes (a dashed line) stream behind it, through layer A (enforce), past layer B (observe, which gets a copy beside the path), through layer C (enforce) and the rules, then on to the upstream. Each layer's when is evaluated on the head as it reaches the layer. At the rules the admission decision is made once, on the head, after the stack and before anything is forwarded (when a rule reads body.text, the body is buffered first): allow, deny or change the request. As body bytes stream past the rules they are re-checked in flight (body.bytes, byte metrics), which can deny or quarantine but never allow or change the request." />
+<img src={requestTiming} alt="The request phase of one exchange through roxy, left to right. The client's request head (a solid line) travels first and its body bytes (a dashed line) stream behind it, through layer A (enforce), past layer B (observe, which gets a copy beside the path), through layer C (enforce) and the rules, then on to the upstream. Each layer's when is evaluated on the head as it reaches the layer. At the rules the admission decision is made once, on the head, after the stack and before anything is forwarded (when a rule reads body.text, the body is buffered first): allow, deny, respond or change the request. As body bytes stream past the rules they are re-checked in flight (body.bytes, byte metrics), which can deny or quarantine but never allow or change the request." />
 
 The reference calls the first kind *admission* rules and the second
 *in-flight* rules. `roxy check` and `roxy rule test` say which each rule
 is.
 
 A rule checked later can only deny, because by then the request has
-already gone. It can also log, tag, write state, or change response
+already gone. It cannot `allow` or `respond`. It can also log, tag, write state, or change response
 headers that have not been sent yet. When it denies, roxy stops the
 exchange: the client gets an error if its response has not started, and
 otherwise the connection is closed.
@@ -61,8 +74,11 @@ the body back until it has read it, and then decides
 
 Order matters for what rules change, not for the decision. When a
 request is allowed, every matching rule's changes apply from top to
-bottom, so if two rules set the same header, the lower one wins. The flow
-log names the rule that decided as `terminal_rule`.
+bottom, so if two rules set the same header, the lower one wins. When a
+`respond` rule answers, nothing is forwarded, so changes to the request do
+nothing; `log`, `set_state`, `tag`, and `capture` or `digest` of the
+response still apply. The flow log names the rule that decided as
+`terminal_rule`.
 
 A tag set by a rule can only be read by rules below it. roxy rejects a
 config where a rule reads a tag that a rule further down sets.
