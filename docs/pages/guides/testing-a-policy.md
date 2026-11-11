@@ -45,7 +45,7 @@ it the same `when` but only a `tag`:
     then: { tag: trial-no-gists }
 ```
 
-A rule with no `allow`, `deny` or `quarantine` does not change the
+A rule with no `allow`, `deny`, `quarantine` or `respond` does not change the
 decision: other rules still decide the request. The tag is there so you
 can find the requests it matched. Each one's `request` event in the
 [flow log](/reference/flow-log) carries it:

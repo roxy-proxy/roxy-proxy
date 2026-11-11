@@ -11,6 +11,7 @@ connection rather than letting traffic through
 | roxy is quarantined | `403`, `_quarantined` ([quarantine](/guides/operations#quarantine)) |
 | a malformed request | the connection is closed, with a `400` if possible, and a `parse_error` event |
 | a rule denies | the deny response, then the connection is closed |
+| a matching `respond` beside a matching `allow`, or two matching `respond` rules | `503`, `_fail_closed`, `terminal_conflict` ([deny wins](/design/policy-evaluation#deny-wins)) |
 | a metric, address list or secret is unavailable | `503`, `_fail_closed` |
 | a metric table is full | `503`, `_fail_closed`, `metric_table_full` |
 | a body is too large to inspect, or cannot be decoded | `503`, `_fail_closed` |

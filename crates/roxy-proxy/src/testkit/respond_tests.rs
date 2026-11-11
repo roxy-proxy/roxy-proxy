@@ -154,6 +154,51 @@ async fn close_ends_the_connection_after_the_answer() {
     assert!(kit.upstream.seen().is_empty());
 }
 
+/// Over HTTP/2, `close: true` answers on the stream, then the connection
+/// goes away: a new stream on it fails.
+#[tokio::test]
+async fn close_over_h2_answers_on_the_stream_then_goes_away() {
+    let kit = kit().await;
+    let mut c = kit.tunnel("auth.test", true).await;
+    let a = c.call("POST", "/close", &[], b"hello").await;
+    assert_eq!(a.status, 503, "{a:?}");
+    assert_eq!(a.body.as_deref().unwrap(), b"gone");
+    c.closed().await;
+    let req = c
+        .request_to("auth.test", "GET", "/oauth/token", &[])
+        .body(roxy_http::Body::from_bytes(Bytes::new()))
+        .unwrap();
+    assert!(
+        c.send(req).await.is_err(),
+        "a new stream after GOAWAY must fail"
+    );
+    let ev = kit.request_event().await;
+    assert_answered_event(&ev, "token-close");
+    assert_eq!(ev["res"]["status"], 503);
+    assert!(kit.upstream.seen().is_empty());
+}
+
+/// A request that sent `Expect: 100-continue` gets the answer in place of
+/// `100 Continue`. Whether the body follows is now the client's choice,
+/// so roxy closes the connection after the answer instead of reading it.
+#[tokio::test]
+async fn an_expect_continue_request_is_answered_and_the_connection_closed() {
+    let kit = kit().await;
+    let (out, closed) = kit
+        .raw_http(
+            b"POST /oauth/token HTTP/1.1\r\nhost: auth.test\r\nexpect: 100-continue\r\n\
+              content-length: 5\r\n\r\n",
+        )
+        .await;
+    assert!(out.starts_with("HTTP/1.1 200 "), "{out}");
+    assert!(!out.contains("100 Continue"), "{out}");
+    assert!(out.ends_with(BODY), "{out}");
+    assert!(closed, "the connection closes after the answer: {out}");
+    let ev = kit.request_event().await;
+    assert_answered_event(&ev, "token");
+    assert!(kit.upstream.seen().is_empty());
+}
+
 /// An `Upgrade` request a respond rule matches gets the answer as an
 /// ordinary response. Nothing was forwarded, so no upgrade was stripped.
 #[tokio::test]

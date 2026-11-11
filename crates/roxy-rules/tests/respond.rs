@@ -213,6 +213,16 @@ fn framing_hop_by_hop_and_owned_headers_are_refused() {
     assert!(e.contains("respond content_type"), "{e}");
 }
 
+/// Header names are compared without case, so `X-A` beside `x-a` is one
+/// header set twice, not two headers.
+#[test]
+fn a_header_set_twice_in_different_cases_is_refused() {
+    let e = compile_err(r#"- { id: r, then: { respond: { headers: { X-A: "1", x-a: "2" } } } }"#);
+    assert!(e.contains("respond header `x-a` is set twice"), "{e}");
+    let e = compile_err(r"- { id: r, then: { respond: { headers: { Vary: a, VARY: b } } } }");
+    assert!(e.contains("respond header `vary` is set twice"), "{e}");
+}
+
 #[test]
 fn secrets_are_refused_anywhere_in_it() {
     for respond in [

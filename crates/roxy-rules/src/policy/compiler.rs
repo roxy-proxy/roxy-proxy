@@ -900,6 +900,16 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
                 self.push(rule, apath, format!("respond header `{lower}` {why}"));
                 continue;
             }
+            // Names differing only in case are one header: the answer would
+            // otherwise carry it twice.
+            if out.iter().any(|(seen, _)| *seen == lower) {
+                self.push(
+                    rule,
+                    apath,
+                    format!("respond header `{lower}` is set twice"),
+                );
+                continue;
+            }
             if !is_header_value(value) {
                 self.push(
                     rule,

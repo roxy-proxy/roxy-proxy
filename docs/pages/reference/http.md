@@ -233,6 +233,9 @@ connection open for the next request. A body over 1 MiB is not read to its
 end, and the connection is closed instead. With `respond: { close: true }`
 the connection is closed after the answer without reading the body. On
 HTTP/2 the stream ends with the answer, and `close: true` sends `GOAWAY`.
+A request that sent `Expect: 100-continue` gets the answer in place of
+`100 Continue`; its body is not read, and the connection is closed after
+the answer.
 
 A WebSocket upgrade request that a `respond` rule matches gets the answer
 as an ordinary response, without the upgrade.
