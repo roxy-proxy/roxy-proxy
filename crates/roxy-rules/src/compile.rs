@@ -73,13 +73,22 @@ impl Needs {
         }
     }
 
-    /// Names of the in-flight values in `mask`, as written, for messages and
-    /// `roxy check`.
-    pub(crate) fn in_flight_names(&self, mask: Reads) -> Vec<String> {
+    /// The in-flight values in `mask` with their names as written, for
+    /// messages and `roxy check`. A `bytes` metric is one read under one
+    /// name, whichever direction `mask` asks about.
+    pub(crate) fn in_flight_reads(&self, mask: Reads) -> Vec<(InFlightValue, String)> {
         self.in_flight
             .iter()
             .filter(|(w, _)| mask.contains(*w))
-            .map(|(_, n)| n.clone())
+            .cloned()
+            .collect()
+    }
+
+    /// Names of the in-flight values in `mask`, as written.
+    pub(crate) fn in_flight_names(&self, mask: Reads) -> Vec<String> {
+        self.in_flight_reads(mask)
+            .into_iter()
+            .map(|(_, n)| n)
             .collect()
     }
 }
@@ -558,7 +567,14 @@ impl Compiler<'_, '_> {
                 }
                 let in_flight = match &access {
                     Access::Metric(id) => metric(id).and_then(|count| {
-                        Some((count.in_flight()?, format!("metric.{id} ({count})")))
+                        let name = format!("metric.{id} ({count})");
+                        let mut values = count.in_flight().iter();
+                        let first = values.next()?;
+                        // A count over both directions is re-checked on either.
+                        for w in values {
+                            self.needs.add_in_flight(w, name.clone());
+                        }
+                        Some((first, name))
                     }),
                     a @ (Access::Scalar(_)
                     | Access::Header(_)

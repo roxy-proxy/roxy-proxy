@@ -12,15 +12,16 @@ A metric is defined once and compared in rules, for example
 ```yaml
 metrics:
   - id: github_writes
-    count: requests      # requests | request_bytes | response_bytes | errors | denied | unique(<field>)
+    count: requests      # requests | request_bytes | response_bytes | bytes | errors | denied | unique(<field>)
     where: host under "api.github.com" and method in [POST, PUT, PATCH, DELETE]
     key: [client.ip]     # one count per client; omitted = one count for everything
     window: 1m           # omitted = since start
     max_keys: 10000      # optional; default limits.max_metric_keys
 ```
 
-- **`count`** says what is counted. `unique(<field>)` counts distinct
-  values, approximately.
+- **`count`** says what is counted. `bytes` is request and response
+  bytes together, for a budget on everything an exchange moves.
+  `unique(<field>)` counts distinct values, approximately.
 - **`where`** says which exchanges count. It can read admission fields,
   state and other metrics, but not tags.
 - **`key`** gives each distinct value its own count. It takes plain
@@ -31,6 +32,7 @@ metrics:
   `metric.x >= 30` denies the 31st request. Denied requests count too.
 - **Byte counts** grow as bodies stream. A `deny` that reads one is
   checked as bytes arrive, and stops the exchange that crosses the limit.
+  A `bytes` count grows, and is checked, as either direction streams.
 - **Nullable fields.** If a key can be `null`, such as `tls.sni` on plain
   HTTP, the metric must exclude those exchanges in `where`
   (`tls.sni != null`), or it does not compile. A rule that reads the

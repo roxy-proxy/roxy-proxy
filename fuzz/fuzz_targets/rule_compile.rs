@@ -44,6 +44,7 @@ fuzz_target!(|data: &[u8]| {
         .with_header("x-a", "1")
         .with_metric("m0", 5)
         .with_metric("m1", 1 << 20)
+        .with_metric("m2", 1 << 21)
         .with_body("{\"k\": 1}");
     for then in [
         json!("allow"),

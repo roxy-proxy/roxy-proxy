@@ -311,6 +311,7 @@ impl<'i, 'a> PolicyCompiler<'i, 'a> {
             MetricCount::Requests
             | MetricCount::RequestBytes
             | MetricCount::ResponseBytes
+            | MetricCount::Bytes
             | MetricCount::Errors
             | MetricCount::Denied => None,
         };
@@ -1198,13 +1199,13 @@ impl RuleShape {
             (
                 RuleKind::InFlight,
                 needs.reads,
-                needs.in_flight_names(needs.reads),
+                needs.in_flight_reads(needs.reads),
             )
         } else if denies && !metrics.is_empty() {
             (
                 RuleKind::AdmissionAndInFlight,
                 metrics,
-                needs.in_flight_names(metrics),
+                needs.in_flight_reads(metrics),
             )
         } else {
             (RuleKind::Admission, Reads::NONE, Vec::new())
@@ -1217,8 +1218,17 @@ impl RuleShape {
         }
     }
 
+    /// The in-flight reads in `mask`, named as written in the rule.
+    pub(super) fn read_names(&self, mask: Reads) -> Vec<String> {
+        self.in_flight_reads
+            .iter()
+            .filter(|(w, _)| mask.contains(*w))
+            .map(|(_, n)| n.clone())
+            .collect()
+    }
+
     fn reads_quoted(&self) -> String {
-        quoted(&self.in_flight_reads)
+        quoted(&self.read_names(Reads::ALL))
     }
 
     /// Why a rule that reads an in-flight field runs after forwarding, for
@@ -1249,9 +1259,7 @@ impl RuleShape {
                  before the response head is sent; this rule also reads {}, which can change \
                  after that",
                 a.name(),
-                self.triggers
-                    .minus(Reads::BEFORE_RESPONSE_SENT)
-                    .names()
+                self.read_names(self.triggers.minus(Reads::BEFORE_RESPONSE_SENT))
                     .join(", ")
             ))
         } else {

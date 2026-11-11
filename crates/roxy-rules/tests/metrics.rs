@@ -94,6 +94,7 @@ fn count_kinds() {
         "- { id: req, count: requests }
 - { id: rqb, count: request_bytes }
 - { id: rsb, count: response_bytes }
+- { id: both, count: bytes }
 - { id: err, count: errors }
 - { id: den, count: denied }
 - { id: uniq, count: unique(path) }",
@@ -141,6 +142,7 @@ fn count_kinds() {
     assert_eq!(g("req"), 2);
     assert_eq!(g("rqb"), 105);
     assert_eq!(g("rsb"), 1001);
+    assert_eq!(g("both"), 1106);
     assert_eq!(g("err"), 1);
     assert_eq!(g("den"), 1);
     assert_eq!(g("uniq"), 2);

@@ -714,6 +714,70 @@ async fn a_byte_budget_stops_the_crossing_upload() {
     );
 }
 
+/// A `bytes` budget counts both directions. An echo whose response, on top
+/// of its request, crosses the budget is cut while the response streams,
+/// and the next request is denied at admission.
+#[tokio::test]
+async fn a_bytes_budget_stops_the_crossing_response() {
+    let kit = Kit::builder()
+        .rules(
+            r#"
+- id: up
+  when: host == "up.test"
+  then: allow
+- id: budget
+  when: metric.transfer > 100kb
+  then: deny
+"#,
+        )
+        .metric_defs("- { id: transfer, count: bytes, key: [client.ip] }")
+        .start()
+        .await;
+    let mut c = kit.h1().await;
+    let req = c
+        .request("POST", "/echo", &[])
+        .body(roxy_http::Body::from_bytes(Bytes::from(vec![
+            b'x';
+            64 * 1024
+        ])))
+        .unwrap();
+    let a = Answer::read(c.send(req).await.unwrap()).await;
+    assert_eq!(a.status, 200, "the 64 KiB upload fits the budget: {a:?}");
+    assert!(
+        a.body.is_err(),
+        "the echo crosses the budget on the way back and is cut: {a:?}"
+    );
+    let a = kit.h1().await.call("GET", "/two", &[], b"").await;
+    assert_eq!(a.status, 403, "over budget now: {a:?}");
+    assert_eq!(a.headers["x-roxy-rule"], "budget");
+    let ev = kit.events("request", 2).await;
+    let by_path = |path: &str| ev.iter().find(|e| e["req"]["path"] == path).unwrap();
+    let echo = by_path("/echo");
+    assert_eq!(echo["decision"], "deny", "{echo:#}");
+    assert_eq!(echo["terminal_rule"], "budget", "{echo:#}");
+    assert_eq!(echo["stage"], "response_body", "{echo:#}");
+    assert!(
+        echo["res"]["body_bytes"].as_u64().unwrap() < 64 * 1024,
+        "{echo:#}"
+    );
+    assert_eq!(by_path("/two")["stage"], "head");
+    // Both directions were counted: the whole upload, and the response up
+    // to the chunk that crossed the budget.
+    let (up, down) = kit
+        .samples
+        .lock()
+        .unwrap()
+        .iter()
+        .fold((0u64, 0u64), |(up, down), s| {
+            (up + s.request_bytes, down + s.response_bytes)
+        });
+    assert_eq!(up, 64 * 1024, "request bytes counted");
+    assert!(
+        down > 0 && up + down > 100 * 1024,
+        "response bytes counted up to the crossing: up {up}, down {down}"
+    );
+}
+
 /// A name that resolves to a public and a private address is denied as a
 /// whole: the floor judges every address, not the one that would be
 /// dialled. With `private_ok` the same name is reachable.

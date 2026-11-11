@@ -56,7 +56,7 @@
 //!   at the forwarding decision) is an **admission rule**. A rule that
 //!   reads an *in-flight* field (`body.bytes`, `response.*`, `ws.*`) is an
 //!   **in-flight rule**. A `deny` or `quarantine` rule that reads a byte
-//!   metric (`count: request_bytes` or `response_bytes`) and no in-flight
+//!   metric (`count: request_bytes`, `response_bytes` or `bytes`) and no in-flight
 //!   field is both ([`RuleKind::AdmissionAndInFlight`]): it takes part in
 //!   the admission decision and is re-checked as this exchange adds bytes
 //!   to that metric.

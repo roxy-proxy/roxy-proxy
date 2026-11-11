@@ -260,6 +260,62 @@ fn errors_stop_the_exchange() {
     );
 }
 
+/// A message about a `bytes` metric names it as written, not as the two
+/// directions it reads.
+#[test]
+fn a_bytes_metric_is_named_as_written() {
+    let err = try_compile(
+        "- { id: q, count: bytes }",
+        "- { id: a, when: 'response.status == 1 and metric.q > 1', then: { set_header: { x: y } } }",
+    )
+    .unwrap_err()
+    .join("\n");
+    assert!(err.contains("also reads metric.q (bytes), which"), "{err}");
+    assert!(!err.contains("request_bytes metric"), "{err}");
+}
+
+/// A budget on `bytes` counts both directions, so it is re-checked as either
+/// the request or the response streams.
+#[test]
+fn bytes_metric_denies_on_either_direction() {
+    let p = compile(
+        "- { id: transfer, count: bytes }",
+        r"
+- id: ok
+  then: allow
+- id: budget
+  when: metric.transfer > 1mb
+  then: deny
+",
+    );
+    assert_eq!(p.rule_info()[1].kind, RuleKind::AdmissionAndInFlight);
+    assert_eq!(
+        p.byte_metrics(),
+        Reads::METRIC_REQUEST_BYTES | Reads::METRIC_RESPONSE_BYTES
+    );
+    let ctx = EvalContext::empty();
+    let v = |n: i64| MapView::new().with_metric("transfer", n);
+    let admission = p.evaluate_admission(&v(0), &ctx);
+    assert_eq!(admission.terminal_rule, "ok");
+    for (changed, fields) in [
+        (
+            Reads::METRIC_REQUEST_BYTES | Reads::BODY_BYTES,
+            Reads::BODY_BYTES,
+        ),
+        (
+            Reads::METRIC_RESPONSE_BYTES | Reads::RESPONSE_BODY_BYTES,
+            Reads::RESPONSE_BODY_BYTES,
+        ),
+    ] {
+        let mut st = p.in_flight_state();
+        let mut tags = admission.tags.clone();
+        let o = p
+            .evaluate_in_flight(changed, fields, &mut st, &mut tags, &v(2 << 20))
+            .unwrap();
+        assert_eq!(o.terminal_rule.unwrap(), "budget");
+    }
+}
+
 /// A deny reading a byte metric takes part in the admission decision and is
 /// re-checked as this exchange adds bytes. A deny reading a request-count
 /// metric is not re-checked (it would deny the 30th request of a `>= 30`
